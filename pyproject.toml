@@ -1,0 +1,98 @@
+[project]
+name = "personal-agent-platform"
+version = "0.2.0"
+description = "个人/业务 Agent 平台：FastAPI + LangGraph + 受控工具 + 审批 + RAG"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.20",
+    "alembic>=1.16",
+    "asyncpg>=0.30",
+    # 知识库文档解析。这三个都是可选路径，但「页面上传」把可选变成了必需：
+    # 用户传一份 PDF 却报「未安装 pypdf」，是产品缺陷不是配置问题。
+    "beautifulsoup4>=4.12",
+    "greenlet>=3.1",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "jieba>=0.42",
+    "jsonschema>=4.23",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.3",
+    "langgraph>=1.0",
+    # 远端 MCP Server 客户端。
+    # 这里刻意锁死到与对端完全相同的版本（对端 requirements.txt 同样是 2.2.0）：
+    # 2.x 的客户端 API 与 1.x 完全不同，且 2.x 内部还在改名（streamablehttp_client
+    # → streamable_http_client），跟版本漂移会让接入在下次 uv sync 后突然坏掉。
+    "mcp==2.2.0",
+    "httpx2>=0.1",
+    "opentelemetry-api>=1.30",
+    "opentelemetry-exporter-otlp>=1.30",
+    "opentelemetry-instrumentation-fastapi>=0.51b0",
+    "opentelemetry-instrumentation-httpx>=0.51b0",
+    "opentelemetry-sdk>=1.30",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # 文档上传走 multipart。它一直是 fastapi 的传递依赖（没声明也能跑），
+    # 但知识库上传是自建的第一个 multipart 接口，显式声明才不会在
+    # 依赖树变动后突然 500「python-multipart must be installed」。
+    "python-multipart>=0.0.20",
+    "python-docx>=1.1",
+    "pypdf>=5.0",
+    "python-dotenv>=1.0",
+    "rank-bm25>=0.2.2",
+    "redis>=5.2",
+    "sqlalchemy>=2.0.36",
+    "tenacity>=9.0",
+    "uvicorn[standard]>=0.30",
+    "langgraph-checkpoint-postgres>=3.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
+# 仅用于本地/服务器上的 LangGraph Studio 观测（langgraph dev）。
+# 生产 API 运行不需要该组，安装方式：uv sync --group studio
+studio = [
+    "langgraph-cli[inmem]>=0.4",
+]
+
+# 这是一个应用（application）而非可安装库：源码就在 app/ 下，
+# 不参与构建，因此关闭 uv 的打包行为。
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".venv", "data", "alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "B008",  # FastAPI Depends 作为默认值是标准写法
+    "E501",  # 中文注释与长字符串由 formatter 处理
+    "UP042",  # 保留 str+Enum：SQLAlchemy Enum 与 pydantic 序列化行为更可预测
+    "UP046",  # 保留 Generic 写法，兼容现有类型标注
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

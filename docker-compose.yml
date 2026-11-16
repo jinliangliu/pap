@@ -1,0 +1,62 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: personal-agent-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 容器内连接 postgres 服务；密码来自 .env，不写入仓库
+      DATABASE_URL: postgresql+psycopg://agent:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/personal_agent
+      REDIS_URL: redis://redis:6379/0
+      # 检查点与业务库共用同一个 PostgreSQL（不同的表）。
+      # 多副本部署时各实例必须看到同一份 interrupt 现场，不能用本地文件。
+      CHECKPOINT_DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/personal_agent
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - app_data:/app/data
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: personal-agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: personal_agent
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+    ports:
+      # 仅允许本机访问，避免数据库暴露到公网
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d personal_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: personal-agent-redis
+    restart: unless-stopped
+    ports:
+      # 宿主机的 6379 可能已被别的 Redis 占用；映射到 6380，
+      # 系统服务用 REDIS_URL=redis://127.0.0.1:6380/0 连接。
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:
+  app_data:

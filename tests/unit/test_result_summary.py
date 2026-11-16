@@ -1,0 +1,291 @@
+# tests/unit/test_result_summary.py
+"""工具结果怎么呈现给用户。
+
+读工具这条路径不走模型：`execute_read_tool` 把 `_summarize_result` 的结果
+直接当最终答复返回。所以这里输出的每一个字用户都会看到——
+整段 JSON 就是让他自己解析报文。
+"""
+
+from __future__ import annotations
+
+from app.agents.nodes import _MAX_LISTED_ITEMS, _summarize_result
+from app.tools.types import ToolExecutionResult
+
+
+def _result(**kwargs: object) -> ToolExecutionResult:
+    defaults: dict[str, object] = {
+        "success": True,
+        "verified": True,
+        "result": {},
+        "message": "已完成远端调用。",
+    }
+    defaults.update(kwargs)
+    return ToolExecutionResult(**defaults)  # type: ignore[arg-type]
+
+
+def test_metadata_is_not_shown_to_user() -> None:
+    """success / data_source / timestamp 是调用元数据，不是结论。"""
+    summary = _summarize_result(
+        _result(
+            message="当前身份看不到任何站点。",
+            result={
+                "success": True,
+                "data_source": "API",
+                "timestamp": "2026-11-03T06:48:40",
+                "query": None,
+                "scope": "很长的一段说明",
+                "stations": [],
+            },
+        )
+    )
+
+    assert summary == "当前身份看不到任何站点。"
+
+
+def test_empty_result_does_not_repeat_counts() -> None:
+    """
+    空白名单的实测返回：message 已经说了「共 10 个授权、0 个可见」，
+    再列 count / total_authorized 只是噪音。
+    """
+    summary = _summarize_result(
+        _result(
+            message="当前身份看不到任何站点：平台账号下共 10 个站点，但白名单为空。",
+            result={
+                "success": True,
+                "count": 0,
+                "total_authorized": 10,
+                "visible_to_identity": 0,
+                "identity_station_filter": [],
+                "stations": [],
+            },
+        )
+    )
+
+    assert "count" not in summary
+    assert "total_authorized" not in summary
+    assert "identity_station_filter" not in summary
+
+
+def test_collection_is_rendered_as_items_not_json() -> None:
+    summary = _summarize_result(
+        _result(
+            message="已完成远端调用。",
+            result={
+                "count": 2,
+                "total_authorized": 2,
+                "visible_to_identity": 2,
+                "identity_station_filter": "ALL",
+                "stations": [
+                    {"name": "硬件测试", "serial": "T002511111"},
+                    {"name": "深圳燃气大厦", "serial": "T002509008"},
+                ],
+            },
+        )
+    )
+
+    assert "1. 硬件测试（T002511111）" in summary
+    assert "2. 深圳燃气大厦（T002509008）" in summary
+    assert "{" not in summary
+    # 权限元数据不占版面：条数已经用自然语言说了。
+    assert "identity_station_filter" not in summary
+    assert "visible_to_identity" not in summary
+
+
+def test_generic_message_is_replaced_by_count() -> None:
+    """「已完成远端调用」没回答「有多少个站」，条数才是他要的。"""
+    summary = _summarize_result(
+        _result(
+            message="已完成远端调用。",
+            result={"stations": [{"name": "A", "serial": "S1"}]},
+        )
+    )
+
+    assert summary.startswith("共 1 个站点。")
+    assert "已完成远端调用" not in summary
+
+
+def test_identifier_already_in_title_is_not_repeated() -> None:
+    """远端站名自带编号，再括注一次就成「硬件测试(T002511111)（T002511111）」。"""
+    summary = _summarize_result(
+        _result(
+            message="已完成远端调用。",
+            result={"stations": [{"name": "硬件测试(T002511111)", "serial": "T002511111"}]},
+        )
+    )
+
+    assert "1. 硬件测试(T002511111)" in summary
+    assert "（T002511111）" not in summary
+
+
+def test_long_list_is_capped() -> None:
+    stations = [{"name": f"站{i}", "serial": f"S{i}"} for i in range(_MAX_LISTED_ITEMS + 5)]
+
+    summary = _summarize_result(_result(result={"stations": stations}))
+
+    assert "共 25 个站点。" in summary
+    assert "另有 5 条未列出" in summary
+    assert f"{_MAX_LISTED_ITEMS + 1}." not in summary
+
+
+def test_scalar_values_are_kept() -> None:
+    """压力、阀位这类标量是查询的直接答案，不能被过滤掉。"""
+    summary = _summarize_result(
+        _result(result={"outlet_pressure": 2300, "empty_field": None, "unit": "Pa"})
+    )
+
+    assert "outlet_pressure：2300" in summary
+    assert "unit：Pa" in summary
+    assert "empty_field" not in summary
+    assert "success" not in summary
+
+
+def test_measurement_is_rendered_as_one_line() -> None:
+    """
+    远端测点统一是 {name, value, unit, status_text}。
+    整段 JSON 化后用户得自己找 value 在哪、单位是什么。
+    """
+    summary = _summarize_result(
+        _result(
+            result={
+                "station": {"station_name": "深圳燃气大厦(T002509008)", "serial": "T002509008"},
+                "inlet": {
+                    "name": "进口压力",
+                    "value": 1.538,
+                    "unit": "kPa",
+                    "status_text": "正常",
+                    "limit_up": 500.0,
+                },
+            }
+        )
+    )
+
+    assert "深圳燃气大厦(T002509008)" in summary
+    assert "进口压力：1.538 kPa（正常）" in summary
+    assert '"value"' not in summary
+
+
+def test_flat_struct_is_rendered_inline() -> None:
+    """时间窗这类扁平对象一行说完，比整段 JSON 好读。"""
+    summary = _summarize_result(_result(result={"window": {"a": 1, "b": 2}}))
+
+    assert "window：a=1，b=2" in summary
+
+
+def test_deep_struct_says_it_is_not_expanded() -> None:
+    """
+    真正嵌套的对象不展开。
+
+    之前是 JSON 截断，用户会看到 `"csv_path": nul…` 这种半截报文——
+    既读不懂，也不知道是数据就这样还是被截了。
+    """
+    summary = _summarize_result(
+        _result(result={"artifact": {"dir": "/app/trends", "meta": {"files": ["a.csv"]}}})
+    )
+
+    assert "artifact" in summary
+    assert "共 2 项明细" in summary
+    assert "{" not in summary
+
+
+def test_series_reports_points_and_range() -> None:
+    """趋势查询的答案就是「多少点、范围多少」。"""
+    summary = _summarize_result(
+        _result(
+            message="趋势曲线已取回。",
+            result={
+                "series": [
+                    {"name": "进口压力(kPa)", "access": "CH1", "points": 0, "min": None},
+                    {"name": "出口压力(kPa)", "access": "CH5", "points": 12, "min": 1.5, "max": 2.3},
+                ]
+            },
+        )
+    )
+
+    assert "1. 进口压力(kPa)：0 个点（该时间段没有采样数据）" in summary
+    assert "2. 出口压力(kPa)：12 个点，范围 1.5~2.3" in summary
+
+
+def test_scalar_list_is_one_line() -> None:
+    summary = _summarize_result(_result(result={"requested_accesses": ["CH1", "CH5", "CH2"]}))
+
+    assert "requested_accesses：CH1、CH5、CH2" in summary
+
+
+def test_long_scalar_list_reports_total() -> None:
+    summary = _summarize_result(_result(result={"tags": [f"t{i}" for i in range(12)]}))
+
+    assert "共 12 项" in summary
+    assert "t8" not in summary
+
+
+def test_notes_are_listed_one_per_line() -> None:
+    """说明性字段一条一句，并成一行会读成一句长句。"""
+    summary = _summarize_result(
+        _result(result={"notes": ["点数不代表连续性", "上下限为 0 不可作判据"]})
+    )
+
+    assert "notes：\n  · 点数不代表连续性\n  · 上下限为 0 不可作判据" in summary
+
+
+def test_message_is_kept_verbatim() -> None:
+    """message 里的业务结论是最重要的一句，必须原样出现在开头。"""
+    summary = _summarize_result(
+        _result(message="控制预演未通过，未下发任何指令。", result={"blockers": ["x"]})
+    )
+
+    assert summary.startswith("控制预演未通过，未下发任何指令。")
+
+
+def test_failure_only_carries_message() -> None:
+    summary = _summarize_result(
+        _result(success=False, verified=False, message="MCP 服务不可达。", result={"raw": 1})
+    )
+
+    assert summary == "MCP 服务不可达。"
+
+
+def test_unverified_result_is_flagged() -> None:
+    summary = _summarize_result(_result(verified=False, result={"count": 1}))
+
+    assert "尚未通过回读核验" in summary
+
+
+def test_empty_query_on_station_list_is_not_reported_as_no_permission() -> None:
+    """count=0 但 visible_to_identity=10：是查询没匹配，不是没有授权。
+
+    2026-11-05：用户拿现场记录表里的「梅石小区」查站点，返回 count=0，
+    模型回答「当前身份看不到任何已授权站点」——同一份结果里写着可见 10 个，
+    用户于是以为授权出了问题。
+    """
+    summary = _summarize_result(
+        _result(
+            message="已查询站点。",
+            result={
+                "success": True,
+                "count": 0,
+                "total_authorized": 10,
+                "visible_to_identity": 10,
+                "stations": [],
+            },
+        )
+    )
+
+    assert "可见 10 个站点" in summary
+    assert "不是没有站点授权" in summary
+
+
+def test_no_note_when_station_list_is_really_empty() -> None:
+    """真一个站都没有时不补这句，否则是另一种误导。"""
+    summary = _summarize_result(
+        _result(
+            message="已查询站点。",
+            result={
+                "success": True,
+                "count": 0,
+                "visible_to_identity": 0,
+                "stations": [],
+            },
+        )
+    )
+
+    assert "不是没有站点授权" not in summary

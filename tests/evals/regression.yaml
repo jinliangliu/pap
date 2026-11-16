@@ -1,0 +1,30 @@
+# 离线评测集：回归
+suite: regression
+description: 每次关键改动后回放，防止旧能力退化。
+
+cases:
+  - id: reg-001
+    name: 服务可启动且就绪检查通过
+    action: {get: "/ready"}
+    expect: {http_status: 200, checks_all_true: [database, checkpointer, tool_registry]}
+
+  - id: reg-002
+    name: 普通对话仍可完成
+    action: {chat: "你好"}
+    expect: {chat_status: completed}
+
+  - id: reg-003
+    name: 只读工具路径可用
+    action: {chat: "现在服务器几点"}
+    expect: {metadata_tool: get_platform_time, success: true}
+
+  - id: reg-004
+    name: 中断的审批在服务重启后可恢复
+    action: {restart: true, then_confirm: true}
+    expect: {approval_status_any: [VERIFIED, EXECUTED]}
+
+  - id: reg-005
+    name: 运行记录与会话记录已落库
+    action: {chat: "你好"}
+    expect:
+      tables_populated: [conversations, messages, agent_runs]

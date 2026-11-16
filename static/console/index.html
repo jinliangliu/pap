@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Personal Agent Platform · 控制台</title>
+<!--
+  控制台外壳。
+
+  这一页只负责骨架：左侧导航（含状态与身份）、内容容器。
+  不设顶栏：顶栏只放得下四件碎事（就绪状态、租户、身份、刷新），
+  却要占掉整条 46px 的横向空间，还把每页的标题往下压一行。
+  视图与数据全部在 assets/console.js 里按 hash 路由渲染，
+  样式在 assets/console.css。无构建步骤，nginx 直接用 alias 提供本目录。
+
+  认证仍由 nginx 的 server 级 auth_basic 承担；
+  页面内所有请求都是同源 /api/v1/*，不涉及 CORS，也不持有任何凭据。
+-->
+<link rel="stylesheet" href="./assets/console.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2l8 4.5v11L12 22l-8-4.5v-11L12 2z"/>
+          <path d="M12 8l4 2.2v4.6L12 17l-4-2.2v-4.6L12 8z"/>
+        </svg>
+      </span>
+      <div class="brand-text">
+        <strong>智能体平台</strong>
+        <span>Personal Agent Platform</span>
+      </div>
+
+      <!-- 折叠钮长在栏的标题行右侧，跟着「这条栏」走：收起后它就贴在只剩图标
+           的那一栏顶上，位置不变，靠肌肉记忆就能找到。 -->
+      <button class="icon-btn nav-collapse" type="button" id="btn-nav"
+              aria-label="收起导航" aria-expanded="true" title="收起导航">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M11 7l-5 5 5 5"/>
+          <path d="M18 7l-5 5 5 5"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- 「从文件新建」是 Studio 唯一的导入入口：三张页面（知识库 / 技能 / 工具）
+         各挂一个上传钮时，人得先判断「这个文件该进哪一页」，而判断依据恰恰是
+         文件内容本身。按钮放在导航之上、与品牌同列，任何页面都能打开。 -->
+    <div class="side-new">
+      <button class="side-new-btn" type="button" id="btn-new-import"
+              title="从文件新建：知识库文档、技能或 OpenAPI 工具">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <span class="side-new-label">从文件新建</span>
+      </button>
+    </div>
+
+    <nav id="nav" class="nav"></nav>
+
+    <div class="sidebar-foot">
+      <!-- 底部只剩「一个人」：头像 + 登录名 + 菜单钮。原来这里竖着五行
+           （账号 / 角色 / 平台管理员 / 状态 + 刷新 / 租户），214px 的栏宽
+           装不下其中任何一行，而四行里只有账号是每一眼都要的——其余只在
+           出异常、换账号时看一次。都收进菜单，头像右下角那一点继续冒健康状态。 -->
+      <div class="foot-user" id="foot-user" data-health="idle">
+        <button class="foot-user-btn" type="button" id="btn-user"
+                aria-haspopup="true" aria-expanded="false" aria-controls="foot-menu">
+          <span class="foot-avatar" id="foot-avatar" aria-hidden="true"></span>
+          <span class="foot-name" id="sidebar-ident">身份读取中…</span>
+          <span class="foot-more" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6" fill="currentColor"/>
+              <circle cx="12" cy="12" r="1.6" fill="currentColor"/>
+              <circle cx="19" cy="12" r="1.6" fill="currentColor"/></svg>
+          </span>
+        </button>
+
+        <!-- 菜单挂在按钮后面、位置由 JS 算（.foot-menu 是 fixed）：收起态那一栏
+             只有 58px 宽，绝对定位会被 .sidebar 的 overflow 裁掉半张。 -->
+        <div class="foot-menu" id="foot-menu" role="menu" aria-labelledby="btn-user" hidden>
+          <div class="foot-menu-head">
+            <span class="foot-menu-name" id="menu-name">未知身份</span>
+            <span class="foot-menu-sub" id="menu-sub">读取中…</span>
+          </div>
+          <div class="foot-menu-row">
+            <span class="status-dot idle" id="status-dot"></span>
+            <span class="status-text" id="status-text">检查中…</span>
+          </div>
+          <div class="foot-menu-row"><span class="chip" id="chip-tenant">租户 —</span></div>
+          <div class="foot-menu-sep"></div>
+          <button class="foot-menu-item" type="button" role="menuitem" id="menu-refresh"
+                  title="重新读取就绪状态并重绘本页">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/>
+              <path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+            </svg>刷新状态
+          </button>
+          <button class="foot-menu-item danger" type="button" role="menuitem" id="menu-signout"
+                  title="清除浏览器缓存的登录凭据，重新弹出登录框">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>退出登录
+          </button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <main class="content" id="view"></main>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+<!-- 渲染层、审批卡判断、追问卡片、刻度导航的几何各占一个文件：它们都只处理纯逻辑，
+     与页面骨架的增删互不牵连，也便于用 node 直接跑单元自检（scripts/check_*.mjs）。 -->
+<script src="./assets/approval.js"></script>
+<script src="./assets/render.js"></script>
+<script src="./assets/clarify.js"></script>
+<script src="./assets/rail.js"></script>
+<script src="./assets/console.js"></script>
+</body>
+</html>

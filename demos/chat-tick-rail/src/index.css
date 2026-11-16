@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #f6f7f6;
+  color: #1c211e;
+  font-family: ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 消息跳转的落点补偿：scrollIntoView(block:'start') 会把气泡贴到容器顶，
+   留一点呼吸空间，否则第一行文字贴着边。 */
+[data-rail-item] {
+  scroll-margin-top: 12px;
+}

@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 684" width="680" height="684" role="img" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif">
+<title>Personal Agent Platform 系统架构</title>
+<desc>五层架构：Nginx 接入层、FastAPI 应用层、LangGraph 智能体层、工具与检索能力层、PostgreSQL 与 Redis 数据层。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<rect width="680" height="684" fill="#FFFFFF"/>
+
+<rect x="40" y="40" width="200" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="140" y="57" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">客户端 / 调用方</text>
+<text x="140" y="73" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">HTTP · Basic Auth</text>
+
+<rect x="452" y="40" width="188" height="44" rx="8" fill="#FFFFFF" stroke="#378ADD" stroke-width="0.5" stroke-dasharray="4 3"/>
+<text x="546" y="57" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">LangGraph Studio</text>
+<text x="546" y="73" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">SSH 隧道 → :2024</text>
+
+<path d="M140 84 V112" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M620 84 V380 H602" fill="none" stroke="#378ADD" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+
+<rect x="40" y="116" width="560" height="76" rx="12" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="54" y="133" font-size="12" fill="#185FA5">接入层</text>
+<rect x="55" y="146" width="250" height="36" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="180" y="164" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">Nginx 反向代理 · 仅监听 :80</text>
+<rect x="325" y="146" width="250" height="36" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="450" y="164" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">Basic 认证 → 注入身份头</text>
+
+<path d="M320 192 V212" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="40" y="216" width="560" height="88" rx="12" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="54" y="233" font-size="12" fill="#185FA5">应用层 · FastAPI（uvicorn :8000）</text>
+<rect x="55" y="246" width="122" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="116" y="262" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">对话接口</text>
+<text x="116" y="278" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">POST /chat</text>
+<rect x="191" y="246" width="122" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="252" y="262" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">审批接口</text>
+<text x="252" y="278" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">/approvals/{id}</text>
+<rect x="327" y="246" width="122" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="388" y="262" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">知识库</text>
+<text x="388" y="278" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">status · search</text>
+<rect x="463" y="246" width="122" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="524" y="262" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">运维</text>
+<text x="524" y="278" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">/ready · /tools</text>
+
+<path d="M320 304 V324" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="40" y="328" width="560" height="104" rx="12" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="54" y="345" font-size="12" fill="#185FA5">智能体层 · LangGraph</text>
+<rect x="55" y="358" width="163" height="56" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="136" y="378" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">规划器</text>
+<text x="136" y="396" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">DeepSeek 意图识别</text>
+<rect x="238" y="358" width="163" height="56" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="319" y="378" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">执行图 StateGraph</text>
+<text x="319" y="396" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">6 节点 · interrupt</text>
+<rect x="421" y="358" width="163" height="56" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="502" y="378" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">Checkpointer</text>
+<text x="502" y="396" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">AsyncPostgresSaver</text>
+
+<path d="M320 432 V452" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="40" y="456" width="560" height="92" rx="12" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="54" y="473" font-size="12" fill="#185FA5">能力层</text>
+<rect x="55" y="486" width="96" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="103" y="502" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">工具网关</text>
+<text x="103" y="518" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">白名单·限流</text>
+<rect x="163" y="486" width="96" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="211" y="502" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">工具集</text>
+<text x="211" y="518" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">5 个已注册</text>
+<rect x="271" y="486" width="96" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="319" y="502" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">知识检索</text>
+<text x="319" y="518" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">BM25 + jieba</text>
+<rect x="379" y="486" width="96" height="44" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text x="427" y="502" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">代码沙箱</text>
+<text x="427" y="518" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0C447C">外部 execute</text>
+<rect x="487" y="486" width="96" height="44" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="535" y="502" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">审计</text>
+<text x="535" y="518" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">approval 表</text>
+
+<path d="M320 548 V572" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="40" y="576" width="560" height="88" rx="12" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="54" y="593" font-size="12" fill="#0F6E56">数据层</text>
+<rect x="55" y="606" width="163" height="44" rx="8" fill="#FFFFFF" stroke="#9FE1CB" stroke-width="0.5"/>
+<text x="136" y="622" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#04342C">PostgreSQL</text>
+<text x="136" y="638" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0F6E56">业务表·切片·checkpoint</text>
+<rect x="238" y="606" width="163" height="44" rx="8" fill="#FFFFFF" stroke="#9FE1CB" stroke-width="0.5"/>
+<text x="319" y="622" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#04342C">Redis</text>
+<text x="319" y="638" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0F6E56">限流计数 · :6380</text>
+<rect x="421" y="606" width="163" height="44" rx="8" fill="#FFFFFF" stroke="#9FE1CB" stroke-width="0.5"/>
+<text x="502" y="622" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#04342C">data/knowledge</text>
+<text x="502" y="638" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0F6E56">源文件（md/docx/pdf）</text>
+</svg>

@@ -1,0 +1,35 @@
+[Unit]
+Description=Personal Agent Platform — LangGraph Studio dev server
+Documentation=file:///personal-agent-platform/docs/STUDIO.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+WorkingDirectory=/personal-agent-platform
+
+# 与 API 共用同一份 .env：Studio 观测的就是生产这套配置与数据库。
+EnvironmentFile=/personal-agent-platform/.env
+
+# langgraph 由 dependency-group studio 提供，不在运行时依赖里。
+# --no-sync 必须保留：uv 默认只装 dev 组，同步会把 langgraph-cli 卸掉。
+ExecStart=/root/.local/bin/uv run --no-sync langgraph dev --host 127.0.0.1 --port 2024 --no-browser --no-reload
+
+Restart=on-failure
+RestartSec=5
+
+# 禁止任何形式的公网暴露：只监听回环，由使用者用 SSH 隧道接入。
+# 本服务没有认证，绑定 0.0.0.0 等于把整张图和数据库读写交给公网。
+StandardOutput=append:/var/log/pap-studio.log
+StandardError=append:/var/log/pap-studio.log
+
+# 基础加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/personal-agent-platform /var/log
+
+[Install]
+WantedBy=multi-user.target

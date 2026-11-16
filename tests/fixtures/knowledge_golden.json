@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "corpus": "data/knowledge 目录扫描语料；不含页面上传文档",
+  "note": "expect_found=false 表示库里本就没有答案，正确行为是返回资料不足。relevant 用 source_path 精确匹配。新增文档或改动切片规则后必须重跑本评测集，不要直接改期望值迁就结果。",
+  "cases": [
+    {
+      "id": "retrieval-algorithm",
+      "query": "知识库使用什么检索方案",
+      "expect_found": true,
+      "relevant": ["inbox/agent-platform-overview.md", "projects/项目规划.md", "notes/平台能力说明.md"],
+      "note": "BM25 关键词检索"
+    },
+    {
+      "id": "tokenizer",
+      "query": "中文分词用哪个组件",
+      "expect_found": true,
+      "relevant": ["inbox/agent-platform-overview.md", "projects/项目规划.md"],
+      "note": "jieba"
+    },
+    {
+      "id": "approval-ttl",
+      "query": "审批有效期是多少秒",
+      "expect_found": true,
+      "relevant": ["notes/approval_policy.md"],
+      "note": "300 秒"
+    },
+    {
+      "id": "approval-preview",
+      "query": "写操作前要先生成什么",
+      "expect_found": true,
+      "relevant": ["notes/approval_policy.md", "inbox/agent-platform-overview.md", "notes/平台能力说明.md"],
+      "note": "预览"
+    },
+    {
+      "id": "idempotency-key",
+      "query": "幂等键在哪里使用",
+      "expect_found": true,
+      "relevant": ["notes/approval_policy.md", "notes/平台能力说明.md"],
+      "note": "已知缺陷：title 里的『使用说明』让同一份文档占满 top4，把真正含『幂等键』的审批策略挤出榜单。基线保留此 miss 用于追踪结果去重问题，不要改期望值迁就结果"
+    },
+    {
+      "id": "filename-only-term",
+      "query": "approval_policy",
+      "expect_found": true,
+      "relevant": ["notes/approval_policy.md"],
+      "note": "查询词只出现在文件名(title)，正文完全没有。字段加权应召回，--no-boost 应返回 0 条"
+    },
+    {
+      "id": "security-requirements",
+      "query": "平台安全要求有哪些",
+      "expect_found": true,
+      "relevant": ["inbox/agent-platform-overview.md"],
+      "note": "安全要求小节"
+    },
+    {
+      "id": "no-secrets-in-kb",
+      "query": "密钥能不能写进知识库",
+      "expect_found": true,
+      "relevant": ["inbox/agent-platform-overview.md", "notes/使用说明.md", "manuals/操作手册.txt"],
+      "note": "不得写入"
+    },
+    {
+      "id": "supported-formats",
+      "query": "第一阶段支持哪些资料格式",
+      "expect_found": true,
+      "relevant": ["notes/使用说明.md", "projects/项目规划.md"],
+      "note": "Markdown 与 TXT"
+    },
+    {
+      "id": "knowledge-dir",
+      "query": "知识资料放在哪个目录",
+      "expect_found": true,
+      "relevant": ["notes/使用说明.md", "manuals/操作手册.txt"],
+      "note": "data/knowledge"
+    },
+    {
+      "id": "index-command",
+      "query": "重建知识索引执行什么命令",
+      "expect_found": true,
+      "relevant": ["notes/使用说明.md", "manuals/操作手册.txt"],
+      "note": "ingest_knowledge"
+    },
+    {
+      "id": "search-endpoint",
+      "query": "检索验证调用哪个接口",
+      "expect_found": true,
+      "relevant": ["manuals/操作手册.txt", "notes/平台能力说明.md"],
+      "note": "POST /api/v1/knowledge/search"
+    },
+    {
+      "id": "health-endpoint",
+      "query": "健康检查访问哪个路径",
+      "expect_found": true,
+      "relevant": ["manuals/操作手册.txt", "notes/平台能力说明.md"],
+      "note": "/health"
+    },
+    {
+      "id": "phase-one-acceptance",
+      "query": "第一阶段验收标准是什么",
+      "expect_found": true,
+      "relevant": ["projects/项目规划.md"],
+      "note": "七条验收标准"
+    },
+    {
+      "id": "phase-two-direction",
+      "query": "第二阶段方向包含哪些内容",
+      "expect_found": true,
+      "relevant": ["projects/项目规划.md"],
+      "note": "PDF/Word、向量检索、评测集等"
+    },
+    {
+      "id": "tech-principles",
+      "query": "项目的技术原则是什么",
+      "expect_found": true,
+      "relevant": ["projects/项目规划.md"],
+      "note": "先可用再复杂、只读先于写入"
+    },
+    {
+      "id": "remote-llm",
+      "query": "对话能力由哪个远程服务提供",
+      "expect_found": true,
+      "relevant": ["projects/项目规划.md", "notes/使用说明.md", "manuals/操作手册.txt"],
+      "note": "DeepSeek"
+    },
+    {
+      "id": "insufficient-evidence",
+      "query": "资料不足时系统应该怎么回答",
+      "expect_found": true,
+      "relevant": ["notes/使用说明.md", "projects/项目规划.md", "notes/平台能力说明.md"],
+      "note": "明确说明依据不足，不编造"
+    },
+    {
+      "id": "meta-capability-list",
+      "query": "平台有哪些能力",
+      "expect_found": true,
+      "relevant": ["notes/平台能力说明.md"],
+      "note": "阶段 0 补的能力说明资料"
+    },
+    {
+      "id": "meta-capability-describe",
+      "query": "描述一下你的能力",
+      "expect_found": true,
+      "relevant": ["notes/平台能力说明.md"],
+      "note": "历史假阳性案例：旧语料靠『不得将失败描述为成功』命中，现在应有真实能力清单"
+    },
+    {
+      "id": "meta-capability-colloquial",
+      "query": "你会做什么",
+      "expect_found": true,
+      "relevant": ["notes/平台能力说明.md"],
+      "note": "零字面交集的口语化提问：纯 BM25 靠单字『做』碰巧召回、首位仍是旧假阳性；--expand 应把能力文档提到第一位。它不能证明口语化提问已被解决，真正的零召回看 absent-pressure-threshold"
+    },
+    {
+      "id": "absent-shutdown-procedure",
+      "query": "阀门停机前要确认什么",
+      "expect_found": false,
+      "relevant": [],
+      "note": "库里没有停机规程；『确认』撞词必须被重筛剔除"
+    },
+    {
+      "id": "absent-pressure-threshold",
+      "query": "压力阈值设定值是多少 kPa",
+      "expect_found": false,
+      "relevant": [],
+      "note": "示例语料没有压力参数"
+    },
+    {
+      "id": "absent-weather",
+      "query": "今天上海天气怎么样",
+      "expect_found": false,
+      "relevant": [],
+      "note": "与语料完全无关"
+    },
+    {
+      "id": "absent-leave-policy",
+      "query": "怎么申请年假",
+      "expect_found": false,
+      "relevant": [],
+      "note": "库里没有人事制度"
+    }
+  ]
+}

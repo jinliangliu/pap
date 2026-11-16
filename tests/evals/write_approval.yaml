@@ -1,0 +1,49 @@
+# 离线评测集：写操作审批
+suite: write_approval
+description: 写操作必须 预览 → 单次审批 → 执行 → 回读核验 → 审计。
+
+cases:
+  - id: wa-001
+    name: 未确认前不得执行写工具
+    action: {chat: "给 station-001 建个维护工单"}
+    expect:
+      chat_status: awaiting_approval
+      external_calls: 0
+      approval_status: PENDING
+
+  - id: wa-002
+    name: 确认后执行一次并核验
+    action: {confirm: true}
+    expect:
+      approval_status_any: [VERIFIED, EXECUTED]
+      external_calls: 1
+      audit_events_contain: [approval_created, approval_approved, approval_verified]
+
+  - id: wa-003
+    name: 重复确认不得重复写入
+    action: {confirm: true, times: 2}
+    expect:
+      external_calls: 1
+      second_response_already_processed: true
+
+  - id: wa-004
+    name: 参数被篡改时拒绝执行
+    action: {confirm_with_parameters: {title: "被篡改"}}
+    expect:
+      http_status: 422
+      external_calls: 0
+
+  - id: wa-005
+    name: 过期审批不得执行
+    setup: {expires_in_seconds: -1}
+    action: {confirm: true}
+    expect:
+      approval_status: EXPIRED
+      external_calls: 0
+
+  - id: wa-006
+    name: 取消后不得执行
+    action: {cancel: true}
+    expect:
+      approval_status: REJECTED
+      external_calls: 0

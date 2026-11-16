@@ -1,0 +1,65 @@
+[Unit]
+Description=Personal Agent Platform — Multi-tenant Code Sandbox
+Documentation=file:///personal-agent-platform/docs/SANDBOX.md
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+# 刻意不用 Requires：docker 重启会把依赖单元一起停掉，而启动器对 docker
+# 没有长连接，docker 短暂不可用时它应当自己恢复（健康检查转 503）。
+
+[Service]
+Type=exec
+
+# 专用低权限用户。它需要 docker 组权限才能创建容器——这等于把
+# "启动容器的能力"交给它，但没有给它宿主 root：容器本身仍是
+# gVisor 用户态内核 + 只读根 + 无网络 + 无宿主挂载。
+User=sandbox
+Group=sandbox
+SupplementaryGroups=docker
+WorkingDirectory=/opt/pap-sandbox
+
+# 运行时配置（API Key、镜像、并发配额）。权限 0600 root:sandbox。
+EnvironmentFile=-/etc/pap-sandbox.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# 独立虚拟环境：沙箱不继承项目依赖，也就 import 不到业务代码。
+ExecStart=/opt/pap-sandbox/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8199
+
+Restart=on-failure
+RestartSec=5
+
+# 只监听回环：公网无法直接打到沙箱，只能由 API 进程经内网调用。
+StandardOutput=append:/var/log/pap-sandbox.log
+StandardError=append:/var/log/pap-sandbox.log
+
+# 比 API 更严的加固：沙箱本来就该假设自己会被攻破。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+# 项目目录必须整体不可见：里面有 .env（模型密钥、数据库口令、LangSmith key）。
+# 只读不够——可读就等于可泄露。
+InaccessiblePaths=/personal-agent-platform
+
+# 关闭出站网络。执行中的代码本来就在 --network none 的容器里，
+# 这一层是给启动器自身兜底：它没有理由访问任何外部地址。
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# 启动器只需要写日志；容器的工作目录在容器内 tmpfs，与宿主无关。
+ReadWritePaths=/var/log
+
+# 启动器本身很轻，真正吃资源的是容器，由 --memory/--cpus 限制。
+MemoryMax=1G
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

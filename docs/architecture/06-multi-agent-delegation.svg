@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 588" width="680" height="588" role="img" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif">
+<title>多智能体委派：边界只收窄不放宽</title>
+<desc>用户请求进入入口智能体，委派给下游智能体时生效权限取交集、委派预算沿链取最小值；写操作跨两次请求，用 operation_id 串成同一次运行。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<rect width="680" height="588" fill="#FFFFFF"/>
+
+<!-- 左栏：调用链 -->
+<text x="40" y="28" font-size="12" fill="#5F5E5A">调用链</text>
+
+<rect x="40" y="40" width="176" height="48" rx="8" fill="#F1EFE8" stroke="#D3D1C7" stroke-width="0.5"/>
+<text x="128" y="58" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#2C2C2A">用户请求</text>
+<text x="128" y="74" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#5F5E5A">身份 + 租户 + Scope</text>
+
+<path d="M128 88 V108" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="40" y="110" width="176" height="56" rx="8" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="128" y="130" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">入口智能体 · cs</text>
+<text x="128" y="147" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">判断该找谁、把事转过去</text>
+
+<path d="M128 166 V196" fill="none" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="136" y="178" font-size="10.5" fill="#0F6E56">delegate_to_agent</text>
+<text x="136" y="191" font-size="10.5" fill="#888780">深度 +1</text>
+
+<rect x="40" y="198" width="176" height="56" rx="8" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+<text x="128" y="218" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">被委派 · ops</text>
+<text x="128" y="235" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0F6E56">在收窄后的边界里执行</text>
+
+<!-- 被拒的一条：虚线 -->
+<path d="M40 300 H216" fill="none" stroke="#A32D2D" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="44" y="292" font-size="10.5" fill="#A32D2D">越界调用在这里被拒</text>
+<text x="44" y="316" font-size="10.5" fill="#888780">记进审计，不当成系统故障</text>
+
+<!-- 右栏：边界收窄 -->
+<text x="272" y="28" font-size="12" fill="#5F5E5A">生效边界 = 三者的交集</text>
+
+<rect x="272" y="40" width="368" height="52" rx="8" fill="#F1EFE8" stroke="#D3D1C7" stroke-width="0.5"/>
+<text x="286" y="58" font-size="11.5" fill="#2C2C2A">人的权限 P</text>
+<text x="286" y="76" font-size="11" fill="#5F5E5A">当前身份在这个租户里能做什么</text>
+
+<rect x="288" y="102" width="336" height="52" rx="8" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="302" y="120" font-size="11.5" fill="#0C447C">入口智能体边界 B1</text>
+<text x="302" y="138" font-size="11" fill="#185FA5">职责 + 工具白名单 + 读/写</text>
+
+<rect x="304" y="164" width="304" height="52" rx="8" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+<text x="318" y="182" font-size="11.5" fill="#0F6E56">被委派边界 B2</text>
+<text x="318" y="200" font-size="11" fill="#0F6E56">下游自己的，再与上游取交集</text>
+
+<path d="M456 216 V236" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+<rect x="304" y="238" width="304" height="46" rx="8" fill="#FFFFFF" stroke="#9FE1CB" stroke-width="0.8"/>
+<text x="456" y="261" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">任何一环都只能更窄，不能更宽</text>
+
+<text x="272" y="308" font-size="11" fill="#5F5E5A">放宽不生效、收窄立即生效 —— 所以「审批期间有人改了边界」</text>
+<text x="272" y="324" font-size="11" fill="#5F5E5A">不会让一张按旧边界批下来的单子照新边界执行。</text>
+
+<!-- 委派预算 -->
+<text x="40" y="352" font-size="12" fill="#5F5E5A">委派预算：沿链取 min，不是取当前环</text>
+
+<rect x="40" y="364" width="120" height="46" rx="8" fill="#FAEEDA" stroke="#FAC775" stroke-width="0.5"/>
+<text x="100" y="380" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#854F0B">cs 配 3 次</text>
+<text x="100" y="396" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#854F0B">深度 2</text>
+
+<path d="M160 387 H196" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="166" y="381" font-size="10" fill="#888780">min</text>
+
+<rect x="198" y="364" width="120" height="46" rx="8" fill="#FAEEDA" stroke="#FAC775" stroke-width="0.5"/>
+<text x="258" y="380" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#854F0B">ops 配 5 次</text>
+<text x="258" y="396" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#854F0B">深度 3</text>
+
+<path d="M318 387 H354" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+<rect x="356" y="358" width="284" height="58" rx="8" fill="#FFFFFF" stroke="#9FE1CB" stroke-width="0.8"/>
+<text x="498" y="376" text-anchor="middle" dominant-baseline="central" font-size="11.5" fill="#0F6E56">生效：3 次 / 深度 2</text>
+<text x="498" y="394" text-anchor="middle" dominant-baseline="central" font-size="10.5" fill="#888780">下游更宽也越不过去；0 不等于默认</text>
+<text x="498" y="408" text-anchor="middle" dominant-baseline="central" font-size="10.5" fill="#888780">（0 是「一次都不许」）</text>
+
+<!-- 审批跨两次请求 -->
+<path d="M40 422 H640" fill="none" stroke="#E3E1D9" stroke-width="1"/>
+
+<text x="40" y="444" font-size="12" fill="#5F5E5A">写操作跨两次请求：同一次运行，两条 trace</text>
+
+<rect x="40" y="456" width="176" height="48" rx="8" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="128" y="474" text-anchor="middle" dominant-baseline="central" font-size="11.5" fill="#0C447C">trace A · 发起</text>
+<text x="128" y="490" text-anchor="middle" dominant-baseline="central" font-size="10.5" fill="#185FA5">awaiting_approval</text>
+
+<path d="M216 480 H256" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+<rect x="258" y="456" width="164" height="48" rx="8" fill="#FAEEDA" stroke="#FAC775" stroke-width="0.5"/>
+<text x="340" y="474" text-anchor="middle" dominant-baseline="central" font-size="11.5" fill="#854F0B">审批单 PENDING</text>
+<text x="340" y="490" text-anchor="middle" dominant-baseline="central" font-size="10.5" fill="#854F0B">人可能几小时后才点</text>
+
+<path d="M422 480 H462" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+<rect x="464" y="456" width="176" height="48" rx="8" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+<text x="552" y="474" text-anchor="middle" dominant-baseline="central" font-size="11.5" fill="#0F6E56">trace B · 确认后执行</text>
+<text x="552" y="490" text-anchor="middle" dominant-baseline="central" font-size="10.5" fill="#0F6E56">从审批单继承 operation_id</text>
+
+<text x="40" y="528" font-size="10.5" fill="#888780">operation_id 是分组键，不是 trace 之间的父子边：同组内所有成员的值相同，</text>
+<text x="40" y="544" font-size="10.5" fill="#888780">所以「按 Agent 的轮次之和 = 总轮次」仍然成立，不会被运行视图悄悄改数。</text>
+
+<text x="40" y="572" font-size="10" fill="#B4B2A9">来源：docs/A2A.md §10</text>
+</svg>

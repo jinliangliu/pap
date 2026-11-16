@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+# 服务器裸仓库（/root/git/personal-agent-platform.git）的 post-receive 钩子。
+#
+# 作用：本地 git push 后，自动把 /personal-agent-platform 工作区对齐到 master。
+# 这样一次 push 就完成发版，不必再单独开 SSH 会话——这台机器对新建 SSH 连接
+# 有速率限制，连接次数越少越稳。
+#
+# 安装：
+#   install -m 755 deploy/git-hooks/post-receive \
+#     /root/git/personal-agent-platform.git/hooks/post-receive
+#
+# 服务器上直接改过的代码不会被静默丢弃：先 stash 再 reset，stash 可用
+# `git stash list` 找回。
+#
+set -e
+
+LOG=/var/log/pap-deploy.log
+
+{
+  printf '=== %s\n' "$(date '+%F %T')"
+
+  # post-receive 运行时会带上 GIT_DIR=<裸仓库>，不清掉的话 cd 到工作区后
+  # git 仍指向裸仓库，报 `fatal: not a git repository: '.'`。
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX \
+        GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_QUARANTINE_PATH
+
+  cd /personal-agent-platform
+
+  BEFORE=$(git rev-parse --short HEAD 2>/dev/null || echo none)
+
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    git stash push -m "auto-stash before deploy $(date +%F_%T)" >/dev/null 2>&1 || true
+    printf 'stashed local changes (was %s)\n' "$BEFORE"
+  fi
+
+  git fetch origin --quiet
+  git reset --hard origin/master >/dev/null
+  git rev-parse HEAD > .deployed-commit
+  printf 'worktree %s -> %s\n' "$BEFORE" "$(git rev-parse --short HEAD)"
+} >> "$LOG" 2>&1

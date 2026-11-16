@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 560" width="680" height="560" role="img" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif">
+<title>沙箱隔离演进：Docker + gVisor、Kubernetes + Kata、Firecracker Worker Pool</title>
+<desc>三阶段共用同一套 HTTP 协议。阶段一已实现：单机、每次执行一个 gVisor 容器；阶段二为 Kubernetes 上每执行一个 Kata Pod；阶段三为自建 Firecracker microVM 池。图下方列出升级触发条件。</desc>
+<rect width="680" height="560" fill="#FFFFFF"/>
+
+<text x="24" y="34" font-size="17" font-weight="600" fill="#1F2328">沙箱隔离演进：三阶段与升级触发条件</text>
+<text x="24" y="55" font-size="11" fill="#5B6270">只有阶段一已实现；阶段二、三为存档设计，触发条件满足后再投入</text>
+
+<!-- 协议契约 -->
+<rect x="24" y="70" width="632" height="42" rx="8" fill="#F7F8FA" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="40" y="88" font-size="11" font-weight="600" fill="#1F2328">统一协议（换阶段不改平台代码）</text>
+<text x="40" y="103" font-size="10" fill="#5B6270">POST /v1/execute · GET /v1/executions/{id} · GET /v1/health　　租户：X-Sandbox-Tenant</text>
+
+<!-- 阶段一 -->
+<rect x="24" y="128" width="196" height="34" rx="8" fill="#E8F1FB" stroke="#B5D4F4" stroke-width="0.8"/>
+<text x="38" y="150" font-size="11.5" font-weight="600" fill="#0C447C">阶段一 · Docker + gVisor</text>
+<rect x="164" y="136" width="44" height="18" rx="9" fill="#185FA5"/>
+<text x="186" y="149" text-anchor="middle" font-size="9.5" fill="#FFFFFF">已实现</text>
+
+<rect x="24" y="172" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.8"/>
+<text x="38" y="191" font-size="10.5" fill="#0C447C">沙箱服务：鉴权 / 租户 / 配额</text>
+<rect x="24" y="210" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.8"/>
+<text x="38" y="229" font-size="10.5" fill="#0C447C">docker run --rm（每执行一个）</text>
+<rect x="24" y="248" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.8"/>
+<text x="38" y="267" font-size="10.5" fill="#0C447C">gVisor 用户态内核（拦截 syscall）</text>
+<rect x="24" y="286" width="196" height="26" rx="6" fill="#F2F4F7" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="38" y="303" font-size="10.5" fill="#5B6270">宿主 Linux 内核（共享）</text>
+
+<text x="28" y="336" font-size="10" fill="#5B6270">启动 0.2–0.6s　·　单机，密度高</text>
+<text x="28" y="353" font-size="10" fill="#5B6270">故障域：整机　·　运维：docker + runsc</text>
+<text x="28" y="370" font-size="10" fill="#B45309">取舍：docker socket ≈ root</text>
+
+<!-- 阶段二 -->
+<rect x="242" y="128" width="196" height="34" rx="8" fill="#F4F5F7" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="256" y="150" font-size="11.5" font-weight="600" fill="#3F4650">阶段二 · K8s + Kata</text>
+<rect x="382" y="136" width="44" height="18" rx="9" fill="#8A9099"/>
+<text x="404" y="149" text-anchor="middle" font-size="9.5" fill="#FFFFFF">存档</text>
+
+<rect x="242" y="172" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="256" y="191" font-size="10.5" fill="#3F4650">沙箱网关（Deployment，无状态）</text>
+<rect x="242" y="210" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="256" y="229" font-size="10.5" fill="#3F4650">Pod（RuntimeClass=kata）</text>
+<rect x="242" y="248" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="256" y="267" font-size="10.5" fill="#3F4650">guest 内核 + KVM（每 Pod 一个）</text>
+<rect x="242" y="286" width="196" height="26" rx="6" fill="#F2F4F7" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="256" y="303" font-size="10.5" fill="#5B6270">K8s 调度 + NetworkPolicy deny-all</text>
+
+<text x="246" y="336" font-size="10" fill="#5B6270">启动 0.5–1.5s　·　多节点，可弹性</text>
+<text x="246" y="353" font-size="10" fill="#5B6270">故障域：单节点　·　运维：集群 + Kata</text>
+<text x="246" y="370" font-size="10" fill="#5B6270">收益：每租户独立 guest 内核</text>
+
+<!-- 阶段三 -->
+<rect x="460" y="128" width="196" height="34" rx="8" fill="#F4F5F7" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="474" y="150" font-size="11.5" font-weight="600" fill="#3F4650">阶段三 · Firecracker</text>
+<rect x="600" y="136" width="44" height="18" rx="9" fill="#8A9099"/>
+<text x="622" y="149" text-anchor="middle" font-size="9.5" fill="#FFFFFF">存档</text>
+
+<rect x="460" y="172" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="474" y="191" font-size="10.5" fill="#3F4650">调度器（bin-pack，按租户打散）</text>
+<rect x="460" y="210" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="474" y="229" font-size="10.5" fill="#3F4650">microVM（jailer + vsock agent）</text>
+<rect x="460" y="248" width="196" height="30" rx="6" fill="#FFFFFF" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="474" y="267" font-size="10.5" fill="#3F4650">guest 内核 + 快照恢复</text>
+<rect x="460" y="286" width="196" height="26" rx="6" fill="#F2F4F7" stroke="#D6D9DE" stroke-width="0.8"/>
+<text x="474" y="303" font-size="10.5" fill="#5B6270">自建 worker 池 + 只读 rootfs</text>
+
+<text x="464" y="336" font-size="10" fill="#5B6270">启动 0.1–0.3s　·　多机，高密度</text>
+<text x="464" y="353" font-size="10" fill="#5B6270">故障域：单 VM　·　运维：自研控制面</text>
+<text x="464" y="370" font-size="10" fill="#5B6270">收益：最强隔离 + 接近容器密度</text>
+
+<!-- 升级触发 -->
+<rect x="24" y="398" width="632" height="138" rx="10" fill="#FFFDF5" stroke="#E8D9A8" stroke-width="0.9"/>
+<text x="40" y="420" font-size="11.5" font-weight="600" fill="#7A5B12">升级触发：满足任意两条再进入下一阶段</text>
+
+<circle cx="44" cy="440" r="2.5" fill="#B45309"/>
+<text x="54" y="444" font-size="10.5" fill="#5B4A22">需要跨节点扩容，或滚动升级不能中断在途执行</text>
+<circle cx="44" cy="462" r="2.5" fill="#B45309"/>
+<text x="54" y="466" font-size="10.5" fill="#5B4A22">租户要求「每租户独立 guest 内核」，而不只是共享内核上的 syscall 拦截</text>
+<circle cx="44" cy="484" r="2.5" fill="#B45309"/>
+<text x="54" y="488" font-size="10.5" fill="#5B4A22">单机故障已造成业务可见损失，需要把故障域缩到单次执行</text>
+<circle cx="44" cy="506" r="2.5" fill="#B45309"/>
+<text x="54" y="510" font-size="10.5" fill="#5B4A22">出现多团队共用，需要按命名空间做配额、审计与网络策略</text>
+
+<text x="40" y="528" font-size="9.5" fill="#8A7A4A">共同纪律：执行记录外置、失败不自动重发、先灰度内部租户、回滚只改 SANDBOX_BASE_URL</text>
+</svg>

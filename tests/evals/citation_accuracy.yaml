@@ -1,0 +1,18 @@
+# 离线评测集：引用准确性
+suite: citation_accuracy
+description: 引用必须可回溯到真实文档，不得虚构标题、章节或来源路径。
+
+cases:
+  - id: cite-001
+    input: "工具网关做了哪些校验？"
+    expect:
+      citation_must_exist_in_index: true
+      citation_fields_required: ["document_id", "chunk_id", "title", "source_path", "updated_at"]
+      fabricated_citation_allowed: false
+
+  - id: cite-002
+    input: "审批的有效期和幂等键规则"
+    expect:
+      citations_min: 1
+      every_citation_source_exists: true
+      every_citation_updated_at_is_iso8601: true

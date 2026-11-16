@@ -1,0 +1,34 @@
+# 离线评测集：安全与脱敏
+suite: safety
+description: 日志、审计与模型上下文中不得出现密钥、Token、Cookie 与未脱敏敏感参数。
+
+cases:
+  - id: safe-001
+    name: 模型密钥不出现在日志与响应中
+    setup: {openai_api_key: "sk-test-secret-value"}
+    action: {chat: "你好"}
+    expect:
+      response_body_not_contains: ["sk-test-secret-value"]
+      log_not_contains: ["sk-test-secret-value"]
+      audit_not_contains: ["sk-test-secret-value"]
+
+  - id: safe-002
+    name: 认证头不被信任为身份来源（production 模式）
+    setup: {app_env: production, headers: {X-User-ID: "user-a"}}
+    expect:
+      http_status: 401
+
+  - id: safe-003
+    name: 敏感文件不入库
+    setup: {files: [".env", "id_rsa", "cookies.txt", "backup.sqlite"]}
+    action: {ingest: true}
+    expect:
+      indexed_documents: 0
+      skipped_contains: [".env", "id_rsa", "cookies.txt", "backup.sqlite"]
+
+  - id: safe-004
+    name: 内部错误不泄露堆栈与 SQL
+    setup: {force_db_error: true}
+    expect:
+      http_status: 500
+      response_body_not_contains: ["Traceback", "SELECT", "postgresql://"]

@@ -1,0 +1,27 @@
+{
+  "entry": "triage",
+  "nodes": [
+    {
+      "id": "triage",
+      "agent": "Gas_Industry_Knowledge",
+      "task": "先用 search_knowledge 检索，查询词用「调压箱 技术规范 要求」（不要自己拼一长串并列词：实测「调压箱 泄漏 通风」这类查询会被语义重筛判为全部不相关，返回 0 条）。\n\n然后针对下面的现场情况，给出适用的规程条款（引原文 + 条款号）。\n\n现场情况：\n{{input.text}}",
+      "emit": {
+        "field": "rules",
+        "max_chars": 2000
+      },
+      "next": [{ "when": null, "to": "dispatch" }]
+    },
+    {
+      "id": "dispatch",
+      "agent": "field-ops",
+      "task": "依据下面的规程与现场情况，判断隐患等级并建单（站点 station-001）。等级只能取「一般」「较大」「重大」之一，写清理由；工单标题格式「【等级】设备或位置隐患」，描述含现场情况、等级与理由、依据条款、处置时限（重大=立即停气处置；较大=24 小时内；一般=7 日内）。\n\n现场情况：\n{{input.text}}\n\n规程：\n{{nodes.triage.rules}}",
+      "next": [{ "when": null, "to": "answer" }]
+    },
+    {
+      "id": "answer",
+      "kind": "compose",
+      "task": "派单完成。\n\n规程依据：\n{{nodes.triage}}\n\n执行结果：\n{{nodes.dispatch}}",
+      "next": []
+    }
+  ]
+}

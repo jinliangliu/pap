@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 490" width="680" height="490" role="img" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif">
+<title>部署视角：进程、端口绑定与网络边界</title>
+<desc>云主机内 Nginx 是唯一公网入口，uvicorn 与 langgraph dev 只绑定回环地址，PostgreSQL 与 Redis 由 Docker 提供并只映射到 127.0.0.1；DeepSeek 与代码沙箱是出站依赖，开发者通过 SSH 隧道访问 Studio。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<rect width="680" height="490" fill="#FFFFFF"/>
+
+<rect x="90" y="40" width="150" height="46" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="165" y="57" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">公网客户端</text>
+<text x="165" y="73" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">HTTPS / HTTP Basic</text>
+
+<rect x="40" y="110" width="480" height="280" rx="16" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="60" y="132" font-size="12" font-weight="500" fill="#185FA5">云主机 203.0.113.10</text>
+
+<rect x="60" y="146" width="200" height="46" rx="8" fill="#FAEEDA" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="160" y="163" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#854F0B">Nginx · :80</text>
+<text x="160" y="179" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#854F0B">0.0.0.0 · 唯一公网端口</text>
+
+<rect x="60" y="204" width="200" height="46" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="160" y="221" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">uvicorn · :8000</text>
+<text x="160" y="237" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">127.0.0.1 · systemd</text>
+
+<rect x="60" y="262" width="200" height="46" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="160" y="279" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">langgraph dev · :2024</text>
+<text x="160" y="295" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">127.0.0.1 · systemd</text>
+
+<rect x="290" y="146" width="200" height="46" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text x="390" y="163" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">PostgreSQL · :5432</text>
+<text x="390" y="179" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0C447C">127.0.0.1 · Docker</text>
+
+<rect x="290" y="204" width="200" height="46" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text x="390" y="221" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">Redis · :6380</text>
+<text x="390" y="237" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0C447C">127.0.0.1 · Docker</text>
+
+<rect x="290" y="262" width="200" height="46" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text x="390" y="279" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">data/knowledge</text>
+<text x="390" y="295" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0C447C">源文件 · 宿主目录</text>
+
+<rect x="60" y="320" width="430" height="38" rx="8" fill="#FFFFFF" stroke="#85B7EB" stroke-width="0.5" stroke-dasharray="4 3"/>
+<text x="275" y="339" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">日志 · /var/log/pap-api.log、/var/log/pap-studio.log</text>
+
+<rect x="540" y="146" width="100" height="56" rx="8" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="590" y="165" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">DeepSeek</text>
+<text x="590" y="183" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">出站 · 规划</text>
+
+<rect x="540" y="224" width="100" height="56" rx="8" fill="#FFFFFF" stroke="#185FA5" stroke-width="0.5"/>
+<text x="590" y="243" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">代码沙箱</text>
+<text x="590" y="261" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">execute 调用</text>
+
+<path d="M160 192 V200" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M165 86 V106" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M520 174 H536" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M520 252 H536" fill="none" stroke="#378ADD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="70" y="426" width="190" height="44" rx="8" fill="#FFFFFF" stroke="#378ADD" stroke-width="0.5" stroke-dasharray="4 3"/>
+<text x="165" y="442" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0C447C">开发者本机</text>
+<text x="165" y="458" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5">ssh -L 2024:127.0.0.1:2024</text>
+
+<path d="M165 426 V394" fill="none" stroke="#378ADD" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+
+<rect x="320" y="425" width="14" height="14" rx="3" fill="#FFFFFF" stroke="#B5D4F4" stroke-width="0.5"/>
+<text x="342" y="432" dominant-baseline="central" font-size="11" fill="#5F5E5A">仅绑定 127.0.0.1</text>
+<rect x="320" y="451" width="14" height="14" rx="3" fill="#FAEEDA" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="342" y="458" dominant-baseline="central" font-size="11" fill="#5F5E5A">对公网开放 :80</text>
+</svg>

@@ -1,0 +1,32 @@
+# 离线评测集：知识问答
+# 每条 case 描述输入、可接受结果与失败判定。评测脚本可逐条回放并断言。
+suite: knowledge_qa
+description: 知识库问答必须基于检索资料，找不到时必须明确拒绝编造。
+
+cases:
+  - id: kq-001
+    input: "场站压力低于阈值时应该怎么处理？"
+    setup:
+      documents: ["data/knowledge/manuals/pressure_threshold.md"]
+    expect:
+      answer_contains_any: ["阈值", "处置"]
+      citations_min: 1
+      must_not_claim: ["我推测", "应该是"]
+
+  - id: kq-002
+    input: "请介绍一下公司 2035 年的战略规划"
+    setup:
+      documents: []
+    expect:
+      answer_contains: "当前知识库中未找到足以支持该结论的资料"
+      citations_min: 0
+      must_not_contain: ["根据资料明确说明"]
+
+  - id: kq-003
+    input: "维护工单的审批有效期是多久？"
+    setup:
+      documents: ["data/knowledge/notes/approval_policy.md"]
+    expect:
+      answer_contains_any: ["5 分钟", "300 秒"]
+      citations_min: 1
+      citation_fields: ["title", "section", "updated_at"]

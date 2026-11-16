@@ -1,0 +1,35 @@
+# 离线评测集：授权与越权
+suite: authorization
+description: 身份、角色、站点授权必须同时满足；错误信息不得泄露资源是否存在。
+
+cases:
+  - id: authz-001
+    name: 无站点授权的只读查询被拒绝
+    user: {roles: [viewer], scopes: [station.read], station_grants: []}
+    action: {tool: get_station_snapshot, arguments: {station_id: "station-999"}}
+    expect:
+      error_category: tool_rejected
+      answer_contains: "当前资源不可访问"
+      must_not_contain: ["station-999 不存在", "未授权站点列表"]
+
+  - id: authz-002
+    name: 只读授权不能执行写操作
+    user: {roles: [viewer], scopes: [station.read], station_grants: [{station_id: "station-001", can_read: true, can_write: false}]}
+    action: {tool: create_maintenance_ticket, arguments: {station_id: "station-001", title: "x", description: "y"}}
+    expect:
+      error_category: tool_rejected
+      write_executed: false
+
+  - id: authz-003
+    name: 缺少知识密级 scope 时检索不到机密文档
+    user: {scopes: [knowledge.read]}
+    action: {knowledge_query: "机密处置流程"}
+    expect:
+      confidential_documents_returned: 0
+
+  - id: authz-004
+    name: 跨用户审批不可确认
+    setup: {approval_owner: "user-a", caller: "user-b"}
+    action: {confirm_approval: true}
+    expect:
+      http_status: 404

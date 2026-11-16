@@ -1,0 +1,14 @@
+[Unit]
+Description=Personal Agent Platform 每分钟巡检
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+# 机器重启或告警处理期间错过的轮次，开机后补一次即可，
+# 不需要把错过的每一分钟都补跑。
+Persistent=true
+Unit=pap-watchdog.service
+
+[Install]
+WantedBy=timers.target

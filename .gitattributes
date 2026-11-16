@@ -1,0 +1,10 @@
+# 部署脚本会在 Linux 上直接执行。Windows 的 core.autocrlf=true 会把它们
+# 转成 CRLF，bash 会报 `$'\r': command not found`，所以强制 LF。
+*.sh text eol=lf
+
+# Windows 侧脚本反过来强制 CRLF：批处理的多行括号块对 LF 解析不稳。
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 属性文件自身也保持 LF，避免被当作文本重新换行
+/.gitattributes text eol=lf

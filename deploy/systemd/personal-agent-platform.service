@@ -1,0 +1,34 @@
+[Unit]
+Description=Personal Agent Platform API
+Documentation=file:///personal-agent-platform/docs/DEPLOYMENT.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+WorkingDirectory=/personal-agent-platform
+
+# 配置只从 .env 读取，不在单元文件里写任何密钥。
+EnvironmentFile=/personal-agent-platform/.env
+
+# uv run 会读 pyproject 与 .venv；--no-sync 表示启动时不再解析依赖，
+# 依赖更新必须由部署流程显式执行 uv sync，避免启动被网络拖死。
+ExecStart=/root/.local/bin/uv run --no-sync uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+Restart=on-failure
+RestartSec=5
+
+# 只监听回环地址，外部访问必须经过 Nginx。
+StandardOutput=append:/var/log/pap-api.log
+StandardError=append:/var/log/pap-api.log
+
+# 基础加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/personal-agent-platform/data /var/log
+
+[Install]
+WantedBy=multi-user.target
