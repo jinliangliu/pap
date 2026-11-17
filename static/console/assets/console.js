@@ -11467,7 +11467,6 @@
       '<path d="M6 6l12 12M18 6L6 18"/></svg>' +
       "</button>" +
       "</div></header>" +
-      '<div class="studio-focus"><select id="studio-focus" aria-label="当前对象"></select></div>' +
       '<div class="studio-log" id="studio-log"></div>' +
       '<div class="studio-foot">' +
       // 托盘在输入框上方、与输入框同宽：附件是「即将发出的东西」，
@@ -11490,6 +11489,11 @@
       'title="添加图片、PDF、Markdown 或文本（可多选）" role="button" tabindex="0" ' +
       'aria-label="添加附件">' + ico("plus") + "</label>" +
       '<input type="file" id="studio-file" accept="' + STUDIO_ATTACH_ACCEPT + '" multiple hidden>' +
+      // 对象选择紧挨加号：它和附件一样，都是「这一条消息要带上的上下文」。
+      // 以前放在头部单独一行，读起来像整个面板的全局设置——切了对象，
+      // 却以为改的是别处。放进工具行，跟着这一条消息一起读才不歧义。
+      '<select id="studio-focus" title="这条消息的当前对象" ' +
+      'aria-label="当前对象"></select>' +
       // 语音输入用的是浏览器自带的识别服务，不经过本平台后端；
       // 因此它在不支持该接口或断网的浏览器里不可用，处理见 bindStudioVoice。
       '<button class="studio-tool" type="button" id="studio-mic" ' +

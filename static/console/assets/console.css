@@ -4514,14 +4514,6 @@ body.lb-open { overflow: hidden; }
   .studio-acts .btn.icon.spinning svg { animation: none; }
 }
 
-.studio-focus { padding: 8px 12px; border-bottom: 1px solid var(--line-soft); }
-.studio-focus select {
-  width: 100%; padding: 6px 8px;
-  font: inherit; font-size: 12px; color: var(--text);
-  background: var(--surface-2);
-  border: 1px solid var(--line); border-radius: 8px;
-}
-
 .studio-log {
   flex: 1; overflow-y: auto;
   padding: 12px;
@@ -4624,6 +4616,30 @@ body.lb-open { overflow: hidden; }
 .studio-composer textarea::placeholder { color: var(--faint); }
 
 .studio-tools { display: flex; align-items: center; gap: 2px; padding-top: 4px; }
+
+/* 对象选择紧挨加号。它和附件是同一类东西——这一条消息要带上的上下文，
+   所以与附件同处一行、同一高度；单独占头部一行会被读成面板的全局设置。
+   高度对齐 28px 的图标按钮，宽度按内容伸缩（上限 168px）：
+   长名字宁可裁掉，也不许把麦克风与发送挤出可视区。 */
+#studio-focus {
+  flex: 0 1 auto; width: auto; min-width: 72px; max-width: 168px;
+  height: 28px; margin-left: 4px; padding: 0 6px;
+  font: inherit; font-size: 11.5px; line-height: 1; color: var(--text-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft); border-radius: 8px;
+  cursor: pointer;
+  text-overflow: ellipsis;
+}
+#studio-focus:hover { border-color: var(--line); color: var(--text); }
+/* 智能体列表还没读回来时是个空盒子：宁可先不占位，也不要露一个没字的控件。 */
+#studio-focus:empty { display: none; }
+/* 全局 `select:focus` 会再画一圈 3px 绿晕（与输入框那层是同一套），
+   在这张卡片里就成了双层框，所以要显式清掉。 */
+#studio-focus:focus,
+#studio-focus:focus-visible {
+  outline: 2px solid var(--green-line); outline-offset: 1px;
+  border-color: var(--green-line); box-shadow: none;
+}
 
 /* 工具按钮：无边框圆形，hover 才出现底色。
    在这一块干净的白卡上，每个按钮都描边会变成一排小方块，噪音压过输入本身。 */
