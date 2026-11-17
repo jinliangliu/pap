@@ -103,5 +103,5 @@
 <text x="40" y="528" font-size="10.5" fill="#888780">operation_id 是分组键，不是 trace 之间的父子边：同组内所有成员的值相同，</text>
 <text x="40" y="544" font-size="10.5" fill="#888780">所以「按 Agent 的轮次之和 = 总轮次」仍然成立，不会被运行视图悄悄改数。</text>
 
-<text x="40" y="572" font-size="10" fill="#B4B2A9">来源：docs/A2A.md §10</text>
+<text x="40" y="572" font-size="10" fill="#B4B2A9">来源：docs/A2A.md §10、docs/AGENT_QUOTA.md、docs/RUNTIME_VIEW.md §4.2</text>
 </svg>

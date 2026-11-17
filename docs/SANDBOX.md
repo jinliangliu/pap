@@ -5,7 +5,7 @@ Agent 运行在平台进程内，但**不执行任何代码**。需要跑代码�
 gVisor 容器，拿回 stdout / stderr / 退出码。
 
 第一阶段采用 **Docker + gVisor（runsc）**。第二、三阶段（Kubernetes + Kata、
-Firecracker Worker Pool）不在当前实现范围内。
+Firecracker Worker Pool）只有设计存档，见 `docs/SANDBOX_ROADMAP.md`。
 
 ## 1. 为什么必须外置
 
@@ -151,7 +151,7 @@ PAP_INSTALL_SANDBOX=1 bash deploy/install.sh
 
 历史上正是因为靠手工拷贝，`/opt/pap-sandbox/server.py` 曾停留在旧版本
 （缺 `X-Sandbox-User` / `X-Sandbox-Conversation` 归属校验），而仓库里已经是新版。
-排查手法见 `docs/DEPLOYMENT.md` §7「代码同步与日常运维」：比对远端与工作区的文件清单与行尾。
+排查手法见 `docs/REMOTE_AUDIT.md` 第 3 节。
 
 跳过沙箱（例如只更新主服务）：`PAP_INSTALL_SANDBOX=0 bash deploy/install.sh`。
 

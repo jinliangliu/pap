@@ -1,7 +1,7 @@
 # tests/unit/test_observability.py
 """自研观测的单元测试。
 
-覆盖四类必须成立的性质：
+覆盖四类必须成立的性质（docs/OBSERVABILITY.md §9）：
 
 1. 采内容：full/summary/off 三种模式各自的语义，敏感键必须打码；
 2. span 树：父子关系与 seq 正确，异常要落成 error + 类别；

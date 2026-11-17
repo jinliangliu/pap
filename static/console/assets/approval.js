@@ -105,6 +105,26 @@
     };
   }
 
+  /* 一次操作只该长一张卡。
+   *
+   * 卡属于「发起」那条消息。执行完成后服务端还会往会话里补一条带同一个
+   * `approval_id` 的结论消息（委派、编排续跑时可能补两条），它们的 metadata
+   * 里也有审批号。照单全收，历史里同一次操作就顶着两三张一模一样的卡——
+   * 而且只有刷新后才看得到：当场那次只渲染了发起的一条。
+   *
+   * 用法：还原历史之前 new 一个，按消息顺序逐条问，只有第一次问到的返回号，
+   * 其余返回空串。
+   */
+  function cardOwners() {
+    var seen = {};
+    return function (meta) {
+      var id = meta && meta.approval_id ? String(meta.approval_id) : "";
+      if (!id || seen[id]) return "";
+      seen[id] = true;
+      return id;
+    };
+  }
+
   /* 409 也可能是结论。
    *
    * 确认/取消这两个动作，服务端会用 409 表示「当前状态不允许执行」——已过期、
@@ -128,6 +148,7 @@
     statusText: statusText,
     outcome: outcome,
     settledFromError: settledFromError,
+    cardOwners: cardOwners,
     fromMeta: fromMeta
   };
 })();

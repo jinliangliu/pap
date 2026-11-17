@@ -317,3 +317,22 @@ async def test_batch_hides_a_colleagues_approvals(client, planner, session, seed
 
     assert response.status_code == 200
     assert response.json()["items"] == []
+
+
+async def test_confirm_reports_the_tool_result_not_a_boilerplate(client, planner):
+    """确认后的回复要用工具自己的结论。
+
+    平台此前只回一句「操作请求已提交，但尚未获得可确认的回读结果」，
+    于是十几个写工具在会话里长得一模一样——而工具早就把结论（工单号、
+    入库几片、下架了几片）写在自己的 message 里了。「核验过没有」由 status
+    表达、审批卡单独标着，不该把结论挤掉。
+    """
+    approval_id = await _create_pending_approval(client, planner, "thread-verdict")
+
+    response = await client.post(f"/api/v1/approvals/{approval_id}/confirm", json={})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["message"]
+    assert "操作请求已提交" not in body["message"]
+    assert body["message"] == "工单已在演示模式下受理，尚未核验。"

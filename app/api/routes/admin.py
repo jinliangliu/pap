@@ -143,29 +143,55 @@ async def update_runtime_settings(
 
     观测开关要动两处：先写配置（库 + 进程内存），再让写入器起停后台任务。
     顺序不能反——`start()` 会再读一次开关，先起任务再改配置会被判成「关」。
-    """
-    previous = runtime_settings.obs_enabled()
 
-    await runtime_settings.set_observability(
-        payload.observability_enabled, actor=identity.subject
-    )
-    await get_obs_writer().set_enabled(payload.observability_enabled)
+    两个字段都是「不传 = 不动」：只想改容量时不必把观测开关的当前值抄一遍。
+    """
+    toggled = payload.observability_enabled is not None
+    previous = runtime_settings.obs_enabled() if toggled else None
+
+    if toggled:
+        await runtime_settings.set_observability(
+            payload.observability_enabled, actor=identity.subject
+        )
+        await get_obs_writer().set_enabled(payload.observability_enabled)
+
+    # 切片上限只写配置，没有第二个落点。
+    chunk_limit_changed = False
+    if payload.knowledge_max_chunks is not None:
+        chunk_limit_changed = await runtime_settings.set_knowledge_max_chunks(
+            payload.knowledge_max_chunks, actor=identity.subject
+        )
 
     with platform_admin_tenant_scope("platform"):
         async with async_session_factory() as session:
             async with session.begin():
-                await _audit(
-                    session,
-                    identity=identity,
-                    target_tenant="platform",
-                    operation="runtime_settings_updated",
-                    resource_type="runtime_settings",
-                    resource_id=runtime_settings.OBSERVABILITY_ENABLED,
-                    metadata={
-                        "observability_enabled": payload.observability_enabled,
-                        "previous": previous,
-                    },
-                )
+                if toggled:
+                    await _audit(
+                        session,
+                        identity=identity,
+                        target_tenant="platform",
+                        operation="runtime_settings_updated",
+                        resource_type="runtime_settings",
+                        resource_id=runtime_settings.OBSERVABILITY_ENABLED,
+                        metadata={
+                            "observability_enabled": payload.observability_enabled,
+                            "previous": previous,
+                        },
+                    )
+                if chunk_limit_changed:
+                    # 单独一条审计：它和观测开关是两件事，塞进上一条的
+                    # metadata 里会让「谁在什么时候放宽了容量」查不出来。
+                    await _audit(
+                        session,
+                        identity=identity,
+                        target_tenant="platform",
+                        operation="runtime_settings_updated",
+                        resource_type="runtime_settings",
+                        resource_id=runtime_settings.KNOWLEDGE_MAX_CHUNKS,
+                        metadata={
+                            "knowledge_max_chunks": payload.knowledge_max_chunks,
+                        },
+                    )
 
     return RuntimeSettingsResponse(**runtime_settings.snapshot())
 

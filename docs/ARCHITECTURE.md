@@ -13,7 +13,7 @@
 | 部署视角 | 哪些端口对外、进程如何隔离 | [04-deployment.svg](architecture/04-deployment.svg) |
 | 沙箱演进 | 三个阶段的隔离差异与升级条件 | [05-sandbox-evolution.svg](architecture/05-sandbox-evolution.svg) |
 
-> 建设顺序、每一阶段明确不做什么，见末图
+> 「为什么按这个顺序建、哪些东西明确不做」，见 [DESIGN.md](DESIGN.md) 与其末图
 > [07-build-roadmap.svg](architecture/07-build-roadmap.svg)。
 
 ## 1. 系统分层
@@ -63,7 +63,7 @@
 
 `0` 与 `null` 是两件事：`null` 走平台默认，`0` 是「一次都不许」。
 折配置必须用 `narrowed_by()` 这类显式函数，写成 `x or DEFAULT` 会让 `0`
-静默变成默认值——这是本仓库已经踩过的坑。
+静默变成默认值——这是本仓库已经踩过的坑（[AGENT_QUOTA.md](AGENT_QUOTA.md)）。
 
 被拒的调用不抛给用户：记进审计（`metadata.limits` 记的是**生效上限**而不是
 配置值，才能回答「为什么这次不行」），然后让上层换条路走。
@@ -72,7 +72,7 @@
 > **一个 Agent 可以 0 轮自己的对话、却被叫了 20 次**——`/observability/agents`
 > 里 `delegated_turns` 与 `traces` 不能相加，它们的分母不同。
 
-一次运行的时间线：写操作跨两次请求，
+一次运行的时间线见 [RUNTIME_VIEW.md](RUNTIME_VIEW.md)：写操作跨两次请求，
 用 `operation_id` 这个**分组键**（不是 trace 之间的父子边）串起来。
 
 ## 3. 请求执行链路
@@ -139,7 +139,7 @@
 只读根、无宿主挂载、非 root，执行记录按租户隔离。
 
 阶段二（Kubernetes + Kata）与阶段三（Firecracker Worker Pool）是**存档设计**，
-图下半部分是升级触发条件：
+详见 [SANDBOX_ROADMAP.md](SANDBOX_ROADMAP.md)。图下半部分是升级触发条件：
 它们是判断依据，不是时间表——满足任意两条再投入，否则等于先付运维成本。
 
 ## 8. 已知边界

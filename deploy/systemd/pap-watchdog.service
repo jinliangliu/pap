@@ -1,5 +1,6 @@
 [Unit]
 Description=Personal Agent Platform 巡检与告警
+Documentation=file:///personal-agent-platform/docs/MONITORING.md
 After=network-online.target
 Wants=network-online.target
 

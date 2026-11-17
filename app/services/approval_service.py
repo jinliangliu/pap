@@ -959,15 +959,13 @@ class ApprovalService:
         tool_result: ToolExecutionResult,
         context: ToolExecutionContext,
     ) -> ApprovalExecutionResult:
-        verify_context = ToolExecutionContext(
-            tenant_id=context.tenant_id,
-            user_id=context.user_id,
-            thread_id=context.thread_id,
-            run_id=context.run_id,
-            request_id=context.request_id,
-            roles=context.roles,
-            scopes=context.scopes,
-            approval_id=context.approval_id,
+        # 与执行入口同一条理由：逐字段重建上下文，每加一个新字段都要来这里
+        # 补一行，漏了不报错。这里已经漏过一次——`conversation_id` 没抄，
+        # 于是回读核验的 verifier 拿不到会话，解不出附件句柄，导入类工具
+        # 只能不核验，审批卡永远停在 EXECUTED。`is_platform_admin` /
+        # `agent_*` / `delegation_*` 同样是靠 replace 才没丢。
+        verify_context = replace(
+            context,
             idempotency_key=approval.idempotency_key,
             external_operation_id=tool_result.external_operation_id,
         )
@@ -1029,7 +1027,12 @@ class ApprovalService:
             status=status,
         )
 
-        message = (
+        # 结论用工具自己的话：片数、加工链路、工单号、下架了几片。
+        # 此前这里只回一句「操作请求已提交」，十几个写工具在会话里长得一模一样，
+        # 人看不出到底成没成——而工具明明已经写了结论，还带回了回读到的实体。
+        # 「核验过没有」由 status 表达，审批卡上单独标着（EXECUTED / VERIFIED），
+        # 不该把结论挤掉。工具没给 message 时才回落到平台文案。
+        message = (tool_result.message or "").strip() or (
             "操作已执行，并已通过外部回读核验。"
             if verified
             else "操作请求已提交，但尚未获得可确认的回读结果。"

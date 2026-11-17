@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import Identity
 from app.core.config import settings
 from app.knowledge.ingest import extract_text_from_bytes
+from app.knowledge.titles import clean_title
 from app.knowledge.upload import (
     UploadDenied,
     UploadRejected,
@@ -40,7 +41,6 @@ from app.studio.parsers import (
     TARGET_AUTO,
     TARGET_KNOWLEDGE,
     TARGET_SKILL,
-    TARGET_TOOL,
     TARGETS,
     StudioParseError,
 )
@@ -176,8 +176,9 @@ async def _knowledge(
         raise ImportRejected(str(exc)) from exc
 
     if dry_run:
+        cleanup: dict[str, int] = {}
         try:
-            text = extract_text_from_bytes(raw, filename)
+            text = extract_text_from_bytes(raw, filename, stats=cleanup)
         except Exception as exc:  # 损坏的 PDF/Word
             raise ImportRejected(f"文件无法解析：{exc}") from exc
 
@@ -186,9 +187,14 @@ async def _knowledge(
         return {
             "notes": [],
             "preview": {
-                "title": title or _default_title(filename),
+                # 预览里的标题必须与入库后一致，所以走同一个函数；
+                # 各写一份的结果是「预览说 T/CGAS 027，入库后带 OCR 长尾」。
+                "title": title or clean_title(filename.rsplit("/", 1)[-1]),
                 "access_scope": scope,
                 "chars": len(text),
+                # 预览里的字符数已经是清洗后的：说清「原文多少」，
+                # 否则「我传了 56 万字，预览说 14 万」看起来像被截断了。
+                "cleanup": cleanup or None,
                 # 不预估切片数：那要真跑一遍切片器，估出来的数字
                 # 与实际入库对不上时，人会以为自己传错了文件。
                 "excerpt": text.strip()[:400],
@@ -219,6 +225,14 @@ async def _knowledge(
             "title": row.title,
             "chunk_count": row.chunk_count,
             "access_scope": row.access_scope,
+            # 形态清洗（OCR 的 HTML 表 → pipe 表）。干净的 md 这里是空的，
+            # 有值时说明「入库的是清洗后的字数」，不是用户传的原文字数。
+            "cleanup": outcome.cleanup or None,
+            # 加工快照原样带出去：对话里要照着它说「清洗压掉多少、切成几节、
+            # 打了哪些标」。此前快照只写库、只给治理页看，于是刚入库的人
+            # 在对话里只知道「N 片」，还得再跳一次控制台才知道中间发生了什么。
+            "pipeline": outcome.pipeline or None,
+            "tags": list(outcome.tags or []),
             "message": {
                 "created": f"已入库 {row.chunk_count} 片",
                 "updated": f"内容有变化，已重建 {row.chunk_count} 片",
@@ -226,17 +240,6 @@ async def _knowledge(
             }.get(outcome.action, outcome.action),
         },
     }
-
-
-def _default_title(filename: str) -> str:
-    stem = filename.rsplit("/", 1)[-1]
-
-    for suffix in (".md", ".markdown", ".txt", ".pdf", ".docx", ".html", ".htm"):
-        if stem.lower().endswith(suffix):
-            stem = stem[: -len(suffix)]
-            break
-
-    return stem
 
 
 # --------------------------------------------------------------------------- #

@@ -1,7 +1,7 @@
 # app/models/observability.py
 """自研观测的两张表：一条 trace = 一轮对话，一条 span = 一个节点/模型/工具调用。
 
-与 `agent_runs` 的分工：
+与 `agent_runs` 的分工（见 docs/OBSERVABILITY.md §10）：
 
 - `agent_runs` 是**业务事实**：谁、什么时候、结果如何。不因观测退役而消失。
 - 这两张表是**诊断明细**：这一轮内部怎么走的、慢在哪。可清理、可丢弃、可整体关闭。
@@ -41,7 +41,7 @@ class ObsTrace(TenantScoped, Base):
     # OTel 规范的 32 位 hex。现在不依赖 OTel SDK，但将来要导 Tempo/Jaeger 不用改字段。
     trace_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
 
-    # 一次「运行」的分组键，不是树边。
+    # 一次「运行」的分组键，不是树边（见 docs/RUNTIME_VIEW.md §4.2）。
     # 开新 trace 时若无值可继承，就等于自己的 trace_id；审批恢复的那一轮
     # 从审批单上继承了发起方的值。于是「同一次运行」= 同 operation_id 的集合，
     # 而这个列不构成父子关系，`by_agent` 之和仍等于 `traces`。
@@ -117,7 +117,7 @@ class ObsSpan(TenantScoped, Base):
     # 这个 span 属于哪个智能体。委派时子图里的节点归被委派方，而不是 trace
     # 的发起方——没有这一列，A→B 一轮里 B 的规划与工具调用认不出是谁的。
     # 成列而不是放 attrs：委派拓扑要按它 GROUP BY，扫 JSON 会随数据量线性退化，
-    # 且 `->>` 与 `json_extract` 不通用（p95 已经因此吃过一次亏）。
+    # 且 `->>` 与 `json_extract` 不通用（OBSERVABILITY.md 已为 p95 吃过一次亏）。
     # 存量行为 NULL，含义是「未归属」，不当作「平台基线」来解释。
     agent_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
 

@@ -6,10 +6,10 @@
 产出「纠错 / 合并 / 下架」建议，**人工确认后**才生效。
 
 用法：
-    uv run python -m scripts.dream_memories --user alex
-    uv run python -m scripts.dream_memories --user alex --dry-run
-    uv run python -m scripts.dream_memories --user alex --days 60 --limit 30
-    uv run python -m scripts.dream_memories --user alex --json /tmp/dream.json
+    uv run python -m scripts.dream_memories --user dylan
+    uv run python -m scripts.dream_memories --user dylan --dry-run
+    uv run python -m scripts.dream_memories --user dylan --days 60 --limit 30
+    uv run python -m scripts.dream_memories --user dylan --json /tmp/dream.json
 
 边界：
 - 只碰 `source=auto_extract` 且 `is_user_confirmed=false` 的候选；

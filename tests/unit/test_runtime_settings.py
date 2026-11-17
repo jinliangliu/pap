@@ -129,3 +129,105 @@ async def test_load_survives_missing_table(monkeypatch):
     await runtime_settings.load()
 
     assert runtime_settings.obs_enabled() is True
+
+
+# ---------------- 单篇切片上限 ----------------
+#
+# 这一项和开关不同：它是**容量阈值**，两次卡住真实国标入库（400 卡 448 片、
+# 800 卡 973 片）。用例守两件事：默认值来自 .env 且脏值不生效；
+# 改了之后**入库路径真的按新值判**（只改配置、入库还读旧值，是最隐蔽的退化）。
+
+
+async def test_chunk_limit_falls_back_to_env(monkeypatch):
+    monkeypatch.setattr(runtime_settings.settings, "knowledge_max_chunks_per_document", 2000)
+
+    await runtime_settings.load()
+
+    assert runtime_settings.knowledge_max_chunks() == 2000
+    assert runtime_settings.source(runtime_settings.KNOWLEDGE_MAX_CHUNKS) == "env"
+
+
+async def test_chunk_limit_prefers_database(monkeypatch):
+    monkeypatch.setattr(runtime_settings.settings, "knowledge_max_chunks_per_document", 2000)
+    async with async_session_factory() as session:
+        async with session.begin():
+            session.add(
+                PlatformSetting(key=runtime_settings.KNOWLEDGE_MAX_CHUNKS, value=3000)
+            )
+
+    await runtime_settings.load()
+
+    assert runtime_settings.knowledge_max_chunks() == 3000
+    assert runtime_settings.source(runtime_settings.KNOWLEDGE_MAX_CHUNKS) == "runtime"
+
+
+@pytest.mark.parametrize("dirty", ["3000", True, 0, -5, 20001, 3.5])
+async def test_chunk_limit_ignores_dirty_values(monkeypatch, dirty):
+    """脏值一律当「未配置」。
+
+    `True` 尤其要挡：`isinstance(True, int)` 为真，若被当成 1，
+    每一份文档都会被判超限——而错误信息看起来像「你的文件太大」。
+    """
+    monkeypatch.setattr(runtime_settings.settings, "knowledge_max_chunks_per_document", 2000)
+    async with async_session_factory() as session:
+        async with session.begin():
+            session.add(PlatformSetting(key=runtime_settings.KNOWLEDGE_MAX_CHUNKS, value=dirty))
+
+    await runtime_settings.load()
+
+    assert runtime_settings.knowledge_max_chunks() == 2000
+    assert runtime_settings.source(runtime_settings.KNOWLEDGE_MAX_CHUNKS) == "env"
+
+
+async def test_set_chunk_limit_rejects_out_of_range():
+    """越界直接拒绝，不夹到边界值：夹了以后「我填的」和「生效的」对不上。"""
+    for bad in (0, 20001):
+        with pytest.raises(ValueError):
+            await runtime_settings.set_knowledge_max_chunks(bad, actor="pap-admin")
+
+
+async def test_set_chunk_limit_takes_effect_and_persists(monkeypatch):
+    monkeypatch.setattr(runtime_settings.settings, "knowledge_max_chunks_per_document", 2000)
+
+    await runtime_settings.load()
+
+    assert await runtime_settings.set_knowledge_max_chunks(3000, actor="pap-admin") is True
+    assert runtime_settings.knowledge_max_chunks() == 3000
+
+    async with async_session_factory() as session:
+        row = await session.scalar(
+            select(PlatformSetting).where(
+                PlatformSetting.key == runtime_settings.KNOWLEDGE_MAX_CHUNKS
+            )
+        )
+    assert row is not None and row.value == 3000
+
+
+async def test_set_chunk_limit_same_value_reports_no_change(monkeypatch):
+    monkeypatch.setattr(runtime_settings.settings, "knowledge_max_chunks_per_document", 2000)
+
+    await runtime_settings.load()
+
+    assert await runtime_settings.set_knowledge_max_chunks(2000, actor="pap-admin") is False
+
+
+async def test_ingest_uses_the_runtime_limit(monkeypatch):
+    """入库必须读运行时值。
+
+    这条防的是「配置改了、入库还读 settings」——那种退化不会报错，
+    只会让人在控制台把上限调到 3000、再传一遍、又被同样的数字拒掉。
+    """
+    from app.knowledge import ingest
+
+    monkeypatch.setattr(runtime_settings.settings, "knowledge_max_chunks_per_document", 2000)
+    await runtime_settings.load()
+    await runtime_settings.set_knowledge_max_chunks(1, actor="pap-admin")
+
+    with pytest.raises(ingest.KnowledgeIngestError, match="超过单篇上限 1"):
+        ingest.build_document(
+            "\n\n".join(["段" * 900 for _ in range(5)]),
+            logical_id="big",
+            title="大文档",
+            source_uri="uploads/big.md",
+            source_type="upload",
+        )

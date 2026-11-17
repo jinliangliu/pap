@@ -96,8 +96,8 @@ async def _seed_agent(**kwargs) -> str:
 def _work_plan(answer: str) -> list[ActionPlan]:
     """一个节点的两次规划：先查一次（留下依据），再作答。
 
-    为什么必须有第一步：`invoke` 会拦「没有任何依据的结论」，
-    一段凭空生成的答复过不了桥。
+    为什么必须有第一步：`invoke` 会拦「没有任何依据的结论」
+    （`AGENT_CONNECT.md` §4 第 7 条），一段凭空生成的答复过不了桥。
     """
     return [
         ActionPlan(action="read_tool", tool_name="get_platform_time", reason="对齐时间窗"),
@@ -339,3 +339,68 @@ async def test_runs_endpoint_exposes_node_flow(client, planner, seeded_identity)
     detail = await client.get(f"/api/v1/workflow-runs/{items[0]['id']}")
     assert detail.status_code == 200
     assert detail.json()["output_text"]
+
+
+async def test_flow_can_be_selected_instead_of_typed(client, planner, seeded_identity):
+    """界面上直接选一条流程（`workflow` 字段），不敲 `/workflow`。
+
+    两个入口必须落到同一件事上：同一条 run、同样逐跳判定、同样落 metadata。
+    分开实现的话，最典型的分叉是「选了流程但没做深度预检」——跑起来才发现
+    第三跳被拒，而用户只是点了个下拉。
+    """
+    await _seed_agent(name="cs", allowed_skills=None)
+    await _seed_agent(name="ops")
+
+    await _save(client, TWO_STEP)
+    planner(_work_plan("这是电控问题") + _work_plan("检查变频器散热"))
+
+    # 建智能体时会顺手建出租户的默认 Agent（`assistant`），所以基线要在发消息之前取：
+    # 这条断言问的是「选了流程这一路有没有再多建一个」，不是「库里只有两个人」。
+    async with async_session_factory() as db:
+        with tenant_scope(TENANT):
+            before = sorted(a.name for a in (await db.scalars(select(Agent))).all())
+
+    response = await client.post(
+        "/api/v1/chat",
+        json={"thread_id": "wf-picked", "message": "3 号泵跳停", "workflow": "triage"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "completed"
+    # 消息正文原样当输入，没有被改写成 `/workflow triage 3 号泵跳停`。
+    assert "检查变频器散热" in body["answer"]
+    assert body["metadata"]["workflow"] == "triage"
+    assert body["metadata"]["nodes_used"] == 3
+
+    async with async_session_factory() as db:
+        with tenant_scope(TENANT):
+            runs = (await db.scalars(select(WorkflowRun))).all()
+            assert len(runs) == 1
+            assert runs[0].status == WorkflowRunStatus.COMPLETED
+            # 选了流程就不该顺手创建出租户的默认 Agent：这条路径根本不看「谁回答」。
+            after = sorted(a.name for a in (await db.scalars(select(Agent))).all())
+            assert after == before
+
+
+async def test_agent_and_flow_together_is_rejected(client, seeded_identity):
+    """同时选人和选流程 → 422，而不是静默丢掉其中一个。
+
+    流程每一步用节点自带的智能体，`agent` 在这条路径上没有任何作用。悄悄忽略的话，
+    用户看到的是「我选了客服，回答却来自别人」，而这在界面上无从查起。
+    """
+    await _seed_agent(name="cs", allowed_skills=None)
+    await _save(client, TWO_STEP)
+
+    response = await client.post(
+        "/api/v1/chat",
+        json={
+            "thread_id": "wf-both",
+            "message": "3 号泵跳停",
+            "agent": "cs",
+            "workflow": "triage",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "CHAT_TARGET_CONFLICT"

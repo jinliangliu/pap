@@ -98,3 +98,55 @@ async def test_toggle_writes_admin_audit(admin_client):
 
     assert rows, "运行配置变更必须留 ADMIN_ACTION"
     assert rows[-1].resource_id == runtime_settings.OBSERVABILITY_ENABLED
+
+
+# ---------------- 入库容量（单篇切片上限） ----------------
+
+
+async def test_chunk_limit_change_does_not_touch_observability(admin_client, monkeypatch):
+    """只改容量时，观测开关必须原样不动。
+
+    原先两个字段都得传，于是「改容量」的请求会顺带把观测开关按页面手里的
+    旧值再写一遍——两个人同时开着这个页面时，后保存的人会静默改回别人的设置。
+    """
+    monkeypatch.setattr(runtime_settings.settings, "obs_enabled", True)
+    await runtime_settings.load()
+
+    await admin_client.put(BASE, json={"observability_enabled": False})
+    assert runtime_settings.obs_enabled() is False
+
+    response = await admin_client.put(BASE, json={"knowledge_max_chunks": 3000})
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+    assert body["knowledge_max_chunks"] == 3000
+    assert body["knowledge_max_chunks_source"] == "runtime"
+    assert body["observability_enabled"] is False
+    assert body["observability_source"] == "runtime"
+
+
+async def test_chunk_limit_out_of_range_is_rejected(admin_client):
+    for bad in (0, 20001):
+        response = await admin_client.put(BASE, json={"knowledge_max_chunks": bad})
+        assert response.status_code == 422, response.text
+
+
+async def test_chunk_limit_change_is_audited_under_its_own_key(admin_client):
+    """审计要能单独查到「谁放宽了容量」，而不是混在观测开关那条里。"""
+    await runtime_settings.load()
+
+    await admin_client.put(BASE, json={"knowledge_max_chunks": 3000})
+
+    async with async_session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(AuditLog)
+                .where(AuditLog.event_type == AuditEventType.ADMIN_ACTION)
+                .where(AuditLog.message == "runtime_settings_updated")
+            )
+        ).all()
+
+    assert rows, "运行配置变更必须留 ADMIN_ACTION"
+    # 审计表不随 platform_settings 一起清，所以只断言「最近一条」是容量那条：
+    # 同一用例文件里前面还有观测开关的审计，按集合相等会比较到别人的行。
+    assert rows[-1].resource_id == runtime_settings.KNOWLEDGE_MAX_CHUNKS

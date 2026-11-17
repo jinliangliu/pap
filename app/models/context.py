@@ -1,7 +1,7 @@
 # app/models/context.py
 """会话上下文摘要（长对话压缩的产物）。
 
-与 `memory` 的分工：记忆是跨会话的长期事实，
+与 `memory` 的分工见 `docs/CONTEXT.md` §2.3：记忆是跨会话的长期事实，
 摘要是本次对话的叙事与指代，跟着会话一起删。
 
 append-only：每次压缩落一行，最新一行生效。留着旧行才能回答
@@ -57,7 +57,7 @@ class ConversationSummary(TenantScoped, Base):
 
     # 产出摘要的模型。复盘「摘要变差了」时要先排除「模型换了」。
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # 全量重建还是增量。
+    # 全量重建还是增量（见 docs/CONTEXT.md §5.4）。
     rebuilt: Mapped[bool] = mapped_column(Boolean, default=False)
     # 模型失败/超时落下的兜底摘要。这类行照常注入，但要在观测里能分辨。
     degraded: Mapped[bool] = mapped_column(Boolean, default=False)

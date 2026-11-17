@@ -224,8 +224,24 @@ class RuntimeSettingsResponse(APIModel):
     mcp_inbound_enabled: bool = True
     mcp_inbound_source: str = "env"
 
+    # 入库容量。与上面几项同一份快照：它也是平台级、也住 platform_settings，
+    # 再单开一个接口只会让页面多跑一次往返。
+    knowledge_max_chunks: int = 2000
+    knowledge_max_chunks_source: str = "env"
+
 
 class RuntimeSettingsUpdate(APIModel):
-    observability_enabled: bool = Field(
+    # 两项都是「不传 = 不动」。原先是必填，于是只想改容量的一次 PUT 必须
+    # 把观测开关的当前值再抄一遍——两个人同时开着这个页面时，后保存的那位
+    # 会把别人刚改的观测开关按自己手里的旧值改回去。
+    observability_enabled: bool | None = Field(
+        default=None,
         description="是否记录 trace / span。关闭后不再新增写入，已有数据保留。",
+    )
+
+    knowledge_max_chunks: int | None = Field(
+        default=None,
+        ge=1,
+        le=20000,
+        description="单篇文档的切片上限。留空表示不修改。",
     )

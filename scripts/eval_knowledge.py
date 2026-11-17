@@ -25,102 +25,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import statistics
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+# 判分与汇总只有一份实现（app/knowledge/evaluation.py）：
+# 脚本与治理页各写一套的话，同一批用例在命令行是 0.62、在页面是 0.55，
+# 而且没人能说清哪个对。这里只保留「从哪儿取语料」的差别。
+from app.knowledge.evaluation import CaseResult, score_case, summarize
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GOLDEN_PATH = REPO_ROOT / "tests/fixtures" / "knowledge_golden.json"
-
-
-@dataclass(frozen=True)
-class CaseResult:
-    case_id: str
-    query: str
-    expect_found: bool
-    found: bool
-    hit: bool
-    reciprocal_rank: float
-    sources: list[str] = field(default_factory=list)
-    rerank: dict[str, Any] = field(default_factory=dict)
-    error: str = ""
-
-    @property
-    def is_false_hit(self) -> bool:
-        return not self.expect_found and self.found
-
-
-def score_case(case: dict[str, Any], sources: list[str], **extra: Any) -> CaseResult:
-    """按来源路径精确匹配判分。
-
-    Hit@k = 至少一条标注来源进入 top-k；MRR 取第一条正确命中的排名倒数。
-    ``relevant`` 为空（不可回答用例）时 hit 恒为 False，命中算假阳性。
-    """
-    relevant = set(case.get("relevant") or [])
-    reciprocal_rank = 0.0
-
-    for rank, source in enumerate(sources, start=1):
-        if source in relevant:
-            reciprocal_rank = 1.0 / rank
-            break
-
-    return CaseResult(
-        case_id=str(case.get("id", "")),
-        query=str(case.get("query", "")),
-        expect_found=bool(case.get("expect_found", True)),
-        found=bool(sources),
-        hit=reciprocal_rank > 0,
-        reciprocal_rank=reciprocal_rank,
-        sources=sources,
-        **extra,
-    )
-
-
-def summarize(results: list[CaseResult], *, k: int) -> dict[str, Any]:
-    answerable = [item for item in results if item.expect_found]
-    unanswerable = [item for item in results if not item.expect_found]
-    errors = [item for item in results if item.error]
-
-    hit_at_k = sum(1 for item in answerable if item.hit) / len(answerable) if answerable else 0.0
-    mrr = sum(item.reciprocal_rank for item in answerable) / len(answerable) if answerable else 0.0
-    answerable_zero = (
-        sum(1 for item in answerable if not item.found) / len(answerable) if answerable else 0.0
-    )
-    false_hit = (
-        sum(1 for item in unanswerable if item.found) / len(unanswerable) if unanswerable else 0.0
-    )
-
-    reranked = [item.rerank for item in results if item.rerank]
-    elapsed = [int(item.get("elapsed_ms", 0)) for item in reranked]
-    fallbacks: dict[str, int] = {}
-
-    for item in reranked:
-        reason = str(item.get("fallback") or "")
-        if reason:
-            fallbacks[reason] = fallbacks.get(reason, 0) + 1
-
-    return {
-        "k": k,
-        "cases": len(results),
-        "answerable": len(answerable),
-        "unanswerable": len(unanswerable),
-        "hit_at_k": round(hit_at_k, 4),
-        "mrr": round(mrr, 4),
-        # 可回答却零召回 = 召回上限的直接证据，这个数降不下去就该上向量检索。
-        "answerable_zero_hit_rate": round(answerable_zero, 4),
-        # 不可回答却返回内容 = 假阳性，重筛该拦住它们。
-        "false_hit_rate": round(false_hit, 4),
-        "errors": len(errors),
-        "rerank_applied": sum(1 for item in reranked if item.get("applied")),
-        "rerank_fallbacks": fallbacks,
-        "rerank_dropped": sum(int(item.get("dropped", 0)) for item in reranked),
-        "rerank_elapsed_p50_ms": int(statistics.median(elapsed)) if elapsed else 0,
-        "rerank_elapsed_p95_ms": (
-            int(sorted(elapsed)[min(len(elapsed) - 1, int(len(elapsed) * 0.95))]) if elapsed else 0
-        ),
-    }
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -169,7 +85,15 @@ def run_local(args: argparse.Namespace, cases: list[dict[str, Any]]) -> list[Cas
             min_relative_score=0,
             query_expansion=bool(args.expand),
         )
-        results.append(score_case(case, [item.source_path for item in citations]))
+        results.append(
+            score_case(
+                case,
+                [
+                    {"document_id": item.source_path, "section": item.section}
+                    for item in citations
+                ],
+            )
+        )
 
     return results
 
@@ -202,8 +126,11 @@ async def run_http(args: argparse.Namespace, cases: list[dict[str, Any]]) -> lis
                 results.append(
                     score_case(
                         case,
-                        [str(item.get("source_path", "")) for item in citations],
-                        rerank=payload.get("rerank") or {},
+                        [
+                            {"document_id": str(item.get("source_path", "")), "section": ""}
+                            for item in citations
+                        ],
+                        extra={"rerank": payload.get("rerank") or {}},
                     )
                 )
             except Exception as exc:  # 单条失败不中断整批评测

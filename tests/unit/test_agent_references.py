@@ -9,7 +9,7 @@
 - 拒绝理由要点名缺的那个 scope。只说「引用不可用」，排障会停在「换份材料吧」，
   而真正该改的是授权。
 
-拒绝理由要点名缺的那个 scope，不能让调用方停在「换份材料吧」。
+对应 `docs/AGENT_CONNECT.md` §7.1 的第 3–8 条。
 """
 
 from __future__ import annotations

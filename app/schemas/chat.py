@@ -47,6 +47,16 @@ class ChatRequest(APIModel):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
         description="智能体标识或 ID；留空使用默认智能体",
     )
+    # 在界面上直接选一条流程（不改写消息正文）。等价于在消息里敲
+    # `/workflow <name> <消息>`，只是不用记住命令和名字。与 `agent` 互斥：
+    # 流程每一步由节点自带的智能体执行，选了流程就没有「这个人」了。
+    workflow: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        description="流程标识；指定后 message 整段作为该流程的输入",
+    )
+
     attachments: list[ChatAttachment] = Field(default_factory=list)
     # 旧字段，等价于 attachments。保留是为了不让已接入的客户端在升级后直接 422；
     # 服务端会把它合并进 attachments，不在别处再读一次。

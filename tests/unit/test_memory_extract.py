@@ -33,7 +33,7 @@ def _item(
     *,
     type_: str = "profile",
     title: str = "称呼",
-    content: str = "希望被称呼为 alex",
+    content: str = "希望被称呼为 dylan",
     confidence: object = 0.9,
 ) -> dict:
     return {"type": type_, "title": title, "content": content, "confidence": confidence}
@@ -158,14 +158,14 @@ def test_parse_garbage_returns_empty():
 async def test_extraction_writes_unconfirmed_candidate(monkeypatch):
     monkeypatch.setattr(settings, "memory_enabled", True)
     monkeypatch.setattr(settings, "memory_extract_enabled", True)
-    _fake_reply(_payload(_item(content="希望被称呼为 alex，不要用「您」。")))
+    _fake_reply(_payload(_item(content="希望被称呼为 dylan，不要用「您」。")))
 
     stats = await memory_extract.run_extraction(
         tenant_id=TENANT,
         user_id=USER,
         thread_id="thread-1",
-        user_message="以后别用「您」，叫我 alex 就行",
-        answer="好的 alex。",
+        user_message="以后别用「您」，叫我 dylan 就行",
+        answer="好的 dylan。",
     )
 
     assert stats == {"candidates": 1, "created": 1, "refreshed": 0, "skipped": 0}
@@ -186,7 +186,7 @@ async def test_extraction_never_overwrites_user_memory(monkeypatch):
     monkeypatch.setattr(settings, "memory_extract_enabled", True)
     await _seed_user_memory(title="称呼", content="用户自己写的：叫我老张")
 
-    _fake_reply(_payload(_item(content="模型认为他叫 alex")))
+    _fake_reply(_payload(_item(content="模型认为他叫 dylan")))
     stats = await memory_extract.run_extraction(
         tenant_id=TENANT,
         user_id=USER,

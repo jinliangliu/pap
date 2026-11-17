@@ -4262,8 +4262,23 @@ body.lb-open { overflow: hidden; }
   padding: 0 6px;
   font-size: 11.5px;
   border-radius: 7px;
-  max-width: 150px;
+  /* 流程显示名比智能体长（「隐患分级派单」这类四五个字很常见），
+     给到 190px：再宽就把「Ctrl/⌘ + Enter 发送」挤出可视区。 */
+  max-width: 190px;
 }
+
+/* 选了流程时的提示条：压在这条消息上，让人一眼看到「这句会被当成流程输入」。
+   只在选中流程时出现，说完一句就消失——常驻提示最后会变成没人看的装饰。 */
+.chat-target-hint {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  margin-bottom: 6px; padding: 6px 9px;
+  border: 1px solid var(--green-line); border-radius: 8px;
+  background: var(--green-soft); color: var(--green);
+  font-size: 11.5px; line-height: 1.55;
+}
+.chat-target-hint svg { width: 14px; height: 14px; flex: none; }
+.chat-target-hint span { flex: 1 1 auto; min-width: 0; }
+.chat-target-hint .btn { margin-left: auto; }
 
 /* 观测「按智能体」表里的用量走势。
    柱状而不是折线：周级样本常是 0/3/7 这种稀疏值，连线会画出并不存在的趋势。 */
@@ -5132,13 +5147,6 @@ body.lb-open { overflow: hidden; }
 .wf-step.bad { border-color: var(--red-line); box-shadow: 0 0 0 3px var(--red-soft); }
 .wf-step.orphan { border-style: dashed; }
 .wf-step-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.wf-step-no {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 20px; height: 20px; flex: none;
-  border: 1px solid var(--line-soft); border-radius: 6px;
-  background: var(--surface-2); font: 600 11px var(--mono); color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
 /* 带 `#wf-def-wrap` 前缀是必要的：全局的 `input[type="text"]` 是 (0,1,1)，
    单个 class 的 (0,1,0) 压不住它，框会撑满整行、把同一行的按钮挤到下一行。 */
 #wf-def-wrap .wf-step-id { width: 150px; height: 28px; padding: 0 8px; font: 600 12px var(--mono); }
@@ -5248,6 +5256,67 @@ body.lb-open { overflow: hidden; }
   border: 1px dashed var(--amber-line); border-radius: 10px; background: var(--amber-soft);
 }
 .wf-orphans-head { font-size: 12px; line-height: 1.65; color: var(--amber); }
+
+/* 总览卡片：只要有「几步、谁在第几步、往哪走」，不放任何输入框。
+   卡片是 <button>，所以边框/背景/字体都要显式写，否则会跟着浏览器按钮样式走。 */
+.wf-index {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(186px, 1fr));
+  gap: 8px;
+}
+.wf-card {
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 8px 10px; text-align: left; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface);
+  font: inherit; color: inherit;
+}
+.wf-card:hover { border-color: var(--green-line); background: var(--surface-2); }
+.wf-card.on {
+  border-color: var(--green);
+  background: var(--green-soft);
+  box-shadow: 0 0 0 2px var(--green-soft);
+}
+.wf-card.bad { border-color: var(--red-line); background: var(--red-soft); }
+.wf-card.orphan { border-style: dashed; }
+.wf-card-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.wf-card-no {
+  flex: none; width: 18px; height: 18px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--line-soft); color: var(--muted);
+  font: 600 11px var(--mono);
+}
+.wf-card.on .wf-card-no { background: var(--green); color: #fff; }
+.wf-card-id {
+  font: 600 12px var(--mono); color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.wf-chip {
+  flex: none; padding: 0 5px; border-radius: 5px;
+  font-size: 10.5px; line-height: 15px;
+  background: var(--line-soft); color: var(--muted);
+}
+.wf-chip.entry { background: var(--green-soft); color: var(--green); }
+.wf-chip.bad { background: var(--red-soft); color: var(--red); }
+.wf-card-sub, .wf-card-exit {
+  font-size: 11.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wf-card-exit { color: var(--faint); font-family: var(--mono); }
+
+/* 详情卡：只有被点开那一步的完整表单。 */
+.wf-detail { display: flex; flex-direction: column; gap: 8px; }
+.wf-detail-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12.5px; color: var(--text);
+}
+.wf-detail-head .faint { font-size: 11.5px; }
+.wf-detail-nav { margin-left: auto; display: flex; gap: 6px; }
+.wf-detail-empty {
+  padding: 18px 12px; text-align: center;
+  border: 1px dashed var(--line); border-radius: 10px;
+  font-size: 12px; color: var(--faint);
+}
 
 .wf-runs { display: flex; flex-direction: column; gap: 6px; }
 .wf-run { border: 1px solid var(--line-soft); border-radius: 9px; overflow: hidden; }
@@ -5370,194 +5439,24 @@ body.lb-open { overflow: hidden; }
 
 .tk-kv { margin-top: 4px; }
 
-/* ================= 从文件新建（统一导入） =================
- *
- * 入口在侧栏（.side-new），弹层复用 .modal 体系。
- * 三类的预览结构完全不同，但都落在同一个列表里：行头统一是
- * 「文件名 + 大小 + 识别结果 + 目标下拉」，行体随目标变。
- * 这样人先看到「它被认成了什么」，再看细节，判错时改下拉即可。
- */
-
-.side-new { padding: 0 4px 6px; }
-
-.side-new-btn {
+/* 入库容量：一行「标签 + 数字 + 保存」。数字框固定 120px 不撑满整行——
+   占满宽度会让人以为这里要填一段文字，而它只装一个四位数。 */
+.rt-cap-row {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 7px;
-  width: 100%;
-  padding: 7px 10px;
-  border: 1px dashed var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  color: var(--text-2);
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.rt-cap-row label {
   font-size: 12.5px;
-  cursor: pointer;
-}
-
-.side-new-btn svg { width: 14px; height: 14px; flex: none; opacity: .75; }
-
-.side-new-btn:hover {
-  border-color: var(--green-line);
-  background: var(--green-soft);
-  color: var(--green);
-}
-
-.side-new-btn:focus-visible { outline: 2px solid var(--green); outline-offset: 1px; }
-
-/* 收起态只剩图标：文字挤进 58px 会把按钮撑成两行。 */
-.app.nav-mini .side-new { padding: 0 0 6px; }
-.app.nav-mini .side-new-btn { padding: 7px 0; }
-.app.nav-mini .side-new-label { display: none; }
-
-/* 窄屏侧栏是一条横条，按钮跟导航并排，同样只留图标。 */
-@media (max-width: 900px) {
-  .side-new { padding: 0 6px; flex: none; }
-  .side-new-btn { padding: 7px; border-style: solid; }
-  .side-new-label { display: none; }
-}
-
-.import-modal { max-width: 780px; }
-
-.import-drop {
-  border: 1.5px dashed var(--line);
-  border-radius: 10px;
-  padding: 20px 16px;
-  text-align: center;
-  background: var(--surface-2);
-  cursor: pointer;
-  transition: border-color .12s, background .12s;
-}
-
-.import-drop:hover,
-.import-drop:focus-visible { border-color: var(--green-line); background: var(--green-soft); }
-.import-drop.over { border-color: var(--green); background: var(--green-soft); }
-.import-drop-title { font-size: 13px; font-weight: 600; color: var(--text-2); }
-.import-drop-hint { margin-top: 5px; font-size: 11px; line-height: 1.7; color: var(--faint); }
-
-.import-bar { display: flex; align-items: center; gap: 8px; }
-.import-bar-label { font-size: 11.5px; color: var(--muted); }
-.import-bar select { height: 30px; }
-/* .hint 默认带 margin-top，放进横排里会把这一行顶歪。 */
-.import-bar .hint { margin: 0; }
-
-.import-list { display: flex; flex-direction: column; gap: 8px; }
-
-.import-row {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--surface);
-  overflow: hidden;
-}
-
-.import-row.done { border-color: var(--green-line); background: var(--green-soft); }
-.import-row.bad { border-color: var(--red-line); }
-
-.import-row-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  background: var(--surface-2);
-  border-bottom: 1px solid var(--line-soft);
-}
-
-.import-file {
-  min-width: 0;
-  flex: 1 1 auto;
-  font-size: 12.5px;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.import-size { flex: none; font-size: 11px; color: var(--faint); }
-.import-target { flex: none; height: 26px; font-size: 11.5px; padding: 0 6px; }
-.import-row-head .icon-btn { width: 24px; height: 24px; font-size: 11px; }
-
-/* 弹层里的 chip 要比列表页小一档：一行里同时出现识别结果与风险标记，
-   用默认尺寸会把文件名挤成省略号。 */
-.chip.sm { height: 18px; padding: 0 6px; font-size: 10.5px; border-radius: 5px; }
-
-.import-row-body {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px;
-}
-
-.import-form { display: flex; gap: 8px; }
-.import-form .field { flex: 1 1 auto; }
-.import-form input { height: 28px; font-size: 12px; }
-
-.import-meta { font-size: 11px; line-height: 1.6; color: var(--muted); }
-
-.import-keywords { display: flex; flex-wrap: wrap; gap: 5px; }
-
-/* 正文/摘要预览：等宽 + 限制高度。不换行折断是为了让层级（#、1.）保持可见。 */
-.import-excerpt {
-  margin: 0;
-  max-height: 120px;
-  overflow: auto;
-  padding: 8px 10px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: var(--surface-2);
-  font: 11.5px/1.65 var(--mono);
   color: var(--text-2);
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
-.import-notes {
-  margin: 0;
-  padding-left: 16px;
-  font-size: 11.5px;
-  line-height: 1.7;
-  color: var(--muted);
+.rt-cap-row input {
+  width: 120px;
+  flex: 0 0 auto;
 }
-
-.import-ops {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 220px;
-  overflow: auto;
-}
-
-.import-op {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
-  border: 1px solid var(--line-soft);
-  border-radius: 7px;
-  font-size: 11.5px;
-  cursor: pointer;
-}
-
-.import-op.on { border-color: var(--green-line); background: var(--green-soft); }
-
-.import-op-method {
-  flex: none;
-  width: 44px;
-  font: 10.5px/1 var(--mono);
-  color: var(--muted);
-}
-
-.import-op-name {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.import-op-params { flex: none; color: var(--faint); font-size: 10.5px; }
-
-/* 弹层里的 warn / err 条：整行提示不该占满一条的高度。 */
-.import-row-body .banner { padding: 6px 10px; font-size: 11.5px; }
 
 /* ---- 权限页 ---- */
 
@@ -5673,3 +5572,77 @@ body.lb-open { overflow: hidden; }
   padding: 0 8px;
   font-size: 12px;
 }
+
+/* ---------------- 知识治理 ---------------- */
+
+/* 八个阶段排成网格：同一组内横向对齐，人一眼能把「加工」与「存储」分开看。 */
+.kb-stages { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.kb-stage {
+  display: flex; flex-direction: column; gap: 9px;
+  padding: 14px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface);
+}
+/* 未启用的阶段用虚线与浅底：它不是「还没跑到」，是「这条路没走」。 */
+.kb-stage.off { border-style: dashed; background: var(--surface-2); }
+.kb-stage-head { display: flex; align-items: center; gap: 8px; }
+.kb-stage-index { font: 600 11px/1 var(--mono); color: var(--faint); }
+.kb-stage-name { flex: 1; font-weight: 600; font-size: 13px; }
+.kb-stage-what, .kb-stage-note { font-size: 12px; line-height: 1.65; color: var(--muted); }
+.kb-stage-engine { font-family: var(--mono); font-size: 11px; color: var(--faint); word-break: break-all; }
+.kb-stage-metrics { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.kb-metric { display: flex; flex-direction: column; gap: 1px; }
+.kb-metric b { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kb-metric span { font-size: 11px; color: var(--muted); }
+.kb-stage-note { border-top: 1px dashed var(--line); padding-top: 8px; }
+.kb-stage-note b { font-weight: 600; color: var(--text-2); }
+
+.kb-group-title {
+  font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--faint); margin: 16px 0 8px;
+}
+.kb-group-title.first { margin-top: 0; }
+
+.sev { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; }
+.sev.high { background: var(--red-soft); color: var(--red); }
+.sev.medium { background: var(--amber-soft); color: var(--amber); }
+.sev.low { background: var(--green-soft); color: var(--green); }
+
+.kb-reasons { display: flex; flex-direction: column; gap: 3px; }
+.kb-reason { font-size: 12px; color: var(--text-2); line-height: 1.55; }
+.kb-reason b { font-weight: 600; }
+
+/* 反馈条目：问题是主信息，回答摘录退后一层，元数据再退一层。 */
+.kb-fb-list { display: flex; flex-direction: column; gap: 8px; }
+.kb-fb-item { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--surface); }
+.kb-fb-item.handled { background: var(--surface-2); }
+.kb-fb-q { font-weight: 600; margin-bottom: 4px; }
+.kb-fb-a { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.kb-fb-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; color: var(--faint); margin-top: 6px; }
+.kb-fb-ops { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+
+.kb-form { display: grid; gap: 8px; margin-top: 10px; padding: 12px; border: 1px dashed var(--line); border-radius: 10px; background: var(--surface-2); }
+.kb-form label { font-size: 12px; color: var(--muted); }
+.kb-form select[multiple] { min-height: 108px; }
+.kb-form-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+.kb-bars { display: flex; flex-direction: column; gap: 6px; }
+.kb-bar { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.kb-bar-label { width: 96px; color: var(--muted); text-align: right; flex: none; }
+.kb-bar-track { flex: 1; height: 6px; border-radius: 999px; background: var(--line-soft); overflow: hidden; }
+.kb-bar-fill { height: 100%; background: var(--green); border-radius: 999px; }
+.kb-bar-value { width: 56px; font-variant-numeric: tabular-nums; }
+
+/* ---------------- 回答反馈 ---------------- */
+
+/* 投票行平时很轻：一条细线 + 两个胶囊按钮。它是可选动作，
+   不该比回答本身更抢眼；但也不能藏进折叠区，否则收不到几条。 */
+.fb-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.fb-line .hint { margin: 0; }
+.fb-btn {
+  height: 26px; padding: 0 11px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface); color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
+}
+.fb-btn:hover { color: var(--text); border-color: #d2d7d3; background: var(--surface-2); }
+.fb-reasons { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.fb-reasons[hidden] { display: none !important; }
+.fb-reasons .fb-btn { font-size: 11px; height: 24px; padding: 0 9px; }

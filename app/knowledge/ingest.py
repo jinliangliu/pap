@@ -27,6 +27,9 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from app.core.config import settings
+from app.knowledge import pipeline, tagging
+from app.knowledge.markdown_clean import clean_ocr_markdown
+from app.knowledge.titles import clean_title
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +153,12 @@ class ParsedDocument:
     # 「第 1 段」这种标签对用户没有任何定位价值。
     sections: list[str]
     chunker_version: int = CHUNKER_VERSION
+    # 与 slices 对应的标签（标准号 / 文档类型 / 主题词）。切片级冗余一份，
+    # 是为了检索与老化判定不必回头按 document_id 再查一次文档行。
+    tags: list[str] = field(default_factory=list)
+    # 各阶段的产物量快照，原样写进 documents.metadata_json["pipeline"]。
+    # 不在这里做聚合，也不在读取时推算——入库那一刻的数字只有这一次能拿到。
+    pipeline: dict[str, Any] = field(default_factory=dict)
 
     @property
     def chunk_count(self) -> int:
@@ -320,16 +329,32 @@ def _html_to_text(markup: str) -> str:
     return soup.get_text("\n")
 
 
-def extract_text_from_bytes(raw: bytes, filename: str) -> str:
+def extract_text_from_bytes(
+    raw: bytes,
+    filename: str,
+    *,
+    stats: dict[str, Any] | None = None,
+) -> str:
     """从字节解析文本。
 
     上传先解析、后落盘：解析失败就不该在磁盘上留下一个永远不会被索引的
     孤儿文件；而落盘后再解析，失败时清理不干净就会一直占空间。
+
+    `stats` 是可选出参：传入一个 dict 就会填进「清洗了几张表、去掉了多少字」。
+    用它而不是改返回值，是因为这份函数的调用点有五个（页面、目录扫描、
+    统一导入、附件读取），改签名会把五个都拖下水。
     """
     suffix = Path(filename).suffix.lower()
 
     if suffix in TEXT_SUFFIXES:
         text = raw.decode("utf-8", errors="ignore")
+        # PaddleOCR-VL 直接吐的 md 里，表格还是 `<table border=1 style=...>` 那一坨。
+        # 不清洗就入库，一份 56.8 万字的标准会切出 973 片、其中 77% 的字符是标签，
+        # BM25 还会把 word / break / center 这些属性名当成正文词。
+        # 清洗放在这里（而不是页面或导入工具里）：所有入库入口都经过它。
+        text, clean_stats = clean_ocr_markdown(text)
+        if stats is not None and clean_stats:
+            stats.update(clean_stats)
     elif suffix == ".pdf":
         text = _extract_pdf(io.BytesIO(raw))
     elif suffix == ".docx":
@@ -446,6 +471,17 @@ def _document_acl(relative_path: str, meta: dict[str, str]) -> dict:
     }
 
 
+def _chunk_limit() -> int:
+    """当前的单篇切片上限（管理员可在控制台改，即时生效）。
+
+    局部导入：`runtime_settings` 会拉起 `app.db.session` 与整套 ORM 模型，
+    而切片本身是纯文本处理——`scripts/` 里的离线入库也要能不起库跑通。
+    """
+    from app.services import runtime_settings
+
+    return runtime_settings.knowledge_max_chunks()
+
+
 def build_document(
     text: str,
     *,
@@ -458,11 +494,16 @@ def build_document(
     size_bytes: int | None = None,
     meta: dict[str, str] | None = None,
     acl_hint: str | None = None,
+    pre_stats: dict[str, Any] | None = None,
 ) -> ParsedDocument:
     """把已抽取的正文变成可写入的文档。
 
     切片上限在这里拦：一份几百页的手册切成上万片，BM25 每轮检索都要扫一遍，
     与其让它慢慢拖垮检索，不如明确报错让调用方拆分文档。
+
+    ``pre_stats`` 是解析/清洗阶段的统计（``extract_text_from_bytes`` 的
+    出参），只用来拼流水线快照。不传也能跑：快照里少一节，治理页据此显示
+    「快照覆盖 n/m」，不会把「没采集」显示成「结果是 0」。
     """
     body = text.strip()
 
@@ -471,14 +512,41 @@ def build_document(
 
     sections = split_document(body)
     chunks = [item.text for item in sections]
-    limit = settings.knowledge_max_chunks_per_document
+    limit = _chunk_limit()
 
     if len(chunks) > limit:
-        raise KnowledgeIngestError(f"切片数 {len(chunks)} 超过单篇上限 {limit}，请拆分后再入库。")
+        # 报错要能让人自己判断「是该拆，还是该调容量」：只写「超过上限、
+        # 请拆分」等于给了一句做不到的指令（导入入口没有拆分功能，手工拆
+        # 还会把同一份标准散成两处、跨章引用接不上）。三个数字一给，
+        # 是「大部头」还是「切碎了」当场可判。
+        average = len(body) // max(len(chunks), 1)
+        raise KnowledgeIngestError(
+            f"切片数 {len(chunks)} 超过单篇上限 {limit}"
+            f"（原文 {len(body)} 字，平均每片 {average} 字）。"
+            "这是容量阈值，不是内容错误：管理员可在控制台「运行配置 → 入库容量」"
+            "调高上限，改完立刻生效，不需要重新上传。"
+        )
+
+    # 标题在这里统一归一：OCR 产物会带着 `.pdf_by_PaddleOCR-VL-1.6` 的长尾，
+    # 它进检索的标题加权是纯噪声。上传、目录扫描、控制台导入、重建四条路
+    # 最后都落到这一行，规则只写一份（见 titles.py）。
+    display_title = clean_title(title, fallback=Path(filename or source_uri).stem or logical_id)
+    tags = tagging.analyze(display_title, body, filename=filename)
+    snapshot = pipeline.build_snapshot(
+        extractor=pipeline.extractor_of(filename, source_uri),
+        source_bytes=size_bytes,
+        text_chars=len(body),
+        clean_stats=pre_stats,
+        tags=tags,
+        chunks=chunks,
+        sections=[item.section for item in sections],
+        chunker_version=CHUNKER_VERSION,
+        chunk_size=CHUNK_SIZE,
+    )
 
     return ParsedDocument(
         logical_id=logical_id,
-        title=(title or Path(filename or source_uri).stem or logical_id)[:512],
+        title=display_title,
         filename=filename,
         source_uri=source_uri,
         source_type=source_type,
@@ -489,6 +557,8 @@ def build_document(
         chunks=chunks,
         sections=[item.section for item in sections],
         chunker_version=CHUNKER_VERSION,
+        tags=tags.tags,
+        pipeline=snapshot,
     )
 
 
@@ -496,7 +566,9 @@ def parse_path(path: Path, root: Path, *, source_type: str = SOURCE_DIRECTORY) -
     """解析目录里的一个文件；调用方负责先做排除与大小判断。"""
     relative = path.relative_to(root).as_posix()
     raw = path.read_bytes()
-    text = extract_text_from_bytes(raw, path.name)
+    # 清洗统计要往流水线快照里带，所以这里得接住出参。
+    stats: dict[str, Any] = {}
+    text = extract_text_from_bytes(raw, path.name, stats=stats)
 
     meta: dict[str, str] = {}
 
@@ -516,6 +588,7 @@ def parse_path(path: Path, root: Path, *, source_type: str = SOURCE_DIRECTORY) -
         size_bytes=len(raw),
         meta=meta,
         acl_hint=relative,
+        pre_stats=stats,
     )
 
 

@@ -274,14 +274,14 @@ POST /chat { agent: "ops" }
 
 ## 8. 暂不做（附触发条件）
 
-下表中前三项的**规则已经定稿**，实现前先读对应文档；文档里记录了被推翻的
-直觉做法（尤其是 A2A 的子集校验为什么不能放在配置期）：
-[`A2A.md`](A2A.md)、[`STUDIO_ASSISTANT.md`](STUDIO_ASSISTANT.md)。
+下表中前三项的**规则已经定稿成设计稿**，实现前先读对应文档；稿子里记录了
+被推翻的直觉做法（尤其是 A2A 的子集校验为什么不能放在配置期、Agent 配额为什么不能建独立表）：
+[`A2A.md`](A2A.md)、[`AGENT_QUOTA.md`](AGENT_QUOTA.md)、[`STUDIO_ASSISTANT.md`](STUDIO_ASSISTANT.md)。
 
 | 事项 | 为什么现在不做 | 开工条件 |
 |---|---|---|
-| ~~**Agent 之间委派（A2A handoff）**~~ | **P0 / P1 / P2 已上线**：`delegate_to_agent`、`agent_subset` 唯一判定、深度 2 / 环 / 单轮 3 次、`kind=agent` span、`agent_delegated` 审计、`GET /agents/{ref}/capabilities`；P1 的 `refs` 引用传递；P2 解除子调用只读 + 审批单冻结 `delegation_chain` 并逐跳复核。规则见 [`A2A.md`](A2A.md) | — | 余下 P3：委派预算按 Agent 可配、`delegated_turns` 指标、跨会话共享产物 |
-| **Agent 级配额 / 成本上限** | 现有配额在租户粒度。按 Agent 拆需要先有稳定的调用量分布，否则阈值是拍的。加列即可，不建表 | `obs_traces.agent_name` 攒够 2 周，能看到 Agent 之间的成本差异 |
+| ~~**Agent 之间委派（A2A handoff）**~~ | **P0 / P1 / P2 已上线**：`delegate_to_agent`、`agent_subset` 唯一判定、深度 2 / 环 / 单轮 3 次、`kind=agent` span、`agent_delegated` 审计、`GET /agents/{ref}/capabilities`；P1 的 `refs` 引用传递；P2 解除子调用只读 + 审批单冻结 `delegation_chain` 并逐跳复核。规则见 [`A2A.md`](A2A.md)，数据面与偏差见 [`AGENT_CONNECT.md`](AGENT_CONNECT.md) | — | 余下 P3：委派预算按 Agent 可配、`delegated_turns` 指标、跨会话共享产物 |
+| **Agent 级配额 / 成本上限** | 现有配额在租户粒度。按 Agent 拆需要先有稳定的调用量分布，否则阈值是拍的。方案见 [`AGENT_QUOTA.md`](AGENT_QUOTA.md)（加列，不建表） | `obs_traces.agent_name` 攒够 2 周，能看到 Agent 之间的成本差异 |
 | **Agent 绩效看板**（成功率 / 驳回率 / 时延） | 依赖上一行；且「主动调用 → 被驳回」目前只记在审批表，口径要先定 | 有 ≥2 个 Agent 在真实使用 |
 | **多 Agent 并发 / 辩论** | 这是执行图的形态变化，不是配置问题；单机跑并行 agent 会先把时延打爆 | 单 Agent 的成功率与边界稳定性有数据支撑之后 |
 | **Agent 绑定模型** | 现在全局一个模型配置。按 Agent 选模型要先有成本分摊与降级策略 | 有「某类任务必须用更强模型」的具体诉求，且能接受多份凭据 |

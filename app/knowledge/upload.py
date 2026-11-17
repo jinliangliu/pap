@@ -21,8 +21,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,7 +48,6 @@ from app.tenancy.context import tenant_scope
 logger = logging.getLogger(__name__)
 
 WRITE_PERMISSION = "knowledge:write"
-MAX_TITLE_CHARS = 200
 
 
 class UploadRejected(Exception):
@@ -62,6 +62,17 @@ class UploadDenied(Exception):
 class UploadOutcome:
     row: documents.DocumentRow
     action: str
+    # 入库前的形态清洗统计（OCR 的 HTML 表转 pipe 表）。
+    # 不是每个人都有：干净的 md 没有这一步，此时是空 dict。
+    # 保留它是因为「入库的是 14 万字，不是你传的 56 万字」必须说得出——
+    # 否则人会以为后半本没进去，或者以为自己传错了文件。
+    cleanup: dict[str, int] = field(default_factory=dict)
+    # 这一步产出的加工快照与原样标签。对话里要把它说成一条链路
+    # （解析 → 清洗 → 结构化 → 切片 → 打标），光靠 ``row`` 说不出来：
+    # 文档行只存了快照，标签是冗在各片上的。从 ``parsed`` 直接带出，
+    # 免得调用方去猜 metadata_json 的形状。
+    pipeline: dict[str, Any] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
 
 
 def can_write_knowledge(identity: Identity) -> bool:
@@ -138,8 +149,10 @@ async def ingest_upload(
     if len(raw) > limit:
         raise UploadRejected(f"文件超过 {limit // (1024 * 1024)} MB 上限。")
 
+    cleanup: dict[str, int] = {}
+
     try:
-        text = extract_text_from_bytes(raw, raw_name)
+        text = extract_text_from_bytes(raw, raw_name, stats=cleanup)
     except KnowledgeIngestError as exc:
         raise UploadRejected(str(exc)) from exc
     except Exception as exc:  # 损坏的 PDF/Word 不走上面的分支
@@ -152,19 +165,24 @@ async def ingest_upload(
     body_hash = "sha256:" + hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
     existing = await documents.find_upload_by_hash(session, identity.tenant_id, body_hash)
     logical_id = existing.logical_id if existing else f"upload-{uuid.uuid4().hex[:12]}"
-    clean_title = (title or "").strip()[:MAX_TITLE_CHARS] or Path(raw_name).stem[:MAX_TITLE_CHARS]
+    # 标题归一交给 build_document（titles.clean_title）：这里再算一遍，
+    # 两处规则就会各自演化——原本 CLI 清长尾、这里不清，就是那么来的。
+    display_title = title
 
     try:
         parsed = build_document(
             text,
             logical_id=logical_id,
-            title=clean_title,
+            title=display_title,
             source_uri=f"uploads/{raw_name}",
             source_type=SOURCE_UPLOAD,
             filename=raw_name,
             size_bytes=len(raw),
             meta={"access_scope": scope, "visibility": "tenant_shared"},
             acl_hint=raw_name,
+            # 清洗统计一路带进流水线快照：治理页要能说出「上传 56.8 万字、
+            # 入库 14 万字、压掉的都是标签」。
+            pre_stats=cleanup,
         )
     except KnowledgeIngestError as exc:
         raise UploadRejected(str(exc)) from exc
@@ -208,7 +226,13 @@ async def ingest_upload(
         # 写完之后读不回来，说明写入本身有问题，不是输入问题。
         raise RuntimeError("写入后未能读回文档。")
 
-    return UploadOutcome(row=row, action=action)
+    return UploadOutcome(
+        row=row,
+        action=action,
+        cleanup=cleanup,
+        pipeline=parsed.pipeline,
+        tags=list(parsed.tags),
+    )
 
 
 async def _audit(

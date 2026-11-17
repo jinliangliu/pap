@@ -5,13 +5,13 @@
 """
 
 from app.models.agent import Agent, AgentStatus
+from app.models.api_token import ApiToken
 from app.models.approval import (
     TERMINAL_APPROVAL_STATUSES,
     ApprovalRequest,
     ApprovalStatus,
     RiskLevel,
 )
-from app.models.api_token import ApiToken
 from app.models.artifact import Artifact
 from app.models.audit import AuditEventType, AuditLog
 from app.models.connector import (
@@ -24,6 +24,7 @@ from app.models.connector import (
     ConnectorCredential,
     ConnectorKind,
 )
+from app.models.context import ConversationSummary
 from app.models.conversation import (
     AgentRun,
     Conversation,
@@ -31,13 +32,22 @@ from app.models.conversation import (
     MessageRole,
     RunStatus,
 )
-from app.models.context import ConversationSummary
 from app.models.custom_tool import CustomTool
 from app.models.document import (
     Document,
     DocumentChunk,
     DocumentStatus,
     KnowledgeIndexState,
+)
+from app.models.knowledge_gov import (
+    VALID_CASE_SOURCES,
+    VALID_REASONS,
+    VALID_VERDICTS,
+    VERDICT_DOWN,
+    VERDICT_UP,
+    KnowledgeEvalCase,
+    KnowledgeEvalRun,
+    KnowledgeFeedback,
 )
 from app.models.mcp_registered import McpRegisteredTool
 from app.models.memory import (
@@ -60,17 +70,17 @@ from app.models.rbac import (
     UserRole,
 )
 from app.models.skill import Skill, SkillHit
-from app.models.workflow import (
-    OPEN_RUN_STATUSES,
-    Workflow,
-    WorkflowRun,
-    WorkflowRunStatus,
-)
 from app.models.tenant import (
     Tenant,
     TenantQuota,
     TenantStatus,
     TenantToolPolicy,
+)
+from app.models.workflow import (
+    OPEN_RUN_STATUSES,
+    Workflow,
+    WorkflowRun,
+    WorkflowRunStatus,
 )
 
 __all__ = [
@@ -94,6 +104,14 @@ __all__ = [
     "DocumentChunk",
     "DocumentStatus",
     "KnowledgeIndexState",
+    "KnowledgeFeedback",
+    "KnowledgeEvalCase",
+    "KnowledgeEvalRun",
+    "VERDICT_UP",
+    "VERDICT_DOWN",
+    "VALID_VERDICTS",
+    "VALID_REASONS",
+    "VALID_CASE_SOURCES",
     "Memory",
     "MemoryReview",
     "MemoryReviewAction",

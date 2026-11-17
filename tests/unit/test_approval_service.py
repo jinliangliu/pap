@@ -36,7 +36,12 @@ def run_context() -> ToolExecutionContext:
     )
 
 
-def build_service(calls: list[dict], *, required_scopes: tuple[str, ...] = ()) -> ApprovalService:
+def build_service(
+    calls: list[dict],
+    *,
+    required_scopes: tuple[str, ...] = (),
+    verifier=None,  # noqa: ANN001
+) -> ApprovalService:
     async def write_handler(ctx, arguments):  # noqa: ANN001
         calls.append({"arguments": arguments, "idempotency_key": ctx.idempotency_key})
         return ToolExecutionResult(
@@ -65,6 +70,7 @@ def build_service(calls: list[dict], *, required_scopes: tuple[str, ...] = ()) -
                 "additionalProperties": False,
             },
             handler=write_handler,
+            verifier=verifier,
         )
     )
 
@@ -236,3 +242,57 @@ async def test_confirmation_preserves_platform_admin_flag():
 
     assert result.status in {ApprovalStatus.EXECUTED, ApprovalStatus.VERIFIED}
     assert len(calls) == 1, "确认后必须真正执行，而不是被授权层拦掉"
+
+
+async def test_verify_context_carries_the_session_scope():
+    """回读核验拿到的是「发起那一次」的完整上下文，不是重建出来的一份。
+
+    这里曾经逐字段重建：`conversation_id` 没抄，于是导入类工具的 verifier
+    解不出附件句柄，只能一律不核验——没人报错，只是审批卡永远停在
+    EXECUTED。补字段是治症状：下一个人加字段时还会漏，所以改成 replace，
+    这个用例盯的就是那一位。
+    """
+    seen: dict = {}
+
+    async def verifier(ctx, arguments):  # noqa: ANN001
+        seen["conversation_id"] = ctx.conversation_id
+        seen["attachment_ids"] = ctx.attachment_ids
+        seen["external_operation_id"] = ctx.external_operation_id
+        return ToolExecutionResult(
+            success=True,
+            verified=True,
+            message="已回读确认。",
+            verification={"verified": True},
+        )
+
+    service = build_service([], verifier=verifier)
+    context = ToolExecutionContext(
+        tenant_id="t1",
+        user_id="u1",
+        thread_id="th-verify",
+        run_id="r1",
+        request_id="req1",
+        conversation_id="conv-42",
+        attachment_ids=("txt_0123456789ab",),
+    )
+
+    approval = await service.create_approval(
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        thread_id=context.thread_id,
+        run_id=context.run_id,
+        plan=plan(context),
+        preview={},
+    )
+
+    result = await service.confirm_and_execute(
+        approval_id=approval.id,
+        context=context,
+        confirmed_parameters={"title": "压力异常"},
+    )
+
+    assert result.status == ApprovalStatus.VERIFIED
+    assert seen["conversation_id"] == "conv-42"
+    assert seen["attachment_ids"] == ("txt_0123456789ab",)
+    # 执行结果里的外部操作号要一起带过去：verifier 靠它定位「核哪一份」。
+    assert seen["external_operation_id"] == "op-1"

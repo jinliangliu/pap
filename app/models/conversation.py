@@ -74,7 +74,7 @@ class Conversation(TenantScoped, Base):
 
     # 上一轮实测的 prompt token 数（供应商报的值，经回调收集后落库）。
     # 放业务表而不是只记在观测里：观测可以整体关掉，而「这一轮该不该压缩」
-    # 不能因为开关状态而失去依据。
+    # 不能因为开关状态而失去依据。见 docs/CONTEXT.md §4。
     last_prompt_tokens: Mapped[int] = mapped_column(
         Integer,
         default=0,

@@ -31,9 +31,14 @@ import argparse
 import json
 import re
 import sys
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+
+# 直接 `python scripts/ocr_json_to_md.py …` 时 sys.path[0] 是 scripts/，
+# 项目根不在里面，`app.*` 会导入失败（用 `python -m scripts.…` 才天生可见）。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.knowledge.markdown_clean import normalize, table_to_markdown  # noqa: E402,F401
 
 # PaddleOCR 标成这些标签的块不进正文：页码、脚注、页眉页脚、侧栏。
 # 与 JSON 里 `markdown_ignore_labels` 的默认值保持一致。
@@ -47,69 +52,15 @@ IGNORED_LABELS = {
     "aside_text",
 }
 
-_TABLE_RE = re.compile(r"<table[\s\S]*?</table>", re.IGNORECASE)
-_IMG_RE = re.compile(r"<img[^>]*>", re.IGNORECASE)
-_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+# 清洗实现住在 `app/knowledge/markdown_clean.py`：入库路径也要用同一份，
+# 各写一套会出现「脚本处理过的不脏、直接上传的就脏」。
 _BLANK_RE = re.compile(r"\n{3,}")
 
 
-class _TableParser(HTMLParser):
-    """把 `<table>` 采成二维字符串数组。
-
-    只用标准库：这个脚本要能在没装 bs4 的机器上跑（服务器上是空的 venv）。
-    """
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.rows: list[list[str]] = []
-        self._row: list[str] | None = None
-        self._cell: list[str] | None = None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag == "tr":
-            self._row = []
-        elif tag in {"td", "th"}:
-            self._cell = []
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
-            self._row.append(_clean_cell("".join(self._cell)))
-            self._cell = None
-        elif tag == "tr" and self._row is not None:
-            if any(cell for cell in self._row):
-                self.rows.append(self._row)
-            self._row = None
-
-    def handle_data(self, data: str) -> None:
-        if self._cell is not None:
-            self._cell.append(data)
-
-
-def _clean_cell(text: str) -> str:
-    return " ".join(text.split()).replace("|", "\\|")
-
-
-def table_to_markdown(table_html: str) -> str:
-    """HTML 表格 → Markdown 表格；解析不出行就退化成空串（宁缺勿噪）。"""
-    parser = _TableParser()
-    parser.feed(table_html)
-    parser.close()
-
-    rows = [row for row in parser.rows if row]
-
-    if not rows:
-        return ""
-
-    width = max(len(row) for row in rows)
-    padded = [row + [""] * (width - len(row)) for row in rows]
-    header, *body = padded
-
-    lines = ["| " + " | ".join(header) + " |",
-             "| " + " | ".join("---" for _ in range(width)) + " |"]
-
-    lines.extend("| " + " | ".join(row) + " |" for row in body)
-
-    return "\n".join(lines)
+def _blocks(page: dict[str, Any]) -> list[dict[str, Any]]:
+    pruned = page.get("prunedResult") or {}
+    blocks = pruned.get("parsing_res_list") or []
+    return [block for block in blocks if isinstance(block, dict)]
 
 
 def boilerplate_lines(pages: list[dict[str, Any]], *, min_pages: int = 2) -> set[str]:
@@ -131,12 +82,6 @@ def boilerplate_lines(pages: list[dict[str, Any]], *, min_pages: int = 2) -> set
     return {text for text, pages_seen in seen.items() if len(pages_seen) >= min_pages}
 
 
-def _blocks(page: dict[str, Any]) -> list[dict[str, Any]]:
-    pruned = page.get("prunedResult") or {}
-    blocks = pruned.get("parsing_res_list") or []
-    return [block for block in blocks if isinstance(block, dict)]
-
-
 def page_text(page: dict[str, Any]) -> str:
     """取一页的正文：优先用 markdown，缺了就从版面块按顺序拼。"""
     markdown = page.get("markdown")
@@ -145,35 +90,15 @@ def page_text(page: dict[str, Any]) -> str:
         return markdown["text"]
 
     ordered = sorted(
-        (block for block in _blocks(page)
-         if block.get("block_label") not in IGNORED_LABELS),
+        (
+            block
+            for block in _blocks(page)
+            if block.get("block_label") not in IGNORED_LABELS
+        ),
         key=lambda block: block.get("block_order") or 0,
     )
 
     return "\n\n".join(str(block.get("block_content") or "") for block in ordered)
-
-
-def normalize(text: str, *, boilerplate: set[str]) -> str:
-    """去表格标签味、去图、去重复页眉页脚，压掉多余空行。"""
-    text = _TABLE_RE.sub(lambda match: "\n\n" + table_to_markdown(match.group(0)) + "\n\n", text)
-    text = _IMG_RE.sub("", text)
-    # div / span 之类的包裹层只去标签、留文字：题注就在里面。
-    text = _TAG_RE.sub("", text)
-
-    lines: list[str] = []
-
-    for raw in text.splitlines():
-        line = " ".join(raw.split())
-
-        if not line:
-            lines.append("")
-            continue
-        if line in boilerplate:
-            continue
-
-        lines.append(line)
-
-    return _BLANK_RE.sub("\n\n", "\n".join(lines)).strip()
 
 
 def convert(data: Any) -> tuple[str, dict[str, Any]]:

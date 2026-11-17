@@ -106,7 +106,7 @@
 改成 `False` 是没用的，必须同时降到 `normal`。
 
 代价是这些导出文件会持续堆积，目前没有自动清理。文件都在 MCP 容器的
-数据卷里，需要时观察该卷的磁盘占用增长。
+数据卷里，需要时按 `docs/MONITORING.md` 的磁盘检查项观察增长。
 
 **刻意不暴露**：
 
@@ -358,7 +358,7 @@ curl -s -H 'X-Authenticated-Subject: pap-admin' http://127.0.0.1:8000/api/v1/too
 1. `MCP_ENABLED=true` + 令牌配好后重启，日志应出现 `mcp_tools_registered`，
    `registered=21`。
 2. `/api/v1/tools` 里出现 21 个 `prv_*`。
-3. `default` 租户问「列出你能看到的调压站」，应返回全部 10 个站点（owner 令牌覆盖全站点）。
+3. `default` 租户问「列出你能看到的调压站」，应返回 10 个真实站名（owner 令牌全站点）。
 4. `test` 租户配 `isolated` 令牌后问同一句，应得到「当前身份看不到任何站点」
    并说明是空白名单——**不是** `MCP_CREDENTIAL_MISSING`，更不能拿到 default 的 10 个站。
    两种隔离形态要分清：没配令牌是「拒绝」，配了空白名单是「空结果」。
@@ -416,7 +416,7 @@ ZeroPadding、base64，密钥硬编码在对端 `server.py`），再 `POST {base
 
 ## 10. 与对端版本的关系（2026-11-04）
 
-对端在后续一版里加了一层 **HTTP 层鉴权前筛**（`prv_auth.AuthPrefilter`），
+对端在 `<commit>` 之后加了一层 **HTTP 层鉴权前筛**（`prv_auth.AuthPrefilter`），
 由 `PRV_STRICT_HTTP_AUTH` 控制，默认关闭。它对客户端的要求只有一条，
 但踩不上就会误判：
 

@@ -125,7 +125,7 @@ class ApprovalRequest(TenantScoped, Base):
     # 确认后是新的 trace，只有从这里继承，前半段（发起）与后半段（执行）
     # 才在运行视图里是同一次运行。观测关闭时为空，此时不显示运行视图。
     # 与 `A2A.md` §10 拒绝的 `parent_trace_id` 不同：那是 trace 之间的树边，
-    # 这是分组键。
+    # 这是分组键，见 docs/RUNTIME_VIEW.md §4.2。
     operation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     tool_name: Mapped[str] = mapped_column(String(128), index=True)

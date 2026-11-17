@@ -164,7 +164,9 @@ def test_build_document_rejects_oversized_document(monkeypatch):
     """
     from app.knowledge import ingest
 
-    monkeypatch.setattr(ingest.settings, "knowledge_max_chunks_per_document", 1)
+    # 上限现在来自运行时配置（管理员可在控制台调），直接钉住取值函数：
+    # 改 `settings.knowledge_max_chunks_per_document` 不再影响入库。
+    monkeypatch.setattr(ingest, "_chunk_limit", lambda: 1)
 
     with pytest.raises(ingest.KnowledgeIngestError, match="超过单篇上限"):
         ingest.build_document(

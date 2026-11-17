@@ -265,7 +265,10 @@ async def test_pause_then_confirm_continues_from_the_same_node(
     assert "流程继续执行完毕" in result["message"]
     # 汇总节点用的是「建单节点」的结论，而那个结论来自审批执行，不是模型转述。
     assert "流程结论：" in result["message"]
-    assert "操作已执行" in result["message"]
+    # 结论是工具自己的那句话（「工单已在演示模式下受理」），不是平台统一拼的
+    # 「操作请求已提交，但尚未获得可确认的回读结果」——后者会让所有写工具
+    # 在会话里长得一模一样，用户看不出到底成没成。
+    assert "工单已在演示模式下受理" in result["message"]
 
     after = await _run(run_id)
     assert str(after.id) == str(run.id), "续跑另开了一条 run"
@@ -279,7 +282,7 @@ async def test_pause_then_confirm_continues_from_the_same_node(
         "answer",
     ]
     assert after.nodes_json[1]["status"] == "ok"
-    assert "操作已执行" in (after.output_text or "")
+    assert "工单已在演示模式下受理" in (after.output_text or "")
 
     # 续跑没有额外开单。
     assert len(await _approvals_of(after)) == 1

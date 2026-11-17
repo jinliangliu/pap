@@ -48,7 +48,23 @@ DEFAULT_TOOL_ACTION = "permissions.default_action"
 # 删令牌要逐个点，而这个开关点一下就到。
 MCP_INBOUND_ENABLED = "mcp.inbound_enabled"
 
+# 单篇文档的切片上限。它是**容量阈值**，不是质量阈值：
+# 一份 56.8 万字的现行国标切 973 片是它应有的颗粒度，而一本被误传的数 MB
+# 手册能切出几千片，BM25 每轮检索都要全扫。
+#
+# 为什么放在运行时配置里而不是只留在 `.env`：这个数字已经两次卡住真实入库
+# （400 卡住 448 片的 GB/T 3836.1，800 卡住 973 片的 GB/T 3836.4），
+# 而它取决于机器规格与语料规模，不是「改错了」——不该每调一次就发一次版。
+# 默认值见 `settings.knowledge_max_chunks_per_document`。
+KNOWLEDGE_MAX_CHUNKS = "knowledge.max_chunks_per_document"
+
 _BOOL_KEYS = (OBSERVABILITY_ENABLED, MCP_INBOUND_ENABLED)
+
+# 切片上限的合法区间。下限 1 是「至少能存一份」；上限 20000 挡住手滑写成
+# 十万——那个量级会真的把每轮检索拖成秒级，而它不会在写入时报错，
+# 只会在之后每次提问时慢慢显形。
+_CHUNK_LIMIT_MIN = 1
+_CHUNK_LIMIT_MAX = 20000
 
 # 默认动作只有两个合法取值。不提供 confirm：把「没配过」的工具默认设成
 # 每次都要审批，会让第一次接入的二十个工具全部弹卡片，人会条件反射地点通过。
@@ -59,7 +75,6 @@ _DEFAULTS: dict[str, Any] = {
     DEFAULT_TOOL_ACTION: "allow",
     MCP_INBOUND_ENABLED: True,
 }
-
 # 进程内的当前值。只放**已校验过**的值：脏数据不进缓存，
 # 于是 `_read` 会自然回落到默认，与「库里没这条」表现一致。
 _cache: dict[str, Any] = {}
@@ -72,9 +87,12 @@ def _fallback(key: str) -> Any:
 
     观测项回落到 `.env` 的 `OBS_ENABLED` 而不是写死 True：
     这样「想用环境变量压住」的老做法仍然有效，且启动行为可预测。
+    切片上限同理回落到 `KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT`。
     """
     if key == OBSERVABILITY_ENABLED:
         return bool(settings.obs_enabled)
+    if key == KNOWLEDGE_MAX_CHUNKS:
+        return int(settings.knowledge_max_chunks_per_document)
     return _DEFAULTS.get(key)
 
 
@@ -87,6 +105,19 @@ def _coerce_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     return None
+
+
+def _coerce_chunk_limit(value: Any) -> int | None:
+    """把库里的值读成切片上限；越界或非整数返回 None（= 按未配置处理）。
+
+    `isinstance(True, int)` 为真，所以要先挡布尔：库里存了 `true` 时
+    不能被当成 1——那会让每一份文档都被判超限。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if not (_CHUNK_LIMIT_MIN <= value <= _CHUNK_LIMIT_MAX):
+        return None
+    return value
 
 
 def _read_bool(key: str) -> bool:
@@ -119,6 +150,18 @@ def mcp_inbound_enabled() -> bool:
     return _read_bool(MCP_INBOUND_ENABLED)
 
 
+def knowledge_max_chunks() -> int:
+    """单篇文档的切片上限。入库时读，纯内存。
+
+    入库路径不是热路径（一份文档只切一次），但也没必要为它 await 一次库：
+    缓存里就是生效值，未 load 时回落到 `.env`，与其它项一致。
+    """
+    value = _coerce_chunk_limit(_cache.get(KNOWLEDGE_MAX_CHUNKS))
+    if value is None:
+        return int(_fallback(KNOWLEDGE_MAX_CHUNKS))
+    return value
+
+
 def source(key: str) -> str:
     """当前值来自哪里：`runtime`（管理员设过）或 `env`（默认值）。"""
     return "runtime" if key in _from_db else "env"
@@ -133,6 +176,8 @@ def snapshot() -> dict[str, Any]:
         "default_tool_action_source": source(DEFAULT_TOOL_ACTION),
         "mcp_inbound_enabled": mcp_inbound_enabled(),
         "mcp_inbound_source": source(MCP_INBOUND_ENABLED),
+        "knowledge_max_chunks": knowledge_max_chunks(),
+        "knowledge_max_chunks_source": source(KNOWLEDGE_MAX_CHUNKS),
     }
 
 
@@ -187,6 +232,23 @@ async def load() -> None:
                 continue
             cache[row.key] = action
             from_db.add(row.key)
+        elif row.key == KNOWLEDGE_MAX_CHUNKS:
+            limit = _coerce_chunk_limit(row.value)
+            if limit is None:
+                # 越界或类型不对：不进缓存，于是 `knowledge_max_chunks()`
+                # 回落到 .env，`source()` 也如实说「来自 env」——
+                # 与「库里没这条」表现一致，比「用了一个奇怪的数还标成管理员设的」好。
+                logger.warning(
+                    "运行配置项的值不可用，按未配置处理。",
+                    extra={
+                        "event": "runtime_setting_invalid",
+                        "key": row.key,
+                        "value_type": type(row.value).__name__,
+                    },
+                )
+                continue
+            cache[row.key] = limit
+            from_db.add(row.key)
         else:
             # 未知键不报错：可能是旧版本留下的，或新版本先写了、回退了代码。
             cache[row.key] = row.value
@@ -225,6 +287,19 @@ async def set_default_tool_action(value: str, *, actor: str | None) -> bool:
     return await _persist(DEFAULT_TOOL_ACTION, value, actor=actor)
 
 
+async def set_knowledge_max_chunks(value: int, *, actor: str | None) -> bool:
+    """写入切片上限。越界直接拒绝，不夹到边界值。
+
+    夹边界看着「更友好」，实际更坏：管理员以为设成了 50000，实际是 20000，
+    下次撞墙时看到的数字和他填的对不上，会怀疑是「没保存」。
+    """
+    if not (_CHUNK_LIMIT_MIN <= value <= _CHUNK_LIMIT_MAX):
+        raise ValueError(
+            f"切片上限应在 {_CHUNK_LIMIT_MIN} 到 {_CHUNK_LIMIT_MAX} 之间。"
+        )
+    return await _persist(KNOWLEDGE_MAX_CHUNKS, value, actor=actor)
+
+
 async def set_bool(key: str, value: bool, *, actor: str | None) -> bool:
     return await _persist(key, value, actor=actor)
 
@@ -236,6 +311,8 @@ async def _persist(key: str, value: Any, *, actor: str | None) -> bool:
         previous: Any = _read_bool(key)
     elif key == DEFAULT_TOOL_ACTION:
         previous = default_tool_action()
+    elif key == KNOWLEDGE_MAX_CHUNKS:
+        previous = knowledge_max_chunks()
     else:
         previous = _cache.get(key)
     changed = previous != value

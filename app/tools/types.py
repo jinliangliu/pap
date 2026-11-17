@@ -154,7 +154,7 @@ class ToolExecutionContext:
     # 因为它们是**执行纪律**，与「模型看到了什么」无关；
     # 混进 state 的可见部分会让模型多出一堆看不懂的字段。
     # 但子调用是一个新的执行图，跨图只能走 state——所以 state 里也存一份，
-    # 由 `_context` 还原到这里。
+    # 由 `_context` 还原到这里（见 `docs/AGENT_CONNECT.md` §5）。
     delegation_path: tuple[str, ...] = ()
     delegation_count: int = 0
 

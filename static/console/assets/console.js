@@ -150,7 +150,9 @@
     tools: [],
     tenants: [],
     currentTenant: null,
-    chat: { thread: newThreadId(), id: null, messages: [], attachments: [], agent: "" }
+    /* `agent` 与 `flow` 不能同时有值：一个是「这个人回答」，一个是「这条流程跑一次」。
+       选流程时会话不动（流程只用这句话作输入，不读上下文），选人时按老规矩开新会话。 */
+    chat: { thread: newThreadId(), id: null, messages: [], attachments: [], agent: "", flow: "" }
   };
 
   /* 附件上限必须与后端 chat_max_attachments / chat_max_attachment_bytes 一致，
@@ -397,7 +399,7 @@
     },
     workflows: {
       eyebrow: "WORKFLOWS", title: "编排",
-      desc: "把「谁在第几步做什么」写成版本化的图，用 /workflow 在对话里触发。图只排顺序，不分配能力——每次节点调用仍然逐跳判定边界。",
+      desc: "把「谁在第几步做什么」写成版本化的图，在对话输入框里选它就能触发（也可以打 /workflow）。图只排顺序，不分配能力——每次节点调用仍然逐跳判定边界。",
       mount: mountWorkflows
     },
     permissions: {
@@ -1169,6 +1171,85 @@
     return parts.join("");
   }
 
+  /* ---- 回答反馈：点赞/踩 ----
+   *
+   * 这是知识闭环的入口：踩的记录进治理页的 bad case 清单，可以一键升格成
+   * 评测用例。所以按钮必须就在回答下面——藏进菜单或折叠区，一条都收不到。
+   *
+   * 状态挂在 `msg.feedback` 上而不是另设一张表：整块重渲染（搜索、切回会话）
+   * 之后要能原样还原，存两份就有一份会过期。
+   */
+
+  var FEEDBACK_REASONS = [
+    { id: "not_relevant", label: "答非所问" },
+    { id: "wrong_citation", label: "引错资料" },
+    { id: "outdated", label: "内容过期" },
+    { id: "incomplete", label: "没答全" },
+    { id: "not_found_but_had", label: "库里有却说没有" }
+  ];
+
+  function feedbackBar(msg, index) {
+    var picked = msg.feedback || null;
+
+    if (picked) {
+      return '<div class="fb-line done"><span class="chip ' +
+        (picked.verdict === "up" ? "ok" : "err") + '">' +
+        (picked.verdict === "up" ? "已点赞" : "已记录问题") + "</span>" +
+        (picked.reason ? '<span class="hint">' +
+          esc((FEEDBACK_REASONS.filter(function (r) { return r.id === picked.reason; })[0] || {}).label ||
+            picked.reason) + "</span>" : "") +
+        '<span class="hint">可在知识治理页复盘</span></div>';
+    }
+
+    var reasons = FEEDBACK_REASONS.map(function (reason) {
+      return '<button class="fb-btn" type="button" data-fb-reason="' + esc(reason.id) +
+        '" data-fb-idx="' + index + '">' + esc(reason.label) + "</button>";
+    }).join("");
+
+    return '<div class="fb-line" data-fb-line="' + index + '">' +
+      '<span class="hint">这条回答有用吗</span>' +
+      '<button class="fb-btn" type="button" data-fb="up" data-fb-idx="' + index + '">赞</button>' +
+      '<button class="fb-btn" type="button" data-fb="down" data-fb-idx="' + index + '">踩</button>' +
+      '<span class="fb-reasons" data-fb-reasons="' + index + '"' +
+      (msg.feedbackOpen ? "" : " hidden") + ">" + reasons + "</span></div>";
+  }
+
+  async function submitFeedback(index, verdict, reason) {
+    var msg = state.chat.messages[index];
+    if (!msg) return;
+
+    // 上一条若是用户提问，它就是这次回答对应的问题。
+    // 中间夹着别的消息（很少见）时留空也比猜一条强。
+    var prev = index > 0 ? state.chat.messages[index - 1] : null;
+    var query = prev && prev.role === "user" ? prev.text : "";
+    var cites = msg.citations || [];
+
+    try {
+      await api("/api/v1/knowledge/feedback", {
+        method: "POST",
+        body: {
+          verdict: verdict,
+          reason: verdict === "down" ? (reason || "other") : null,
+          // 没有 id（刚返回、还没刷新）也允许提交：一条没有消息号的反馈
+          // 仍然是一次真实事故，丢掉它比多一条重复记录更可惜。
+          message_id: msg.id || null,
+          conversation_id: state.chat.id || null,
+          query: query || "",
+          answer: msg.text || "",
+          chunk_ids: cites.map(function (c) { return c.chunk_id; }).filter(Boolean),
+          document_ids: cites.map(function (c) { return c.document_id; }).filter(Boolean)
+        }
+      });
+
+      msg.feedback = { verdict: verdict, reason: reason || "" };
+      msg.feedbackOpen = false;
+      renderChatLog();
+      toast(verdict === "up" ? "已点赞" : "已记录，可在知识治理页看这条 bad case");
+    } catch (e) {
+      toast(errText(e), "err");
+    }
+  }
+
   function chatBubble(msg, index, closed) {
     // data-idx 是刻度导航与搜索跳转的落点：DOM 顺序与 state.chat.messages 一致，
     // 但重渲染后节点会换，所以标识必须挂在元素上而不是留着旧引用。
@@ -1206,6 +1287,10 @@
           esc(c.title || "未命名") + " · " + esc(c.section || "—") + "</a>" +
           " · score=" + esc(score) + "</li>";
       }).join("") + "</ul>";
+    }
+    // 反馈行跟着回答走：它评价的是这一条回答，不是整段会话。
+    if (typeof index === "number" && msg.role !== "user") {
+      out += feedbackBar(msg, index);
     }
     if (msg.approval) {
       var a = msg.approval;
@@ -1283,6 +1368,7 @@
       });
     });
     bindClarifyOnce(log);
+    bindFeedbackOnce(log);
 
     // 重渲染会把 mark 冲掉：搜索状态留在 chatUI 里，渲染完再挂回去。
     // 刻度导航自己从 DOM 认轮次，重渲染后重新同步一次即可。
@@ -1337,6 +1423,39 @@
     var text = C.compose(ctx.items, picks);
     if (!text) return;
     deliverChat(text, (state.chat.attachments || []).slice());
+  }
+
+  /* 事件委托：气泡每次重渲染都会重建，逐个绑定必然失效。只挂一次。 */
+  function bindFeedbackOnce(log) {
+    if (!log || log.dataset.feedbackBound === "1") return;
+    log.dataset.feedbackBound = "1";
+
+    log.addEventListener("click", function (ev) {
+      var btn = ev.target && ev.target.closest ? ev.target.closest("[data-fb], [data-fb-reason]") : null;
+      if (!btn) return;
+
+      var idx = parseInt(btn.getAttribute("data-fb-idx"), 10);
+      if (isNaN(idx)) return;
+
+      var verdict = btn.getAttribute("data-fb");
+      if (verdict === "up") {
+        submitFeedback(idx, "up", "");
+        return;
+      }
+
+      if (verdict === "down") {
+        // 先问「哪里不对」再提交：原因是后面做统计与补语料的唯一维度，
+        // 只收一个「踩」等于知道错了却不知道错在哪。
+        var msg = state.chat.messages[idx];
+        var bar = log.querySelector('[data-fb-reasons="' + idx + '"]');
+        if (msg) msg.feedbackOpen = true;
+        if (bar) bar.hidden = false;
+        return;
+      }
+
+      var reason = btn.getAttribute("data-fb-reason");
+      if (reason) submitFeedback(idx, "down", reason);
+    });
   }
 
   function bindClarifyOnce(log) {
@@ -1818,9 +1937,26 @@
   }
 
 
+  /* 点完确认，结论要单独长成一条气泡。
+   *
+     服务端就是这么存的：执行完往会话里补一条助手消息，刷新之后读回来的正是它。
+     当场却把结论塞进卡上的状态行（更早还直接把 `r.result` 的 JSON 贴进气泡里），
+     于是「刚点完看到的」和「刷新后看到的」是两种样子——而那正是最容易被当成
+     数据问题的界面：JSON 只在内存里，一刷新就没了。
+
+     只在卡本来还能点时补：能点说明单子还是 PENDING，这次一定会走恢复、
+     也一定会落库。已经处理过的单子（重复确认）不会补消息，补了就是一条
+     刷新后凭空消失的话。 */
+  function conclusionMessage(r, wasOpen) {
+    if (!wasOpen || !r || !r.message) return null;
+    return { role: "agent", text: r.message, at: new Date().toISOString(), status: "ok" };
+  }
+
   async function resolveApproval(id, action, index, btn) {
     var msg = state.chat.messages[index];
     if (!msg || !msg.approval) return;
+    // settle 会把卡改成结束态，先记下「点之前还能不能点」。
+    var wasOpen = !msg.approval.done && msg.approval.open !== false;
     var buttons = $$("[data-idx='" + index + "']");
     buttons.forEach(function (b) { b.disabled = true; });
     btn.textContent = action === "confirm" ? "执行中…" : "取消中…";
@@ -1838,17 +1974,12 @@
       var r = await api("/api/v1/approvals/" + encodeURIComponent(id) + "/" + action, {
         method: "POST", body: {}
       });
-      /* 卡上写结论，不写字段名。刷新之后这张卡会从批量接口还原成
+      /* 卡上只写状态，不写字段名。刷新之后这张卡会从批量接口还原成
          「已执行并核验通过（DELEGATION_REVOKED）」这种形状；当场确认的卡
-         若显示成 `status=VERIFIED · verified=true`，同一张单子就有了两种样子。
-
-         服务端那句话只取第一行：委派确认时它带着整段结论，塞进卡里会把卡撑破。 */
-      var text = PAPApproval.outcome({ status: r.status, error_code: r.error_code });
-      if (r.message) text += " · " + String(r.message).split("\n")[0];
-      settle(text);
-      if (r.result) {
-        msg.text = msg.text + "\n\n执行结果：\n" + JSON.stringify(r.result, null, 2);
-      }
+         若显示成 `status=VERIFIED · verified=true`，同一张单子就有了两种样子。 */
+      settle(PAPApproval.outcome({ status: r.status, error_code: r.error_code }));
+      var answer = conclusionMessage(r, wasOpen);
+      if (answer) state.chat.messages.push(answer);
       toast(action === "confirm" ? "已提交执行" : "已取消", "ok");
     } catch (e) {
       /* 409 且带着状态：单子已经作废（过期、被别处取消），这同样是结论，
@@ -2057,15 +2188,25 @@
   }
 
   function applyConversation(conv, messages, approvals, summaries) {
+    /* 一张单子一处卡：按顺序问，只有「发起」那条消息能拿到号。
+       结论消息带着同一个审批号，不过这一道就长成第二张同一张单子的卡。 */
+    var ownsApproval = PAPApproval.cardOwners();
+
     state.chat.id = conv.id;
     state.chat.thread = conv.thread_id;
     state.chat.attachments = [];
+    // 流程是「这一条消息怎么发」的选择，不属于这段历史：点开另一段会话还挂着
+    // 上一条流程，下一句话就会莫名其妙又跑一遍整张图。
+    state.chat.flow = "";
+    syncChatTarget();
+    renderChatTargetHint();
     state.chat.messages = messages
       .filter(function (m) { return m.role === "user" || m.role === "assistant"; })
       .map(function (m) {
         var meta = [];
         if (m.metadata && m.metadata.intent) meta.push("intent=" + m.metadata.intent);
         if (m.metadata && m.metadata.tool_name) meta.push("tool=" + m.metadata.tool_name);
+        if (m.metadata && m.metadata.workflow) meta.push("流程=" + m.metadata.workflow);
         return {
           // 服务端消息 id 只为一件事保留：定位压缩摘要的水位。
           // 界面上不显示，也不能拿它当渲染 key（新建的消息还没有 id）。
@@ -2087,8 +2228,9 @@
           at: m.created_at || null,
           // 停在审批上的那条消息，刷新后靠审批号把卡拼回来。
           // 不拼的话，那条消息读起来像结论，其实还在等人点。
+          // 只拼在「发起」那条上：结论消息带着同一个审批号，也拼就会重一张。
           approval:
-            m.role === "assistant"
+            m.role === "assistant" && ownsApproval(m.metadata)
               ? PAPApproval.fromMeta(m.metadata, approvals)
               : null,
           status: "ok"
@@ -2370,58 +2512,143 @@
     });
   }
 
-  /* 智能体选择器：只有一个可用项时整块隐藏。
-     选项只从「已启用」里出——草稿和已停用的选中会被服务端 409 拒掉，
-     与其让人选完再报错，不如根本不给选。
+  /* 「这句话交给谁」：一个下拉，两组选项——某个智能体，或者一条流程。
 
-     内置的构建助手不在列表里：它已经是右下角的常驻面板，把它放进下拉
-     只会多一个「从对话台打开的助手」，会话却仍然记在 studio 通道上，
-     两边都找不到自己刚说过什么。 */
-  async function loadChatAgents() {
+     为什么并进同一个下拉：它们回答的是同一个问题，而且不能同时生效
+     （流程的每一步用节点自带的智能体，选了流程就没有「这个人」了）。
+     两个下拉并排会让人以为可以既选人又选流程，再疑惑为什么选了人不生效。
+
+     选项只从「已启用」里出——草稿/已停用的智能体、停用的流程，选了也会被服务端拒，
+     与其让人选完再报错，不如根本不给选。内置的构建助手不在列表里：它已经是右下角
+     的常驻面板，放进下拉只会多一个「从对话台打开的助手」。 */
+  async function loadChatTargets() {
     var sel = $("#chat-agent");
     var wrap = $("#chat-agent-wrap");
     if (!sel || !wrap) return;
 
+    var usable = [];
+    var flows = [];
     try {
       var d = await api("/api/v1/agents");
-      var usable = (d.items || []).filter(function (item) {
+      usable = (d.items || []).filter(function (item) {
         return item.usable && !item.is_builtin;
       });
-
-      if (usable.length <= 1) {
-        wrap.hidden = true;
-        state.chat.agent = "";
-        return;
-      }
-
-      var remembered = "";
-      try { remembered = window.localStorage.getItem("pap.chat.agent") || ""; } catch (e) { remembered = ""; }
-
-      sel.innerHTML = usable.map(function (item) {
-        return '<option value="' + esc(item.name) + '">' +
-          esc(item.display_name || item.name) + "</option>";
-      }).join("");
-
-      var known = usable.filter(function (item) { return item.name === remembered; }).length > 0;
-      sel.value = known ? remembered : usable[0].name;
-      state.chat.agent = sel.value;
-      wrap.hidden = false;
-
-      sel.addEventListener("change", function () {
-        state.chat.agent = sel.value;
-        try { window.localStorage.setItem("pap.chat.agent", sel.value); } catch (e) { /* 隐私模式下写不了，忽略 */ }
-        // 换人等于换上下文：把上一轮的问答留在新智能体名下会误导它接手
-        // 不是自己产生的结论，所以直接开一个新会话。
-        if (state.chat.messages.length) {
-          resetChat();
-          toast("已切换智能体，并开启新会话");
-        }
-      });
     } catch (e) {
-      // 读不到就退回「不指定」：等效平台默认，不影响对话本身。
+      usable = [];
+    }
+    try {
+      // 流程读不到不该让整块消失：少一组选项，比连智能体都选不了温和。
+      var w = await api("/api/v1/workflows");
+      flows = (w.items || []).filter(function (item) { return item.enabled; });
+    } catch (e) {
+      flows = [];
+    }
+
+    if (usable.length <= 1 && !flows.length) {
       wrap.hidden = true;
       state.chat.agent = "";
+      state.chat.flow = "";
+      return;
     }
+
+    var opts = ['<option value="">直接对话 · 默认智能体</option>'];
+    if (usable.length) {
+      opts.push('<optgroup label="智能体">' + usable.map(function (item) {
+        return '<option value="agent:' + esc(item.name) + '">' +
+          esc(item.display_name || item.name) + "</option>";
+      }).join("") + "</optgroup>");
+    }
+    if (flows.length) {
+      opts.push('<optgroup label="流程">' + flows.map(function (item) {
+        return '<option value="flow:' + esc(item.name) + '">' +
+          esc(item.display_name || item.name) + "</option>";
+      }).join("") + "</optgroup>");
+    }
+
+    sel.innerHTML = opts.join("");
+
+    // 记住上次选的（同一个浏览器里多半是同一件事）。
+    // 旧版本存的是裸的智能体名，读到了就按智能体认——不让人升级后丢选择。
+    var remembered = "";
+    try {
+      remembered = window.localStorage.getItem("pap.chat.target") || "";
+      if (!remembered) {
+        var legacy = window.localStorage.getItem("pap.chat.agent") || "";
+        if (legacy) remembered = "agent:" + legacy;
+      }
+    } catch (e) { remembered = ""; }
+
+    var values = Array.prototype.map.call(sel.options, function (o) { return o.value; });
+    applyChatTarget(values.indexOf(remembered) >= 0 ? remembered : "");
+    wrap.hidden = false;
+    syncChatTarget(sel);
+    renderChatTargetHint();
+
+    sel.addEventListener("change", function () {
+      var before = state.chat.agent;
+      applyChatTarget(sel.value);
+      try { window.localStorage.setItem("pap.chat.target", sel.value); } catch (e) { /* 隐私模式下写不了，忽略 */ }
+      renderChatTargetHint();
+      // 换人等于换上下文：把上一轮的问答留在新智能体名下会误导它接手
+      // 不是自己产生的结论，所以直接开一个新会话。
+      // 换流程不动会话：流程只用这一句话作输入，不读上面的问答。
+      if (state.chat.agent && state.chat.agent !== before && state.chat.messages.length) {
+        resetChat();
+        toast("已切换智能体，并开启新会话");
+      }
+    });
+  }
+
+  /* 下拉值一对一地写回状态：`flow:` 前缀只动 flow，`agent:` 只动 agent。
+     选了流程时有意保留原来选的那个人——流程跑完自动回到他。 */
+  function applyChatTarget(value) {
+    var raw = String(value || "");
+    if (raw.indexOf("flow:") === 0) {
+      state.chat.flow = raw.slice(5);
+      return;
+    }
+    state.chat.flow = "";
+    state.chat.agent = raw.indexOf("agent:") === 0 ? raw.slice(6) : "";
+  }
+
+  function syncChatTarget(sel) {
+    var target = sel || $("#chat-agent");
+    if (!target) return;
+    target.value = state.chat.flow ? "flow:" + state.chat.flow : (state.chat.agent ? "agent:" + state.chat.agent : "");
+    var wrap = $("#chat-agent-wrap");
+    if (wrap) {
+      wrap.title = state.chat.flow
+        ? "这条消息触发流程「" + chatFlowLabel(state.chat.flow) + "」"
+        : "这条消息交给谁回答";
+    }
+  }
+
+  function chatFlowLabel(name) {
+    var sel = $("#chat-agent");
+    if (!sel) return name;
+    for (var i = 0; i < sel.options.length; i += 1) {
+      if (sel.options[i].value === "flow:" + name) {
+        return sel.options[i].textContent || name;
+      }
+    }
+    return name;
+  }
+
+  /* 选了流程时，输入区要先说清楚「这一句会被当成流程的输入，不是聊天」。
+     不说的话，最坏的情况是用户以为在追问，实际又触发了一遍流程。 */
+  function renderChatTargetHint() {
+    var box = $("#chat-target-hint");
+    if (!box) return;
+    if (!state.chat.flow) {
+      box.hidden = true;
+      box.innerHTML = "";
+      return;
+    }
+    box.hidden = false;
+    box.innerHTML = ico("flow") +
+      '<span>将触发流程「' + esc(chatFlowLabel(state.chat.flow)) +
+      "」：这句话是它的输入，发完自动回到直接对话</span>" +
+      '<button class="btn sm" type="button" data-act="flow-off">取消</button>';
   }
 
   function mountChat(root) {
@@ -2470,6 +2697,7 @@
       '<div class="chat-rail" id="chat-rail" hidden></div>' +
       "</div>" +
       '<div class="composer">' +
+      '<div class="chat-target-hint" id="chat-target-hint" hidden></div>' +
       '<div class="attach-tray" id="attach-tray" hidden></div>' +
       '<textarea id="chat-input" rows="2" placeholder="例如：查一下 station-001 最近一天的压力趋势"></textarea>' +
       '<div class="composer-bar">' +
@@ -2479,8 +2707,8 @@
       '<span class="attach muted" id="chat-attach"></span>' +
       // 智能体选择器默认隐藏：只有一个可用时不值得占位置，
       // 多选一才有意义（否则每个租户都会看到一个永远只有一项的下拉）。
-      '<label class="agent-pick" id="chat-agent-wrap" title="以哪个智能体回答" hidden>' +
-      ico("flow") + '<select id="chat-agent" aria-label="选择智能体"></select></label>' +
+      '<label class="agent-pick" id="chat-agent-wrap" title="这条消息交给谁回答" hidden>' +
+      ico("flow") + '<select id="chat-agent" aria-label="这条消息交给谁：智能体或流程"></select></label>' +
       '<span style="flex:1"></span>' +
       '<span class="faint" style="font-size:11px">Ctrl / ⌘ + Enter 发送</span>' +
       '<button class="btn primary" type="button" id="chat-send">发送</button>' +
@@ -2517,6 +2745,16 @@
       }
     });
 
+    // 提示条是随选中态重建的：委托在输入区上，避免每次重建都要重绑。
+    $(".composer").addEventListener("click", function (ev) {
+      var off = ev.target.closest ? ev.target.closest('[data-act="flow-off"]') : null;
+      if (!off) return;
+      state.chat.flow = "";
+      syncChatTarget();
+      renderChatTargetHint();
+      try { window.localStorage.setItem("pap.chat.target", state.chat.agent ? "agent:" + state.chat.agent : ""); } catch (e) { /* 忽略 */ }
+    });
+
     // 托盘里的删除按钮是动态渲染的，用事件委托，避免每次重建后重新绑定。
     $("#attach-tray").addEventListener("click", function (ev) {
       var btn = ev.target.closest("[data-remove]");
@@ -2529,7 +2767,7 @@
     // 刷新按钮去掉了：发消息、重命名、删除、切页都会重新拉列表，
     // 手动刷新在这个页面上换不来任何新信息，那个位置让给折叠更有用。
     applyConvCollapsed(convCollapsed());
-    loadChatAgents();
+    loadChatTargets();
 
     $("#chat-send").addEventListener("click", sendChat);
     input.addEventListener("keydown", function (ev) {
@@ -2596,6 +2834,12 @@
     var text = input.value.trim();
     var outgoing = (state.chat.attachments || []).slice();
     if (!text && !outgoing.length) return;
+    // 流程只吃这一句正文：节点里没有「读附件」这一步，附件带进去也不会被看。
+    // 与其让它静悄悄失效，不如当场拦住——用户去掉附件即可，或者改回直接对话。
+    if (state.chat.flow && outgoing.length) {
+      toast("流程只能拿到这句话，读不到附件：先去掉附件，或切回直接对话", "err");
+      return;
+    }
     // 只发附件不给话时补一句中性指令，避免后端 min_length=1 直接 422 把附件丢掉。
     if (!text) text = "请看附件。";
     input.value = "";
@@ -2623,9 +2867,12 @@
     var sendBtn = $("#chat-send");
     if (sendBtn) sendBtn.disabled = true;
 
+    var flowRun = state.chat.flow;
     var payload = { thread_id: state.chat.thread, message: text };
     // 不选就不传：省略 agent 等于平台基线，和改造前的行为逐字一致。
-    if (state.chat.agent) payload.agent = state.chat.agent;
+    // 选了流程就只传流程：两个一起传会被服务端 422 拒掉（流程每一步自带智能体）。
+    if (flowRun) payload.workflow = flowRun;
+    else if (state.chat.agent) payload.agent = state.chat.agent;
     if (outgoing.length) {
       payload.attachments = outgoing.map(function (att) {
         return { data_url: att.dataUrl, name: att.name || null };
@@ -2647,6 +2894,7 @@
       var meta = [];
       if (r.metadata && r.metadata.intent) meta.push("intent=" + r.metadata.intent);
       if (r.metadata && r.metadata.tool_name) meta.push("tool=" + r.metadata.tool_name);
+      if (r.metadata && r.metadata.workflow) meta.push("流程=" + r.metadata.workflow);
       if (r.status && r.status !== "completed") meta.push("status=" + r.status);
       if (r.error_category) meta.push("error=" + r.error_category);
       placeholder.meta = meta.join(" · ");
@@ -2676,6 +2924,13 @@
     } finally {
       chatUI.sending = false;
       if (sendBtn) sendBtn.disabled = false;
+      if (flowRun) {
+        // 流程是一次性触发：留着选中态，下一句「谢谢」会再跑一遍整张图。
+        state.chat.flow = "";
+        syncChatTarget();
+        renderChatTargetHint();
+        try { window.localStorage.setItem("pap.chat.target", state.chat.agent ? "agent:" + state.chat.agent : ""); } catch (e) { /* 忽略 */ }
+      }
       renderChatLog();
       // 标题取自第一条消息、活跃时间也会变，发送后同步一次列表。
       loadConversations();
@@ -4531,6 +4786,745 @@
     }
   }
 
+  /* ================= 知识治理 =================
+   *
+   * 这一组页签解决的是「知识库除了列表和搜索，还能看什么」：
+   * 加工过程（解析→清洗→结构化→分段→打标→索引）、效果评估、使用反馈、
+   * 老化淘汰。数据全部来自接口，页面不推算也不补零——
+   * 没采集到的阶段显示「未采集」而不是 0，否则会让人以为清洗没生效。
+   */
+
+  var kbUI = {
+    view: "overview",
+    // 单篇明细当前选中的文档 id。切走再切回要能停在原处。
+    selectedDoc: ""
+  };
+
+  var KB_VIEWS = [
+    { id: "overview", label: "概览" },
+    { id: "pipeline", label: "加工流水线" },
+    { id: "eval", label: "评估与反馈" },
+    { id: "lifecycle", label: "生命周期" }
+  ];
+
+  var KB_STATUS = {
+    active: { label: "运行中", tone: "ok" },
+    partial: { label: "部分采集", tone: "warn" },
+    not_enabled: { label: "未启用", tone: "" }
+  };
+
+  var KB_GROUP = { process: "知识加工与治理", store: "知识存储与索引" };
+
+  var KB_SEV_LABEL = { high: "高", medium: "中", low: "低" };
+
+  var KB_REASON_LABEL = {
+    not_relevant: "答非所问",
+    wrong_citation: "引错资料",
+    outdated: "内容过期",
+    incomplete: "没答全",
+    not_found_but_had: "库里有却说没有",
+    other: "其他"
+  };
+
+  function kbTabsHtml() {
+    return '<div class="tabs" id="kb-tabs">' + KB_VIEWS.map(function (view) {
+      return '<button class="tab' + (view.id === kbUI.view ? " active" : "") +
+        '" type="button" data-kb-view="' + esc(view.id) + '">' + esc(view.label) + "</button>";
+    }).join("") + "</div>";
+  }
+
+  function bindKbTabs(root, state) {
+    $$("#kb-tabs .tab", root).forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        showKbView(root, state, btn.getAttribute("data-kb-view"));
+      });
+    });
+
+    // 刷新后停在原来那个页签，而不是弹回概览。数据重新拉一遍——
+    // 治理页看到的数字必须与库里一致，缓存一份只会让人对着旧数做决定。
+    if (kbUI.view !== "overview") {
+      showKbView(root, state, kbUI.view);
+    }
+  }
+
+  async function showKbView(root, state, view) {
+    kbUI.view = view;
+
+    KB_VIEWS.forEach(function (item) {
+      var panel = root.querySelector("#kb-view-" + item.id);
+      if (panel) panel.hidden = item.id !== view;
+    });
+    $$("#kb-tabs .tab", root).forEach(function (btn) {
+      btn.classList.toggle("active", btn.getAttribute("data-kb-view") === view);
+    });
+
+    if (view === "overview") return;
+
+    var box = root.querySelector("#kb-view-" + view);
+    if (!box) return;
+
+    // 治理接口要 knowledge:write：反馈里有用户原话，评测标注也是内部资产。
+    // 没权限时不做无意义的请求，直接说清为什么看不到。
+    if (!state.canWrite) {
+      box.innerHTML = '<div class="card"><div class="empty"><strong>需要 knowledge:write</strong>' +
+        "加工流水线、评估与反馈、生命周期都属于知识治理视图，" +
+        "当前身份只能查看文档列表与检索。</div></div>";
+      return;
+    }
+
+    if (view === "pipeline") await loadKbPipeline(box, state);
+    if (view === "eval") await loadKbEval(box);
+    if (view === "lifecycle") await loadKbLifecycle(box);
+  }
+
+  function kbBusyCard(text) {
+    return '<div class="card"><div class="skeleton" style="width:60%"></div>' +
+      '<p class="hint" style="margin-top:10px">' + esc(text) + "</p></div>";
+  }
+
+  function kbErrorCard(error, title) {
+    return '<div class="card"><div class="banner err">' + esc(title || "读取失败") +
+      "：" + esc(errText(error)) + "</div></div>";
+  }
+
+  /* ---------------- 加工流水线 ---------------- */
+
+  function kbMetricHtml(metric) {
+    var unit = metric.unit ? '<span class="kb-unit" style="font-weight:400;font-size:11px;color:var(--muted)"> ' +
+      esc(String(metric.unit)) + "</span>" : "";
+    return '<div class="kb-metric"><b>' + esc(String(metric.value)) + unit + "</b>" +
+      "<span>" + esc(metric.label) + "</span></div>";
+  }
+
+  function kbStageCard(stage, index) {
+    var meta = KB_STATUS[stage.status] || { label: stage.status, tone: "" };
+    var off = stage.status === "not_enabled";
+    var note = "";
+
+    if (off) {
+      note = '<div class="kb-stage-note"><b>为什么没有</b><br>' + esc(stage.reason || "—") +
+        "<br><b>什么时候该有</b><br>" + esc(stage.trigger || "—") + "</div>";
+    } else if (stage.note) {
+      note = '<div class="kb-stage-note">' + esc(stage.note) + "</div>";
+    }
+
+    return '<div class="kb-stage' + (off ? " off" : "") + '">' +
+      '<div class="kb-stage-head">' +
+      '<span class="kb-stage-index">' + String(index + 1).padStart(2, "0") + "</span>" +
+      '<span class="kb-stage-name">' + esc(stage.name) + "</span>" +
+      '<span class="chip' + (meta.tone ? " " + meta.tone : "") + '">' + esc(meta.label) + "</span>" +
+      "</div>" +
+      '<div class="kb-stage-what">' + esc(stage.what) + "</div>" +
+      '<div class="kb-stage-metrics">' + (stage.metrics || []).map(kbMetricHtml).join("") + "</div>" +
+      '<div class="kb-stage-engine">' + esc(stage.engine) + "</div>" +
+      note +
+      "</div>";
+  }
+
+  function kbCoverageBanner(data) {
+    var coverage = data.coverage || {};
+    if (!coverage.missing) return "";
+
+    return '<div class="banner warn" style="margin-bottom:12px">有 ' +
+      esc(String(coverage.missing)) + " 篇文档是在采集流水线快照之前入库的，" +
+      "它们的解析/清洗明细没有记录（不是 0）。对这几份点一次「重建」即可补齐。" +
+      "</div>";
+  }
+
+  function kbStagesHtml(data) {
+    var groups = { process: [], store: [] };
+    (data.stages || []).forEach(function (stage, index) {
+      var key = stage.group === "store" ? "store" : "process";
+      groups[key].push({ stage: stage, index: index });
+    });
+
+    var html = kbCoverageBanner(data);
+
+    ["process", "store"].forEach(function (key) {
+      if (!groups[key].length) return;
+      html += '<div class="kb-group-title">' + esc(KB_GROUP[key]) + "</div>" +
+        '<div class="kb-stages">' + groups[key].map(function (item) {
+          return kbStageCard(item.stage, item.index);
+        }).join("") + "</div>";
+    });
+
+    var totals = data.totals || {};
+
+    if ((totals.standards || []).length) {
+      html += '<p class="hint" style="margin-top:12px">已识别标准：' +
+        esc(totals.standards.join("、")) + "</p>";
+    }
+
+    return '<div class="card">' + cardHead("加工与索引阶段", "layers",
+      '<span class="chip">' + esc(String((data.stages || []).length)) + " 个阶段</span>") +
+      html + "</div>";
+  }
+
+  function kbDocPipelineCard(state) {
+    var items = state.items || [];
+    var options = items.map(function (item) {
+      return '<option value="' + esc(item.id) + '"' +
+        (item.id === kbUI.selectedDoc ? " selected" : "") + ">" +
+        esc(item.title) + " · " + esc(String(item.chunk_count)) + " 片</option>";
+    }).join("");
+
+    if (!items.length) {
+      return '<div class="card">' + cardHead("单篇加工明细", "file") +
+        '<div class="empty"><strong>还没有文档</strong>先上传或同步一份资料，这里会显示它每一步的产物。</div></div>';
+    }
+
+    return '<div class="card">' + cardHead("单篇加工明细", "file") +
+      '<div class="kb-form-row" style="margin-bottom:0">' +
+      '<select id="kb-pipe-doc" style="flex:1;max-width:520px">' +
+      '<option value="">选择一份文档…</option>' + options + "</select>" +
+      '<span class="hint">看的是这份资料从原文到切片的每一步产物量。</span></div>' +
+      '<div id="kb-pipe-detail" style="margin-top:12px">' +
+      '<div class="empty">选择文档后显示解析、清洗、结构化、分段与打标的明细。</div></div>' +
+      "</div>";
+  }
+
+  function kbPipelineDetailHtml(payload) {
+    var snap = payload.snapshot || {};
+    var parse = snap.parse || {};
+    var clean = snap.clean || {};
+    var structure = snap.structure || {};
+    var chunk = snap.chunk || {};
+    var tags = payload.tags || {};
+    var rows = [];
+
+    if (parse.chars) {
+      rows.push(["解析", "提取器 " + (parse.extractor || "—") + " · " + parse.chars + " 字" +
+        (parse.bytes ? " · 原文 " + parse.bytes + " 字节" : "")]);
+    } else {
+      rows.push(["解析", "未采集（这份文档在快照之前入库）"]);
+    }
+
+    if (clean.chars_before) {
+      rows.push(["清洗", "压掉 " + Math.max(0, clean.chars_before - (clean.chars_after || 0)) +
+        " 字 · 转 " + (clean.tables || 0) + " 张 pipe 表"]);
+    } else {
+      // 两种「没有」必须分开：没走到清洗（干净的 md）和没采集快照。
+      rows.push(["清洗", payload.derived ? "未采集" : "未触发（这份资料没有 OCR 标签产物）"]);
+    }
+
+    rows.push(["结构", (structure.sections || 0) + " 个小节"]);
+    rows.push(["分段", (chunk.chunks || 0) + " 片 · " + (chunk.chars || 0) + " 字" +
+      (chunk.max_chars ? " · 最长 " + chunk.max_chars + " 字" : "") +
+      (chunk.chunker_version ? " · 规则 v" + chunk.chunker_version : "")]);
+
+    var tagList = (tags.tags || []).slice();
+    rows.push(["标签", tagList.length ? tagList.join(" · ") : "未识别到标签"]);
+
+    var extra = [];
+    if (tags.standard) extra.push("标准号 " + tags.standard);
+    if (tags.year) extra.push("版本 " + tags.year + " 年");
+    if (tags.doctype) extra.push("类型 " + tags.doctype);
+    if (extra.length) rows.push(["抽取", extra.join(" · ")]);
+
+    var html = '<dl class="kv">' + rows.map(function (row) {
+      return "<dt>" + esc(row[0]) + "</dt><dd>" + esc(String(row[1])) + "</dd>";
+    }).join("") + "</dl>";
+
+    if (payload.derived) {
+      html += '<p class="hint" style="margin-top:8px">这份文档没有入库快照，' +
+        "上面的大小节与片数是从现有切片现算的；重建一次会有完整明细。</p>";
+    }
+
+    return html;
+  }
+
+  async function loadKbPipeline(box, state) {
+    box.innerHTML = kbBusyCard("正在读取加工指标…");
+
+    var data;
+    try {
+      data = await api("/api/v1/knowledge/governance");
+    } catch (e) {
+      box.innerHTML = kbErrorCard(e, "读取加工流水线失败");
+      return;
+    }
+
+    box.innerHTML = kbStagesHtml(data) + kbDocPipelineCard(state);
+
+    var select = box.querySelector("#kb-pipe-doc");
+    var detail = box.querySelector("#kb-pipe-detail");
+    if (!select || !detail) return;
+
+    select.addEventListener("change", async function () {
+      var id = select.value;
+      kbUI.selectedDoc = id;
+      if (!id) {
+        detail.innerHTML = '<div class="empty">选择文档后显示解析、清洗、结构化、分段与打标的明细。</div>';
+        return;
+      }
+      detail.innerHTML = '<div class="skeleton" style="width:50%"></div>';
+      try {
+        var payload = await api("/api/v1/knowledge/documents/" + encodeURIComponent(id) + "/pipeline");
+        detail.innerHTML = kbPipelineDetailHtml(payload);
+      } catch (e) {
+        detail.innerHTML = '<div class="banner err">读取明细失败：' + esc(errText(e)) + "</div>";
+      }
+    });
+
+    if (kbUI.selectedDoc) {
+      select.value = kbUI.selectedDoc;
+      select.dispatchEvent(new Event("change"));
+    }
+  }
+
+  /* ---------------- 评估与反馈 ---------------- */
+
+  function kbRateBar(rate, label) {
+    var percent = Math.round((Number(rate) || 0) * 100);
+    return '<div class="kb-bar"><span class="kb-bar-label">' + esc(label) + "</span>" +
+      '<span class="kb-bar-track"><span class="kb-bar-fill" style="width:' +
+      Math.max(0, Math.min(100, percent)) + '%"></span></span>' +
+      '<span class="kb-bar-value">' + percent + "%</span></div>";
+  }
+
+  function kbSatisfactionCard(satisfaction, latest) {
+    var sat = satisfaction || {};
+    var evalRun = latest || null;
+
+    var html = '<div class="stats">' +
+      stat("有反馈的回答", sat.total || 0) +
+      stat("点赞率", sat.total ? Math.round((sat.like_rate || 0) * 100) + "%" : "—", true) +
+      stat("待处理差评", sat.unhandled_down || 0) +
+      "</div>";
+
+    html += '<div class="kb-bars" style="margin-top:14px">' +
+      kbRateBar(sat.like_rate, "点赞占比") +
+      (evalRun ? kbRateBar(evalRun.recall, "召回率") + kbRateBar(evalRun.precision, "准确率") : "") +
+      "</div>";
+
+    html += '<p class="hint" style="margin-top:10px">' + esc(sat.note || "") +
+      (evalRun ? " 最近一次评测：k=" + esc(String(evalRun.k)) + " · 用时 " +
+        esc(String(evalRun.elapsed_ms)) + "ms · 索引 " + esc(evalRun.index_version) + "。" : " 还没有跑过评测。") +
+      "</p>";
+
+    // 差评原因分布：这是「该补什么」最直接的线索。
+    var reasons = sat.reasons || {};
+    var keys = Object.keys(reasons);
+    if (keys.length) {
+      html += '<p class="hint" style="margin-top:6px">差评原因：' + keys.map(function (key) {
+        return esc(KB_REASON_LABEL[key] || key) + " " + esc(String(reasons[key]));
+      }).join(" · ") + "</p>";
+    }
+
+    return '<div class="card">' + cardHead("效果与满意度", "activity",
+      '<span class="chip">近 ' + esc(String(sat.window_days || 30)) + " 天</span>") +
+      html + "</div>";
+  }
+
+  function kbFeedbackCard(items) {
+    var list = items || [];
+
+    if (!list.length) {
+      return '<div class="card">' + cardHead("反馈（bad case）", "message",
+        '<span class="chip">0 条</span>') +
+        '<div class="empty"><strong>还没有反馈</strong>对话回答下方的点赞/踩会汇总到这里；' +
+        "踩的记录可以直接升格成评测用例。</div></div>";
+    }
+
+    var html = '<div class="kb-fb-list">' + list.map(function (item) {
+      var reason = item.reason ? (KB_REASON_LABEL[item.reason] || item.reason) : "";
+      var ops = [];
+
+      if (item.verdict === "down" && !item.case_id) {
+        ops.push('<button class="btn" type="button" data-fb-case="' + esc(item.id) + '">转为评测用例</button>');
+      }
+      if (!item.handled) {
+        ops.push('<button class="btn" type="button" data-fb-done="' + esc(item.id) + '">标为已处理</button>');
+      }
+
+      return '<div class="kb-fb-item' + (item.handled ? " handled" : "") + '">' +
+        '<div class="kb-fb-q">' + esc(item.query || "（未记录问题）") + "</div>" +
+        '<div class="kb-fb-a">' + esc((item.answer_excerpt || "").slice(0, 160)) + "</div>" +
+        '<div class="kb-fb-meta"><span class="chip ' + (item.verdict === "up" ? "ok" : "err") + '">' +
+        esc(item.verdict === "up" ? "赞" : "踩") + "</span>" +
+        (reason ? "<span>" + esc(reason) + "</span>" : "") +
+        (item.comment ? "<span>" + esc(item.comment) + "</span>" : "") +
+        "<span>" + esc(fmtTime(item.created_at)) + "</span>" +
+        (item.case_id ? "<span>已转用例</span>" : "") +
+        (item.handled && !item.case_id ? "<span>已处理</span>" : "") +
+        "</div>" +
+        (ops.length ? '<div class="kb-fb-ops">' + ops.join("") + "</div>" : "") +
+        '<div data-fb-form="' + esc(item.id) + '"></div>' +
+        "</div>";
+    }).join("") + "</div>";
+
+    return '<div class="card">' + cardHead("反馈（bad case）", "message",
+      '<span class="chip">' + esc(String(list.length)) + " 条</span>") + html + "</div>";
+  }
+
+  function kbCaseFormHtml(options, caseItem, feedbackId) {
+    var selected = (caseItem && caseItem.expect_document) || [];
+    var opts = (options || []).map(function (item) {
+      var logical = item.logical_id || item.document_id || item.id;
+      var checked = selected.indexOf(logical) >= 0 ? " selected" : "";
+      return '<option value="' + esc(logical) + '"' + checked + ">" + esc(item.title) + "</option>";
+    }).join("");
+
+    return '<div class="kb-form" data-form="' + esc(feedbackId || "new") + '">' +
+      (feedbackId ? "" :
+        '<label>问题</label><input type="text" data-case-field="query" placeholder="例如：调压箱泄漏后第一步做什么"' +
+        (caseItem ? ' value="' + esc(caseItem.query || "") + '"' : "") + ">") +
+      '<label>期望命中的文档（可多选；留空表示先记下来待补标注）</label>' +
+      '<select multiple data-case-field="documents">' + opts + "</select>" +
+      '<label>期望小节关键字（可选，填了就必须命中这一段）</label>' +
+      '<input type="text" data-case-field="section" placeholder="例如：5.1.6 过滤精度">' +
+      '<div class="kb-form-row">' +
+      '<button class="btn primary" type="button" data-case-save="' + esc(feedbackId || "") + '">保存</button>' +
+      '<button class="btn" type="button" data-case-cancel="1">取消</button>' +
+      '<span class="hint">没标期望文档的用例会存下来但**不参与计分**，页面上单独计数。</span>' +
+      "</div></div>";
+  }
+
+  function kbCasesCard(casesData, runs) {
+    var items = (casesData && casesData.items) || [];
+    var runList = (runs && runs.items) || [];
+    var scored = (casesData && casesData.scored) || 0;
+
+    var head = '<div class="stats">' +
+      stat("用例", items.length) +
+      stat("可计分", scored) +
+      stat("待标注", Math.max(0, items.length - scored)) +
+      stat("历史评测", runList.length) +
+      "</div>";
+
+    var rows = items.map(function (item) {
+      var docs = (item.expect_document || []).join("、") || "—";
+      return "<tr><td>" + esc(item.query) + "</td>" +
+        '<td class="mono">' + esc(docs) + "</td>" +
+        "<td>" + esc(item.expect_section || "—") + "</td>" +
+        '<td><span class="chip ' + (item.scored ? "ok" : "warn") + '">' +
+        esc(item.scored ? "可计分" : "待标注") + "</span></td>" +
+        "<td>" + esc(item.source || "—") + "</td>" +
+        '<td class="right"><button class="linkish" type="button" data-case-del="' +
+        esc(item.id) + '">删除</button></td></tr>';
+    }).join("");
+
+    var table = items.length
+      ? '<table class="tbl" style="margin-top:12px"><thead><tr><th>问题</th><th>期望文档</th>' +
+        "<th>期望小节</th><th>状态</th><th>来源</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>"
+      : '<div class="empty" style="margin-top:12px"><strong>还没有用例</strong>' +
+        "从下面的 bad case 转一条过来，或点「新建用例」手写一条。" +
+        "先有一条能跑的用例，指标才有意义。</div>";
+
+    var runsTable = runList.length
+      ? '<table class="tbl" style="margin-top:10px"><thead><tr><th>时间</th><th class="right">用例</th>' +
+        '<th class="right">召回</th><th class="right">准确</th><th class="right">命中率</th>' +
+        '<th class="right">MRR</th><th class="right">假阳性</th><th>索引</th></tr></thead><tbody>' +
+        runList.map(function (run) {
+          var pct = function (value) { return Math.round((Number(value) || 0) * 100) + "%"; };
+          return "<tr><td>" + esc(fmtTime(run.created_at)) + "</td>" +
+            '<td class="right">' + esc(String(run.scored)) + "/" + esc(String(run.case_total)) + "</td>" +
+            '<td class="right">' + pct(run.recall) + "</td>" +
+            '<td class="right">' + pct(run.precision) + "</td>" +
+            '<td class="right">' + pct(run.hit_at_k) + "</td>" +
+            '<td class="right">' + (Number(run.mrr) || 0).toFixed(3) + "</td>" +
+            '<td class="right">' + pct(run.false_hit_rate) + "</td>" +
+            '<td class="mono">' + esc(run.index_version) + "</td></tr>";
+        }).join("") + "</tbody></table>"
+      : '<p class="hint" style="margin-top:10px">还没有评测记录。跑一次之后这里会出现指标趋势。</p>';
+
+    return '<div class="card">' + cardHead("评测用例与历史", "check",
+      '<div class="card-ops">' +
+      '<button class="btn" type="button" id="kb-case-new">新建用例</button>' +
+      '<button class="btn primary" type="button" id="kb-eval-run">跑一次评测</button>' +
+      "</div>") +
+      head +
+      '<div id="kb-case-form"></div>' +
+      table +
+      '<div class="kb-group-title">历史评测</div>' + runsTable +
+      "</div>";
+  }
+
+  async function loadKbEval(box) {
+    box.innerHTML = kbBusyCard("正在读取评估与反馈…");
+
+    var gov;
+    var feedback;
+    var cases;
+    var runs;
+
+    try {
+      gov = await api("/api/v1/knowledge/governance");
+      feedback = await api("/api/v1/knowledge/feedback?limit=50");
+      cases = await api("/api/v1/knowledge/eval/cases");
+      runs = await api("/api/v1/knowledge/eval/runs?limit=8");
+    } catch (e) {
+      box.innerHTML = kbErrorCard(e, "读取评估数据失败");
+      return;
+    }
+
+    box.innerHTML = kbSatisfactionCard(gov.satisfaction, gov.latest_eval) +
+      kbFeedbackCard(feedback.items) + kbCasesCard(cases, runs);
+
+    bindKbEval(box);
+  }
+
+  async function bindKbEval(box) {
+    var documents = [];
+    try {
+      var listing = await api("/api/v1/knowledge/documents?limit=200");
+      documents = listing.items || [];
+    } catch (e) {
+      documents = [];
+    }
+
+    function closeForms() {
+      $$("[data-fb-form]", box).forEach(function (node) { node.innerHTML = ""; });
+      var slot = box.querySelector("#kb-case-form");
+      if (slot) slot.innerHTML = "";
+    }
+
+    function openCaseForm(feedbackId) {
+      closeForms();
+
+      if (!documents.length) {
+        toast("还没有可选的文档，先入库一份资料。", "err");
+        return;
+      }
+
+      if (feedbackId) {
+        var node = box.querySelector('[data-fb-form="' + feedbackId + '"]');
+        if (node) node.innerHTML = kbCaseFormHtml(documents, null, feedbackId);
+        return;
+      }
+
+      var slot = box.querySelector("#kb-case-form");
+      if (slot) slot.innerHTML = kbCaseFormHtml(documents, null, "");
+    }
+
+    box.addEventListener("click", async function (ev) {
+      var target = ev.target;
+      if (!target || !target.getAttribute) return;
+
+      var caseFor = target.getAttribute("data-fb-case");
+      if (caseFor) {
+        openCaseForm(caseFor);
+        return;
+      }
+
+      var doneFor = target.getAttribute("data-fb-done");
+      if (doneFor) {
+        try {
+          await api("/api/v1/knowledge/feedback/" + encodeURIComponent(doneFor) + "/handled", {
+            method: "POST",
+            body: { handled: true }
+          });
+          toast("已标为处理完成");
+          await loadKbEval(box);
+        } catch (e) {
+          toast(errText(e), "err");
+        }
+        return;
+      }
+
+      if (target.getAttribute("data-case-cancel")) {
+        closeForms();
+        return;
+      }
+
+      if (target.id === "kb-case-new") {
+        openCaseForm("");
+        return;
+      }
+
+      if (target.getAttribute("data-case-del")) {
+        var delId = target.getAttribute("data-case-del");
+        if (!window.confirm("删除这条评测用例？")) return;
+        try {
+          await api("/api/v1/knowledge/eval/cases/" + encodeURIComponent(delId), { method: "DELETE" });
+          toast("已删除");
+          await loadKbEval(box);
+        } catch (e) {
+          toast(errText(e), "err");
+        }
+        return;
+      }
+
+      if (target.hasAttribute("data-case-save")) {
+        var saveFor = target.getAttribute("data-case-save") || "";
+        var form = target.closest(".kb-form");
+        if (!form) return;
+
+        var queryNode = form.querySelector('[data-case-field="query"]');
+        var sectionNode = form.querySelector('[data-case-field="section"]');
+        var docNode = form.querySelector('[data-case-field="documents"]');
+        var picked = docNode ? Array.prototype.filter.call(docNode.options, function (opt) {
+          return opt.selected;
+        }).map(function (opt) { return opt.value; }) : [];
+
+        var query = queryNode ? queryNode.value.trim() : "";
+
+        if (saveFor) {
+          // 从反馈升格：问题沿用反馈里的原文，不让用户再抄一遍。
+          try {
+            await api("/api/v1/knowledge/feedback/" + encodeURIComponent(saveFor) + "/case", {
+              method: "POST",
+              body: {
+                expect_document: picked,
+                expect_section: sectionNode ? sectionNode.value.trim() : ""
+              }
+            });
+            toast(picked.length ? "已转成评测用例" : "已转成用例，但还没标期望文档（暂不计分）");
+            await loadKbEval(box);
+          } catch (e) {
+            toast(errText(e), "err");
+          }
+          return;
+        }
+
+        if (!query) {
+          toast("先填问题", "err");
+          return;
+        }
+
+        try {
+          await api("/api/v1/knowledge/eval/cases", {
+            method: "POST",
+            body: {
+              query: query,
+              expect_document: picked,
+              expect_section: sectionNode ? sectionNode.value.trim() : ""
+            }
+          });
+          toast("已保存");
+          await loadKbEval(box);
+        } catch (e) {
+          toast(errText(e), "err");
+        }
+        return;
+      }
+
+      if (target.id === "kb-eval-run") {
+        target.disabled = true;
+        target.textContent = "评测中…";
+        try {
+          var result = await api("/api/v1/knowledge/eval/run", {
+            method: "POST",
+            body: { k: 5 }
+          });
+          var m = result.metrics || {};
+          toast("评测完成：召回 " + Math.round((m.recall || 0) * 100) + "% · 准确 " +
+            Math.round((m.precision || 0) * 100) + "%");
+          await loadKbEval(box);
+        } catch (e) {
+          toast(errText(e), "err");
+          target.disabled = false;
+          target.textContent = "跑一次评测";
+        }
+      }
+    });
+  }
+
+  /* ---------------- 生命周期 ---------------- */
+
+  function kbIncrementalCard(data) {
+    var inc = data.incremental || {};
+
+    var html = '<dl class="kv">' +
+      "<dt>索引版本</dt><dd class=\"mono\">" + esc(inc.index_version || "—") + "</dd>" +
+      "<dt>最近变更</dt><dd>" + esc(fmtTime(inc.last_change_at)) + "</dd>" +
+      "<dt>近 " + esc(String(inc.window_days || 30)) + " 天变动</dt><dd>" +
+      esc(String(inc.recent_documents || 0)) + " 篇 / " + esc(String(inc.recent_chunks || 0)) + " 片</dd>" +
+      "</dl>" +
+      '<p class="hint" style="margin-top:8px">' + esc(inc.note || "") + "</p>";
+
+    return '<div class="card">' + cardHead("增量更新", "refresh",
+      '<span class="chip ok">自动</span>') + html + "</div>";
+  }
+
+  function kbLifecycleCard(data) {
+    var summary = data.summary || {};
+    var items = data.items || [];
+    var policy = data.policy || {};
+
+    var head = '<div class="stats">' +
+      stat("文档", summary.documents || 0) +
+      stat("待处理", summary.flagged || 0) +
+      stat("被新版本替代", summary.superseded || 0) +
+      stat("解析异常", summary.broken || 0) +
+      "</div>";
+
+    var table = items.length
+      ? '<table class="tbl" style="margin-top:12px"><thead><tr><th></th><th>标题</th>' +
+        "<th>标准</th><th class=\"right\">切片</th><th>严重度</th><th>理由</th></tr></thead><tbody>" +
+        items.map(function (item) {
+          var reasons = (item.reasons || []).map(function (reason) {
+            return '<div class="kb-reason"><b>' + esc(reason.label) + "</b> · " +
+              esc(reason.detail) + "</div>";
+          }).join("");
+          return '<tr><td><input type="checkbox" data-retire-id="' + esc(item.id) + '"></td>' +
+            "<td>" + esc(item.title) + "</td>" +
+            '<td class="mono">' + esc(item.standard || "—") + "</td>" +
+            '<td class="right">' + esc(String(item.chunks)) + "</td>" +
+            '<td><span class="sev ' + esc(item.severity) + '">' +
+            esc(KB_SEV_LABEL[item.severity] || item.severity) + "</span></td>" +
+            '<td><div class="kb-reasons">' + reasons + "</div></td></tr>";
+        }).join("") + "</tbody></table>"
+      : '<div class="empty" style="margin-top:12px"><strong>没有需要处理的文档</strong>' +
+        "没有发现多版本并存、解析失败或版本过老的资料。</div>";
+
+    return '<div class="card">' + cardHead("老化与淘汰", "alert",
+      '<div class="card-ops"><button class="btn" type="button" id="kb-retire">下架所选</button></div>') +
+      head + table +
+      '<p class="hint" style="margin-top:10px">' + esc(policy.note || "") +
+      " 判据：同标准号存在更新版本、发布年份超过 " + esc(String(policy.max_age_years || 0)) +
+      " 年、解析失败或零切片、超过 " + esc(String(policy.stale_days || 0)) + " 天未重建。" +
+      "</p></div>";
+  }
+
+  async function loadKbLifecycle(box) {
+    box.innerHTML = kbBusyCard("正在检查知识老化…");
+
+    var data;
+    try {
+      data = await api("/api/v1/knowledge/lifecycle");
+    } catch (e) {
+      box.innerHTML = kbErrorCard(e, "读取生命周期失败");
+      return;
+    }
+
+    box.innerHTML = kbIncrementalCard(data) + kbLifecycleCard(data);
+
+    var button = box.querySelector("#kb-retire");
+    if (!button) return;
+
+    button.addEventListener("click", async function () {
+      var picked = $$("[data-retire-id]", box).filter(function (node) {
+        return node.checked;
+      }).map(function (node) {
+        return node.getAttribute("data-retire-id");
+      });
+
+      if (!picked.length) {
+        toast("先勾选要下架的文档", "err");
+        return;
+      }
+
+      if (!window.confirm("下架 " + picked.length + " 份文档？下架后立即不可检索，可在文档列表里重新上传恢复。")) {
+        return;
+      }
+
+      button.disabled = true;
+      try {
+        var result = await api("/api/v1/knowledge/lifecycle/retire", {
+          method: "POST",
+          body: { document_ids: picked }
+        });
+        toast(result.message || "已下架", "ok");
+        await loadKbLifecycle(box);
+      } catch (e) {
+        toast(errText(e), "err");
+        button.disabled = false;
+      }
+    });
+  }
+
+
   async function mountKnowledge(root) {
     // 整页重渲染会丢掉展开状态，所以只有「刷新」重新跑 mountKnowledge；
     // 上传 / 下架 / 重建只重拉列表与状态，检索框里的输入不动。
@@ -4543,6 +5537,8 @@
         '<button class="btn primary" type="button" id="kb-upload">' + ico("upload") + "上传文档</button>" +
         '<input type="file" id="kb-file" multiple hidden>'
     }) +
+      kbTabsHtml() +
+      '<div id="kb-view-overview">' +
       '<div class="card">' +
       cardHead("索引状态", "book", '<span class="chip" id="kb-indexed">加载中</span>') +
       '<div class="stats" id="kb-stats">' + statSkeletons(3) + "</div>" +
@@ -4572,7 +5568,11 @@
       '<div id="kb-result" style="margin-top:12px">' +
       '<div class="empty"><strong>尚未检索</strong>输入问题后回车，验证召回与打分是否符合预期。</div>' +
       "</div>" +
-      "</div>";
+      "</div>" +
+      "</div>" +
+      '<div id="kb-view-pipeline" hidden></div>' +
+      '<div id="kb-view-eval" hidden></div>' +
+      '<div id="kb-view-lifecycle" hidden></div>';
 
     var state = {
       items: [],
@@ -5026,6 +6026,8 @@
       syncBtn.title = "需要 knowledge:write 权限";
       uploadBtn.title = "需要 knowledge:write 权限";
     }
+
+    bindKbTabs(root, state);
 
     // 从对话页的引用跳过来：#/knowledge?doc=<logical_id>&chunk=<chunk_id>
     var cite = routeParams();
@@ -5553,6 +6555,25 @@
         '<div class="empty"><strong>当前身份无法修改平台级配置</strong>' +
         "观测开关存在 platform_settings 全局表里，只有 platform_admin 能改。</div></div>";
 
+    // 入库容量：单篇切片上限。它不是「检索质量旋钮」，而是容量阈值——
+    // 一份 56.8 万字的现行国标切 973 片是正常颗粒度，一本被误传的几 MB 手册
+    // 才该被拦。所以这里必须写明「撞上限 ≠ 文件有问题」，否则人会去拆文档，
+    // 而把同一份标准拆成两处会直接伤跨章检索。
+    var capacityCard = state.admin
+      ? '<div class="card" id="rt-cap-card">' +
+        cardHead("入库容量", "list", '<span class="chip" id="rt-cap-chip">读取中</span>') +
+        '<p class="card-sub">单篇文档允许的最大切片数。入库时按标题分节、节内约 800 字一片，' +
+        "所以这个数字大致对应「一份资料能有多长」：一份 56.8 万字的国标约 973 片。" +
+        "导入撞上限时改这里再重试，<strong>不需要重新上传文件</strong>。</p>" +
+        '<div class="rt-cap-row">' +
+        '<label for="rt-cap-input">单篇切片上限</label>' +
+        '<input type="number" id="rt-cap-input" min="1" max="20000" step="100" disabled>' +
+        '<button class="btn" type="button" id="rt-cap-save" disabled>保存</button>' +
+        "</div>" +
+        '<p class="hint" id="rt-cap-hint">读取中…</p>' +
+        "</div>"
+      : "";
+
     root.innerHTML = pageHead({
       eyebrow: PAGES.runtime.eyebrow,
       title: PAGES.runtime.title,
@@ -5561,6 +6582,7 @@
     }) +
       modelCard +
       obsCard +
+      capacityCard +
       '<div class="card">' +
       cardHead("进程参数", "sliders", '<span class="chip">只读</span>') +
       '<dl class="kv" id="rt-meta"><div class="skeleton" style="width:70%"></div></dl>' +
@@ -5609,6 +6631,21 @@
       if (obsToggle) {
         obsToggle.addEventListener("change", function () { saveObservabilitySetting(this.checked); });
       }
+
+      var capSave = $("#rt-cap-save");
+      if (capSave) capSave.addEventListener("click", function () { saveKnowledgeLimit(); });
+
+      var capInput = $("#rt-cap-input");
+      if (capInput) {
+        capInput.addEventListener("input", function () {
+          var save = $("#rt-cap-save");
+          if (save) save.disabled = false;
+        });
+        capInput.addEventListener("keydown", function (e) {
+          if (e.key === "Enter") { e.preventDefault(); saveKnowledgeLimit(); }
+        });
+      }
+
       loadRuntimeSettings();
 
       loadProviders();
@@ -5647,9 +6684,76 @@
     try {
       var data = await api("/api/v1/admin/runtime-settings");
       applyObsState(data.observability_enabled, data.observability_source);
+      applyCapacityState(data.knowledge_max_chunks, data.knowledge_max_chunks_source);
     } catch (e) {
       var hint = $("#rt-obs-hint");
       if (hint) hint.textContent = "读取失败：" + errText(e);
+      var capHint = $("#rt-cap-hint");
+      if (capHint) capHint.textContent = "读取失败：" + errText(e);
+    }
+  }
+
+  /* ---------------- 运行配置：入库容量 ---------------- */
+
+  function applyCapacityState(limit, source) {
+    var input = $("#rt-cap-input");
+    var chip = $("#rt-cap-chip");
+    var hint = $("#rt-cap-hint");
+    var save = $("#rt-cap-save");
+    if (!input) return;
+
+    input.value = limit;
+    input.disabled = false;
+    // 保存钮在页面刚开、值还没变时禁用：一个永远可点的保存按钮会让人
+    // 以为每次进页面都得点一下，而「点了之后什么都没变」是最难排查的反馈。
+    if (save) save.disabled = true;
+
+    if (chip) {
+      chip.textContent = "上限 " + limit;
+      chip.className = "chip";
+    }
+
+    if (hint) {
+      var origin = source === "runtime"
+        ? "当前值由管理员设置，存在 platform_settings。"
+        : "当前值来自 .env 的 KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT 默认值，还没有人在控制台改过。";
+      hint.textContent =
+        "切片按标题分节、节内约 800 字一片。撞上限时导入会失败并报出真实片数，" +
+        "调高这里再重试即可，文件不用重传。改动立刻生效，不需要重启进程。" + origin;
+    }
+  }
+
+  async function saveKnowledgeLimit() {
+    var input = $("#rt-cap-input");
+    var save = $("#rt-cap-save");
+    if (!input) return;
+
+    var raw = String(input.value || "").trim();
+    var value = parseInt(raw, 10);
+
+    // 空值、小数、字母都挡住：把 "2e4" 或 "" 传给后端只会换来一个
+    // 422，而那个 422 的文案（「字段需大于等于 1」）说不清该填什么。
+    if (!/^\d+$/.test(raw) || value < 1 || value > 20000) {
+      toast("切片上限要填 1 到 20000 之间的整数", "err");
+      input.focus();
+      return;
+    }
+
+    input.disabled = true;
+    if (save) save.disabled = true;
+
+    try {
+      // 只传这一项：PUT 的另一项是「不传就不动」，所以这里不会碰到
+      // 观测开关，也就不会把别人刚改的开关按手里的旧值改回去。
+      var data = await api("/api/v1/admin/runtime-settings", {
+        method: "PUT",
+        body: { knowledge_max_chunks: value }
+      });
+      applyCapacityState(data.knowledge_max_chunks, data.knowledge_max_chunks_source);
+      toast("单篇切片上限已改为 " + data.knowledge_max_chunks + "，立刻生效");
+    } catch (e) {
+      input.disabled = false;
+      toast(errText(e), "err");
     }
   }
 
@@ -8843,7 +9947,7 @@
       icon: "share",
       intro: "把「谁在第几步做什么」写成版本化的图。图只排顺序，不分配能力：每次节点调用仍然走委派那一套边界判定。",
       items: [
-        "触发只有一种：在对话里发 /workflow <标识> <要说的事>。页面上刻意没有「立即运行」——那样跑出来的结论没有归属，用户看不见、审计也查不到。",
+        "触发方式：在对话输入框左下角的下拉里选一条流程，正文就是它的输入；也可以发 /workflow <标识> <要说的事>。页面上刻意没有「立即运行」——那样跑出来的结论没有归属，用户看不见、审计也查不到。",
         "保存即编译：没有兜底边、有环、引用了不在必经路径上的节点、上限装不下最长路径，都会在保存时拒绝并指出是哪个节点，不会等到对话里才炸。",
         "节点里只能写 Agent 名、任务模板、顺序与条件，不能内联提示词、不能临时给工具——那是绕过边界判定的口子。",
         "两个预算分开算：模型的「每轮最多转交几次」管的是它临场即兴，图里人写死的步数不受它限制；但「最大转交深度」仍然逐跳累积，超了在开跑前就拒。",
@@ -8892,7 +9996,7 @@
         "「链路耗时」里的条从 0 起、宽度是该阶段占总耗时的比例，读的是「谁占得多」；要按时间先后看顺序，看左边的「编排流程」——缩进表示调用关系，重复出现的节点（规划 → 工具 → 再规划）会连着出现并标 ①②。",
         "这一轮里有委派（别的智能体被叫来干活）时，「编排流程」的卡头会多一对「流程 / 泳道」开关：流程看走了哪条路，泳道按智能体分道看谁在什么时候在干。没有委派就没有这对开关——泳道画出来只是一条通到底的横条，不如缩进列表。",
         "右上角「这一次运行」进运行页：把同一次运行的几轮和那张审批单串成一条时间线。历时、其中等人工、实际在跑是三个数，不是一个数的三种说法——等了人两小时五十八分和系统跑了两小时五十八分，要改的地方完全不同。点时间线上任一轮回到那一轮的详情，返回时回到这条运行。",
-        "保留期 14 天，错误 trace 保留 30 天；初始化时没有 observability:read 的库需要手动补一行授权。"
+        "保留期 14 天，错误 trace 保留 30 天；初始化时没有 observability:read 的库需要手动补一行授权，见 docs/OBSERVABILITY.md 第 16 节。"
       ]
     },
     {
@@ -10156,577 +11260,6 @@
     });
   }
 
-  /* ================= 从文件新建（统一导入） =================
-   *
-   * 一个入口覆盖三类产物：知识库文档、技能、OpenAPI 工具。
-   *
-   * 为什么不是三张页面各挂一个上传钮：判断「这份文件该建成什么」的依据是
-   * **文件内容**，不是后缀——现场规程和技能都是 `.md`，工具导出和 OpenAPI
-   * 都是 `.json`。让人先自己分类，等于把机器的活推给人，判错还要改名重传。
-   *
-   * 识别结果一律显示出来并允许改：自动识别会判错（比如把带 front matter
-   * 的规程认成技能），此时人要能就地改目标，而不是把文件搬来搬去。
-   *
-   * 预览走后端 `dry_run`，与真正导入是同一个解析函数。前端另算一遍预览，
-   * 就会出现「预览 3 个接口、实际存 1 个」——而那是导入之后才发现的错。
-   */
-
-  var IMPORT_TARGET_LABEL = {
-    auto: "自动识别",
-    knowledge: "知识库文档",
-    skill: "技能",
-    tool: "工具接口"
-  };
-
-  var importUI = {
-    mask: null,
-    rows: [],
-    seq: 0,
-    busy: false,
-    targets: null,
-    // 新加文件时用的默认目标。改它只影响之后加进来的文件，
-    // 不回头改已经识别过的行——那会让人以为自己刚才的选择被推翻了。
-    target: "auto"
-  };
-
-  function importTargetLabel(value) {
-    return IMPORT_TARGET_LABEL[value] || value;
-  }
-
-  /* multipart 不能用 api()：它会把非字符串 body 当 JSON 序列化，
-     FormData 会被毁掉（知识库上传那条路踩过同样的坑）。 */
-  async function importPost(file, target, dryRun, options) {
-    var form = new FormData();
-    form.append("file", file, file.name);
-    form.append("target", target || "auto");
-    form.append("dry_run", dryRun ? "true" : "false");
-
-    if (options && Object.keys(options).length) {
-      form.append("options", JSON.stringify(options));
-    }
-
-    var res = await fetch("/api/v1/studio/import", {
-      method: "POST",
-      body: form,
-      credentials: "same-origin"
-    });
-    var text = await res.text();
-    var payload = null;
-    if (text) { try { payload = JSON.parse(text); } catch (e) { payload = null; } }
-
-    if (!res.ok) {
-      var detail = payload && payload.detail;
-      if (detail && typeof detail !== "string") detail = JSON.stringify(detail);
-      var err = new Error(detail || ("HTTP " + res.status));
-      err.status = res.status;
-      throw err;
-    }
-
-    return payload;
-  }
-
-  /* 行的 options 只装「人选过的东西」，不装默认值：
-     标题没填就不传 title，让后端按文件名推；一律传空串会把标题清成空的。 */
-  function importRowOptions(row) {
-    var out = {};
-    var picked = row.picked || {};
-
-    if (picked.title && picked.title.trim()) out.title = picked.title.trim();
-    if (picked.name && picked.name.trim()) out.name = picked.name.trim();
-    if (picked.overwrite === false) out.overwrite = false;
-
-    if (row.preview && row.preview.tools && picked.operations) {
-      out.operations = picked.operations;
-    }
-
-    return out;
-  }
-
-  async function importDetect(row) {
-    row.busy = true;
-    row.error = "";
-    row.result = null;
-    importRenderRow(row);
-
-    try {
-      var data = await importPost(row.file, row.target, true, importRowOptions(row));
-      row.detected = data.detected_target;
-      row.preview = data.preview || null;
-      row.notes = data.notes || [];
-
-      // 工具默认全选：OpenAPI 里几十个 operation 时，逐个勾选是负担；
-      // 但一导入就全注册也不对，所以给一份「先全选、可去掉」的清单。
-      if (row.preview && row.preview.tools && !row.picked.operations) {
-        row.picked.operations = row.preview.tools.map(function (tool) { return tool.name; });
-      }
-    } catch (e) {
-      row.error = errText(e);
-      row.preview = null;
-    }
-
-    row.busy = false;
-    importRenderRow(row);
-    importSyncFoot();
-  }
-
-  function importRowHead(row) {
-    var detected = row.detected
-      ? '<span class="chip sm">识别为 ' + esc(importTargetLabel(row.detected)) + "</span>"
-      : "";
-
-    var options = Object.keys(IMPORT_TARGET_LABEL).map(function (value) {
-      return '<option value="' + value + '"' +
-        (row.target === value ? " selected" : "") + ">" +
-        esc(IMPORT_TARGET_LABEL[value]) + "</option>";
-    }).join("");
-
-    return '<div class="import-row-head">' +
-      '<span class="import-file" title="' + esc(row.file.name) + '">' + esc(row.file.name) + "</span>" +
-      '<span class="import-size">' + esc(fmtBytes(row.file.size)) + "</span>" +
-      detected +
-      '<select class="import-target" data-act="target" aria-label="导入到">' + options + "</select>" +
-      '<button class="icon-btn" type="button" data-act="remove" title="移除" aria-label="移除">✕</button>' +
-      "</div>";
-  }
-
-  function importResolvedTarget(row) {
-    if (row.target && row.target !== "auto") return row.target;
-    if (row.detected) return row.detected;
-    // 还没识别完就按知识库渲染：它是约束最松的一类，闪一下也不会误导，
-    // 总比先画出一屏「接口清单」再跳掉好。
-    return "knowledge";
-  }
-
-  function importNotesHtml(notes) {
-    if (!notes || !notes.length) return "";
-    return '<ul class="import-notes">' + notes.map(function (note) {
-      return "<li>" + esc(note) + "</li>";
-    }).join("") + "</ul>";
-  }
-
-  function importKnowledgeBody(row) {
-    var preview = row.preview || {};
-    return '<div class="import-form">' +
-      '<div class="field"><label>标题</label>' +
-      '<input type="text" data-act="title" value="' + esc(row.picked.title || "") +
-      '" placeholder="' + esc(preview.title || "") + '">' +
-      '<span class="help">留空按文件名。同一个标题重传同样的内容不会重复入库。</span></div>' +
-      "</div>" +
-      '<div class="import-meta">' + esc(String(preview.chars || 0)) + " 字 · 分级 " +
-      esc(preview.access_scope || "internal") + "</div>" +
-      (preview.excerpt
-        ? '<pre class="import-excerpt">' + esc(preview.excerpt) + "</pre>"
-        : "");
-  }
-
-  function importSkillBody(row) {
-    var skills = (row.preview && row.preview.skills) || [];
-    var skill = skills[0] || {};
-    var keywords = (skill.trigger_keywords || []).map(function (word) {
-      return '<span class="chip sm">' + esc(word) + "</span>";
-    }).join(" ");
-
-    var exists = skill.exists
-      ? '<div class="banner warn sm">同名技能已存在，导入会覆盖它（指令、触发词、允许工具）。</div>'
-      : "";
-
-    var extra = skills.length > 1
-      ? '<div class="import-meta">这份文件里有 ' + skills.length + " 个技能：" +
-        esc(skills.map(function (item) { return item.name; }).join("、")) + "</div>"
-      : "";
-
-    return exists + extra +
-      '<div class="import-form">' +
-      '<div class="field"><label>技能 ID</label>' +
-      '<input type="text" data-act="name" value="' + esc(row.picked.name || "") +
-      '" placeholder="' + esc(skill.name || "") + '">' +
-      '<span class="help">留空用 front matter 里的 name。从同一份模板建第二个技能时改这里。</span></div>' +
-      "</div>" +
-      '<div class="import-meta">' + esc(skill.display_name || "") +
-      (skill.description ? " · " + esc(skill.description) : "") +
-      " · 正文 " + esc(String(skill.instruction_chars || 0)) + " 字</div>" +
-      (keywords ? '<div class="import-keywords">' + keywords + "</div>" : "") +
-      (skill.instruction_head
-        ? '<pre class="import-excerpt">' + esc(skill.instruction_head) + "</pre>"
-        : "");
-  }
-
-  function importToolBody(row) {
-    var preview = row.preview || {};
-    var tools = preview.tools || [];
-    var picked = row.picked.operations || [];
-
-    var items = tools.map(function (tool) {
-      var on = picked.indexOf(tool.name) >= 0;
-      var risk = tool.risk_level === "destructive"
-        ? '<span class="chip err sm">不可逆</span>'
-        : (tool.risk_level === "write" ? '<span class="chip warn sm">写</span>' : "");
-
-      return '<label class="import-op' + (on ? " on" : "") + '">' +
-        '<input type="checkbox" data-act="op" data-op="' + esc(tool.name) + '"' +
-        (on ? " checked" : "") + ">" +
-        '<span class="import-op-method">' + esc(tool.method) + "</span>" +
-        '<span class="import-op-name" title="' + esc(tool.url) + '">' + esc(tool.name) + "</span>" +
-        risk +
-        '<span class="import-op-params">' + esc(String(tool.params_count)) + " 参数</span>" +
-        "</label>";
-    }).join("");
-
-    var base = preview.base_url
-      ? '<div class="import-meta">服务地址 <span class="mono">' + esc(preview.base_url) + "</span></div>"
-      : '<div class="banner warn sm">规格里没有绝对服务地址，导入后工具 URL 会是相对路径，调用必然失败。' +
-        "请在规格的 servers[0].url 里写完整地址。</div>";
-
-    return base +
-      '<div class="import-ops">' + items + "</div>" +
-      '<div class="import-meta">勾选的 ' + picked.length + " / " + tools.length + " 个接口会注册成工具。</div>";
-  }
-
-  function importRowBody(row) {
-    if (row.busy) return '<div class="skeleton" style="width:52%"></div>';
-
-    if (row.error) {
-      return '<div class="banner err">' + esc(row.error) + "</div>";
-    }
-
-    if (row.done) {
-      var message = (row.result && row.result.message) || "已完成";
-      var items = (row.result && row.result.items) || [];
-      var lines = items.length
-        ? '<ul class="import-notes">' + items.map(function (item) {
-            return "<li>" + esc(item.name) + "：" + esc(item.message || item.action) + "</li>";
-          }).join("") + "</ul>"
-        : "";
-      return '<div class="banner">' + esc(message) + "</div>" + lines;
-    }
-
-    if (!row.preview) return '<div class="hint">即将识别…</div>';
-
-    // 按**实际会写进去的那一类**渲染，而不是下拉框里存的值：
-    // 选「自动识别」时 row.target 是 auto，拿它分支会一律落到工具预览上，
-    // 症状是「识别为技能，下面却是接口清单」。
-    var kind = importResolvedTarget(row);
-    var body = "";
-    if (kind === "knowledge") body = importKnowledgeBody(row);
-    else if (kind === "skill") body = importSkillBody(row);
-    else body = importToolBody(row);
-
-    return body + importNotesHtml(row.notes);
-  }
-
-  function importRenderRow(row) {
-    var node = importUI.mask && importUI.mask.querySelector('[data-row="' + row.id + '"]');
-    if (!node) return;
-
-    node.className = "import-row" + (row.done ? " done" : "") + (row.error ? " bad" : "");
-    node.innerHTML = importRowHead(row) +
-      '<div class="import-row-body">' + importRowBody(row) + "</div>";
-  }
-
-  function importSyncFoot() {
-    if (!importUI.mask) return;
-
-    var pending = importUI.rows.filter(function (row) {
-      return !row.done && !row.busy && !row.error;
-    });
-
-    var btn = importUI.mask.querySelector("#import-run");
-    btn.disabled = importUI.busy || !pending.length;
-    btn.textContent = importUI.busy
-      ? "导入中…"
-      : (pending.length ? "导入 " + pending.length + " 份" : "没有待导入的文件");
-
-    var empty = importUI.mask.querySelector("#import-empty");
-    empty.hidden = importUI.rows.length > 0;
-  }
-
-  async function importAddFiles(fileList) {
-    var files = Array.prototype.slice.call(fileList || []);
-    if (!files.length) return;
-
-    var fresh = [];
-
-    files.forEach(function (file) {
-      // 同名同大小视为重复：拖两次同一个文件是最常见的手滑。
-      var dup = importUI.rows.some(function (row) {
-        return row.file.name === file.name && row.file.size === file.size;
-      });
-      if (dup) return;
-
-      var row = {
-        id: "f" + (++importUI.seq),
-        file: file,
-        target: importUI.target,
-        detected: "",
-        preview: null,
-        notes: [],
-        picked: {},
-        error: "",
-        busy: false,
-        done: false,
-        result: null
-      };
-
-      importUI.rows.push(row);
-      fresh.push(row);
-
-      var node = document.createElement("div");
-      node.className = "import-row";
-      node.setAttribute("data-row", row.id);
-      importUI.mask.querySelector("#import-list").appendChild(node);
-      importRenderRow(row);
-    });
-
-    importSyncFoot();
-
-    // 串行识别：并行发 N 个 dry_run 在弱网下只会把进度条搅乱，
-    // 而这份清单通常只有几个文件。
-    for (var i = 0; i < fresh.length; i += 1) {
-      await importDetect(fresh[i]);
-    }
-  }
-
-  function importRemoveRow(row) {
-    importUI.rows = importUI.rows.filter(function (item) { return item !== row; });
-    var node = importUI.mask.querySelector('[data-row="' + row.id + '"]');
-    if (node) node.remove();
-    importSyncFoot();
-  }
-
-  async function importRunAll() {
-    var queue = importUI.rows.filter(function (row) {
-      return !row.done && !row.busy && !row.error;
-    });
-
-    if (!queue.length) return;
-
-    importUI.busy = true;
-    importSyncFoot();
-
-    var ok = 0;
-    var failed = 0;
-
-    for (var i = 0; i < queue.length; i += 1) {
-      var row = queue[i];
-      row.busy = true;
-      importRenderRow(row);
-
-      try {
-        var data = await importPost(row.file, row.target, false, importRowOptions(row));
-        row.result = data.result || null;
-        row.done = true;
-        ok += 1;
-      } catch (e) {
-        row.error = errText(e);
-        failed += 1;
-      }
-
-      row.busy = false;
-      importRenderRow(row);
-    }
-
-    importUI.busy = false;
-    importSyncFoot();
-
-    if (ok) {
-      toast("已导入 " + ok + " 份");
-      refreshAfterImport();
-    }
-    if (failed) toast(failed + " 份没导进去，看列表里的原因", "err");
-  }
-
-  /* 导入完成后只有这三页会变：别的页面重绘一次既没必要，还会打断人正在看的
-     内容（比如对话台的历史滚动位置）。 */
-  function refreshAfterImport() {
-    var route = currentRoute();
-    if (route === "knowledge" || route === "skills" || route === "tools") render();
-  }
-
-  function closeImport() {
-    if (!importUI.mask) return;
-    importUI.mask.remove();
-    importUI.mask = null;
-    importUI.rows = [];
-    importUI.busy = false;
-    document.removeEventListener("keydown", onImportKey, true);
-  }
-
-  function onImportKey(ev) {
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      closeImport();
-    }
-  }
-
-  function openImportDialog() {
-    if (importUI.mask) {
-      importUI.mask.querySelector("input[type=file]").click();
-      return;
-    }
-
-    var mask = document.createElement("div");
-    mask.className = "modal-mask";
-    mask.innerHTML =
-      '<div class="modal import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title">' +
-      '<div class="modal-head"><div>' +
-      '<div class="modal-eyebrow">NEW FROM FILE</div>' +
-      '<div class="modal-title" id="import-title">从文件新建</div>' +
-      "</div>" +
-      '<button class="modal-close" type="button" id="import-close" aria-label="关闭">×</button></div>' +
-      '<div class="modal-body">' +
-      '<div class="import-drop" id="import-drop" tabindex="0" role="button">' +
-      '<div class="import-drop-title">把文件拖到这里，或点击选择</div>' +
-      '<div class="import-drop-hint">知识库文档 .pdf/.docx/.md/.txt/.html · ' +
-      "技能 .md（带 front matter）· 工具 OpenAPI 3 / Swagger 2 的 .json/.yaml</div>" +
-      "</div>" +
-      '<div class="import-bar">' +
-      '<label class="import-bar-label">导入到</label>' +
-      '<select id="import-target">' +
-      Object.keys(IMPORT_TARGET_LABEL).map(function (value) {
-        return '<option value="' + value + '">' + esc(IMPORT_TARGET_LABEL[value]) + "</option>";
-      }).join("") +
-      "</select>" +
-      '<span class="hint" id="import-target-hint">按内容判断，判得不对可以在下面逐个改。</span>' +
-      "</div>" +
-      '<div id="import-list" class="import-list"></div>' +
-      '<div class="empty sm" id="import-empty"><strong>还没有文件</strong>' +
-      "一次可以拖多份，各自判断、各自导入。</div>" +
-      "</div>" +
-      '<div class="modal-foot">' +
-      '<button class="btn" type="button" id="import-cancel">关闭</button>' +
-      '<button class="btn primary" type="button" id="import-run" disabled>没有待导入的文件</button>' +
-      "</div>" +
-      '<input type="file" id="import-file" multiple hidden>' +
-      "</div>";
-
-    document.body.appendChild(mask);
-    importUI.mask = mask;
-
-    var drop = mask.querySelector("#import-drop");
-    var picker = mask.querySelector("#import-file");
-
-    mask.querySelector("#import-close").addEventListener("click", closeImport);
-    mask.querySelector("#import-cancel").addEventListener("click", closeImport);
-    mask.querySelector("#import-run").addEventListener("click", importRunAll);
-
-    mask.querySelector("#import-target").addEventListener("change", function () {
-      importUI.target = this.value;
-    });
-
-    drop.addEventListener("click", function () { picker.click(); });
-    drop.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter" || ev.key === " ") {
-        ev.preventDefault();
-        picker.click();
-      }
-    });
-
-    picker.addEventListener("change", function () {
-      // 先取快照再清空：`picker.files` 是活引用，`value = ""` 会把它一并清掉，
-      // 清完再读就是空列表——表现是「选完文件什么都没发生」。
-      var files = Array.prototype.slice.call(picker.files || []);
-      picker.value = "";
-      importAddFiles(files);
-    });
-
-    // dragover 必须 preventDefault，否则浏览器会直接用文件替换整个页面。
-    ["dragenter", "dragover"].forEach(function (name) {
-      drop.addEventListener(name, function (ev) {
-        ev.preventDefault();
-        drop.classList.add("over");
-      });
-    });
-
-    ["dragleave", "dragend"].forEach(function (name) {
-      drop.addEventListener(name, function () {
-        drop.classList.remove("over");
-      });
-    });
-
-    drop.addEventListener("drop", function (ev) {
-      ev.preventDefault();
-      drop.classList.remove("over");
-      importAddFiles(ev.dataTransfer && ev.dataTransfer.files);
-    });
-
-    // 行内的改动与移除都走委托：行会被整块重绘，绑在行上的监听会跟着丢。
-    mask.querySelector("#import-list").addEventListener("click", function (ev) {
-      var act = ev.target.closest("[data-act]");
-      if (!act) return;
-
-      var rowNode = act.closest("[data-row]");
-      var row = importUI.rows.filter(function (item) {
-        return item.id === rowNode.getAttribute("data-row");
-      })[0];
-      if (!row) return;
-
-      if (act.getAttribute("data-act") === "remove") {
-        importRemoveRow(row);
-      }
-    });
-
-    mask.querySelector("#import-list").addEventListener("change", function (ev) {
-      var act = ev.target.closest("[data-act]");
-      if (!act) return;
-
-      var rowNode = act.closest("[data-row]");
-      var row = importUI.rows.filter(function (item) {
-        return item.id === rowNode.getAttribute("data-row");
-      })[0];
-      if (!row) return;
-
-      var kind = act.getAttribute("data-act");
-
-      if (kind === "target") {
-        row.target = act.value;
-        // 换目标要重新预览：知识库看字符数、技能看正文、工具看接口清单，
-        // 三者的预览结构完全不同，拿旧的顶上会显示成另一类东西。
-        importDetect(row);
-        return;
-      }
-
-      if (kind === "op") {
-        var name = act.getAttribute("data-op");
-        var list = row.picked.operations || [];
-
-        if (act.checked) {
-          if (list.indexOf(name) < 0) list.push(name);
-        } else {
-          list = list.filter(function (item) { return item !== name; });
-        }
-
-        row.picked.operations = list;
-        act.closest(".import-op").classList.toggle("on", act.checked);
-        importRenderRow(row);
-        return;
-      }
-    });
-
-    // 文本输入只在 input 里记值，不重绘：重绘会把光标顶到末尾，
-    // 改一个字的标题能被弹回行首。
-    mask.querySelector("#import-list").addEventListener("input", function (ev) {
-      var act = ev.target.closest("[data-act]");
-      if (!act) return;
-
-      var rowNode = act.closest("[data-row]");
-      var row = importUI.rows.filter(function (item) {
-        return item.id === rowNode.getAttribute("data-row");
-      })[0];
-      if (!row) return;
-
-      var kind = act.getAttribute("data-act");
-      if (kind === "title") row.picked.title = act.value;
-      if (kind === "name") row.picked.name = act.value;
-    });
-
-    // 不自动弹系统选文件框：拖拽才是最常用的入口，一打开弹两个窗
-    // 会让人先去关掉那个框再回来拖。
-    mask.querySelector("#import-target").value = importUI.target;
-
-    document.addEventListener("keydown", onImportKey, true);
-    importSyncFoot();
-  }
-
   /* ================= 构建助手 =================
    *
    * 常驻在控制台右下角的抽屉（形态参考 Agent Studio 的「构建助手」）。
@@ -10780,11 +11313,13 @@
     paintTray($("#studio-tray"), studioUI.attachments || []);
 
     /* 有附件时把占位语换成「说明要做什么」：只发文件不发话会被拦下，
-       而输入框空着的时候，占位语正是唯一能提前说清这件事的地方。 */
+       而输入框空着的时候，占位语正是唯一能提前说清这件事的地方。
+       三种用途都写出来——不说，人多半只会说「入库」，技能与工具那条路
+       就白留了。 */
     var input = $("#studio-input");
     if (input && !input.value) {
       input.placeholder = (studioUI.attachments || []).length
-        ? "说说要这份文件做什么…"
+        ? "说说这份文件要做什么：入库做资料、做成技能，还是接成工具…"
         : "今天帮你做些什么？可创建、配置或排查 Agent…";
     }
     // 托盘变化也会改变发送按钮该不该亮（有附件就算有内容）。
@@ -11157,26 +11692,27 @@
   async function studioResolve(id, action, index, btn) {
     var msg = studioUI.messages[index];
     if (!msg || !msg.approval) return;
+    // 下面会把卡改成结束态，先记下「点之前还能不能点」——结论补不补看这一位。
+    var wasOpen = !msg.approval.done && msg.approval.open !== false;
 
     $$("[data-sid='" + id + "']").forEach(function (b) { b.disabled = true; });
     btn.textContent = action === "confirm" ? "执行中…" : "取消中…";
 
+    var appended = null;
     try {
       var r = await api("/api/v1/approvals/" + encodeURIComponent(id) + "/" + action, {
         method: "POST", body: {}
       });
-      // 状态说人话，原始字段照旧留着：排查时要看 success / verified。
-      var text = PAPApproval.statusText(r.status);
-      if (r.success !== undefined) text += " · success=" + r.success;
-      if (r.verified !== undefined) text += " · verified=" + r.verified;
-      if (r.message) text += " · " + r.message;
-      msg.approval.done = text;
+      /* 和对话台同一条：卡上只写状态，结论单独一条气泡。
+         以前这里是「状态 · success=true · verified=false · 服务端那句话」，
+         上面再把 `r.result` 的 JSON 贴进气泡——那段 JSON 只在内存里，
+         刷新就没了，看着像数据丢了；而真正的结论（加工链路、片数）刷新后才出现。 */
+      msg.approval.done = PAPApproval.outcome({ status: r.status, error_code: r.error_code });
       msg.approval.title = "已处理";
       msg.approval.open = false;
       msg.approval.note = "";
-      if (r.result) {
-        msg.text = msg.text + "\n\n执行结果：\n" + JSON.stringify(r.result, null, 2);
-      }
+      appended = conclusionMessage(r, wasOpen);
+      if (appended) studioUI.messages.push(appended);
       studioNotice(action === "confirm" ? "已提交执行" : "已取消", "ok");
       // 配置真的变了：智能体页若正开着，重渲染一次，否则列表会停在旧状态。
       if (currentRoute() === "agents") render();
@@ -11186,8 +11722,9 @@
       msg.approval.note = "这次没有提交成功：" + errText(e);
       studioNotice("审批没提交成功：" + errText(e), "err");
     }
-    // 更新的是用户正看着的那张卡：不挪位置，也不挂「有新内容」的记号。
-    renderStudioLog("quiet");
+    /* 补了结论就按自动模式：贴底就跟到最新，滚在上面只挂「有新对话」记号。
+       没补则原地不动——更新的是用户正看着的那张卡。 */
+    renderStudioLog(appended ? undefined : "quiet");
   }
 
   async function studioSend() {
@@ -11337,6 +11874,9 @@
 
       var detail = await api("/api/v1/conversations/" + encodeURIComponent(mine.id));
       var restored = [];
+      /* 一张单子一处卡：结论消息也带着同一个审批号，不筛就重一张。
+         这条规则和对话台共用 approval.js 里的实现。 */
+      var ownsApproval = PAPApproval.cardOwners();
 
       for (var i = 0; i < (detail.messages || []).length; i++) {
         var m = detail.messages[i];
@@ -11353,7 +11893,7 @@
           item.status = "error";
           item.meta = "error=" + meta.error_category;
         }
-        if (role === "agent" && meta.approval_id) {
+        if (role === "agent" && ownsApproval(meta)) {
           item.approval = await studioApprovalCard(meta.approval_id, m.content);
         }
         restored.push(item);
@@ -11479,14 +12019,14 @@
       '<textarea id="studio-input" rows="1" ' +
       'placeholder="今天帮你做些什么？可创建、配置或排查 Agent…"></textarea>' +
       '<div class="studio-tools">' +
-      // 加号只有一个去处：随消息发给助手。
-      // 这里不提供「直接导进知识库」——构建助手处理的是这一问的材料，
-      // 不是长期语料；把两类东西塞进同一个按钮，文件去哪就成了要猜的事。
-      // 建知识库走控制台「从文件新建」页，权限与幂等由那一处统一把关。
-      // 收 Markdown / 文本是为了「按这份规程/清单干活」；
+      // 加号是文件进平台的唯一入口：文件随消息发出去，助手按用户说的用途
+      // 判类——入库做资料、做成技能，或者接成工具——再由 studio_import
+      // 按磁盘上的原文处理。不再另设「从文件新建」弹层：判类依据是文件内容，
+      // 而内容在助手手里，先让人选目标等于把机器的活推给人。
+      // 收 Markdown / JSON / YAML / 文本也是为了同一个用途（判类靠后缀）；
       // 它们和图片、PDF 一样是这个会话的参考材料，随会话保留、跨轮可读。
       '<label class="studio-tool" for="studio-file" id="studio-add" ' +
-      'title="添加图片、PDF、Markdown 或文本（可多选）" role="button" tabindex="0" ' +
+      'title="添加图片、PDF、Markdown / JSON / YAML 或文本（可多选）" role="button" tabindex="0" ' +
       'aria-label="添加附件">' + ico("plus") + "</label>" +
       '<input type="file" id="studio-file" accept="' + STUDIO_ATTACH_ACCEPT + '" multiple hidden>' +
       // 对象选择紧挨加号：它和附件一样，都是「这一条消息要带上的上下文」。
@@ -11716,7 +12256,8 @@
    *   2. 最近跑成什么样（暂停 / 失败 / 跑完，各自停在哪）；
    *   3. 每一步到底产出了什么（节点流水）。
    *
-   * 刻意没有「立即运行」按钮：触发只能回对话里发 `/workflow <名字> <要说的事>`。
+   * 刻意没有「立即运行」按钮：触发只能回对话里——在输入框的下拉里选这条流程，
+   * 或者发 `/workflow <名字> <要说的事>`。两条路走的是同一个 `Command`。
    * 在这里开一个运行入口，结论就不在任何一个会话里——用户看不见、审计查不到、
    * 写操作也落不到他当时确认的那条链上。页面上给的是入口提示，不是执行按钮。
    */
@@ -11772,7 +12313,10 @@
     defView: "steps",
     defRaw: null,
     defOpen: {},
-    defError: null
+    defError: null,
+    /* 总览里点开的那一步。详情卡只画它——所有步骤都摊成表单的话，
+       三张之后就得靠滚动条找「刚才那格在哪」。 */
+    sel: null
   };
 
   function wfChip(status) {
@@ -12323,7 +12867,6 @@
     return '<div class="wf-step' + (bad ? " bad" : "") + (orphan ? " orphan" : "") +
       '" data-node="' + esc(id) + '">' +
       '<div class="wf-step-head">' +
-      '<span class="wf-step-no">' + esc(String(index + 1)) + "</span>" +
       '<input class="wf-step-id" type="text" spellcheck="false" data-node="' + esc(id) +
       '" data-field="id" value="' + esc(id) + '" title="节点 id：改这里会同步所有指向它的边与模板引用">' +
       '<span class="wf-seg wf-kinds">' + kinds + "</span>" +
@@ -12335,23 +12878,109 @@
       "</div>";
   }
 
+  /* 总览卡片：一眼看完「有几步、谁在第几步、各自往哪走」，但不带任何输入框。
+     细节全留给下面那张详情卡——一根柱子从头填到尾，第三次就得靠滚动条找位置。 */
+  function wfCardHtml(node, def, index, orphan, order) {
+    var id = node.id || "";
+    var kind = node.kind || "agent";
+    var bad = wfUI.defError && wfUI.defError.node === id;
+    var on = wfUI.sel === id;
+    var edges = Array.isArray(node.next) ? node.next : [];
+    var conds = edges.filter(function (edge) { return edge && edge.when; }).length;
+    var fallback = edges.filter(function (edge) { return edge && !edge.when; })[0];
+
+    var exits = [];
+    if (conds) exits.push(conds + " 条条件");
+    if (fallback) {
+      exits.push("其余 →" + (order[fallback.to] || "?"));
+    } else if (conds) {
+      exits.push("缺兜底");
+    }
+    if (!edges.length) exits.push("终点");
+
+    var sub = kind === "parallel"
+      ? "∥ " + (Array.isArray(node.branches) ? node.branches.length : 0) + " 个分支"
+      : (kind === "compose" ? "汇总上游" : (node.agent || "未指定智能体"));
+
+    var chips = '<span class="wf-chip">' + esc(WF_KIND[kind]) + "</span>";
+    if (def.entry === id) chips += '<span class="wf-chip entry">入口</span>';
+    if (bad) chips += '<span class="wf-chip bad">有错</span>';
+
+    return '<button type="button" class="wf-card' + (on ? " on" : "") + (bad ? " bad" : "") +
+      (orphan ? " orphan" : "") + '" data-act="def-select" data-node="' + esc(id) + '"' +
+      ' title="点开改这一步的配置">' +
+      '<span class="wf-card-top"><span class="wf-card-no">' +
+      esc(orphan ? "!" : String(index + 1)) + "</span>" +
+      '<code class="wf-card-id">' + esc(id) + "</code>" + chips + "</span>" +
+      '<span class="wf-card-sub">' + esc(sub) + "</span>" +
+      '<span class="wf-card-exit">' + esc(exits.join(" · ") || "—") + "</span>" +
+      "</button>";
+  }
+
+  function wfIndexOfHtml(def, chain) {
+    var order = {};
+    chain.ids.forEach(function (id, at) { order[id] = at + 1; });
+
+    var cards = chain.ids.map(function (id, at) {
+      var node = chain.byId[id];
+      return node ? wfCardHtml(node, def, at, false, order) : "";
+    }).join("");
+
+    var orphans = "";
+    if (chain.orphans.length) {
+      var lost = chain.orphans.map(function (id) {
+        var node = wfNodeById(id);
+        return node ? wfCardHtml(node, def, 0, true, order) : "";
+      }).join("");
+      orphans = '<div class="wf-orphans"><div class="wf-orphans-head"><strong>未接入（' +
+        esc(String(chain.orphans.length)) + "）</strong>从入口走不到，保存时会被拒。" +
+        "点开它，在「下一步」里把它接到某一步上，或者删掉。</div>" +
+        '<div class="wf-index">' + lost + "</div></div>";
+    }
+
+    return '<div class="wf-index">' +
+      (cards || '<div class="empty sm">这张图还没有步骤。点右上角「添加步骤」开始。</div>') +
+      "</div>" + orphans;
+  }
+
+  function wfDetailHtml(def, chain) {
+    var node = wfUI.sel ? wfNodeById(wfUI.sel) : null;
+    if (!node) {
+      return '<div class="wf-detail-empty">点上面任意一张卡片，在这里改那一步的配置。</div>';
+    }
+
+    var at = chain.ids.indexOf(node.id);
+    var orphan = at < 0;
+    var nav = "";
+    if (orphan) {
+      nav = '<span class="faint">还没有人指向这一步：把它接到某一步的「下一步」里，它才会被执行。</span>';
+    } else {
+      nav = (at > 0
+        ? '<button class="btn sm" type="button" data-act="def-prev" data-node="' + esc(node.id) + '">← 第 ' + at + " 步</button>"
+        : "") +
+        (at < chain.ids.length - 1
+          ? '<button class="btn sm" type="button" data-act="def-next" data-node="' + esc(node.id) + '">第 ' + (at + 2) + " 步 →</button>"
+          : "");
+    }
+
+    return '<div class="wf-detail">' +
+      '<div class="wf-detail-head"><strong>' +
+      (orphan ? "未接入的步骤" : "配置第 " + (at + 1) + " 步") +
+      '</strong><span class="faint">改动即时写进定义，保存时才提交</span>' +
+      '<span class="wf-detail-nav">' + nav + "</span></div>" +
+      wfStepHtml(node, def, orphan ? 0 : at, orphan) +
+      "</div>";
+  }
+
   function wfDefHtml() {
     var def = wfDef();
     var chain = wfChain(def);
-    var steps = chain.ids.map(function (id, index) {
-      var node = chain.byId[id];
-      return node ? wfStepHtml(node, def, index, false) : "";
-    }).join("");
 
-    var orphans = chain.orphans.length
-      ? '<div class="wf-orphans">' +
-        '<div class="wf-orphans-head"><strong>未接入（' + esc(String(chain.orphans.length)) + '）</strong>' +
-        "从入口走不到，保存时会被拒。接到某一步的「下一步」里，或删掉。</div>" +
-        chain.orphans.map(function (id, index) {
-          var node = wfNodeById(id);
-          return node ? wfStepHtml(node, def, index, true) : "";
-        }).join("") + "</div>"
-      : "";
+    /* 选中的那一步：默认落在入口上（打开就能改第一步）。删掉/改 id 之后
+       原选择可能已经不存在，这里兜回第一个能用的。 */
+    if (!wfUI.sel || !wfNodeById(wfUI.sel)) {
+      wfUI.sel = chain.ids[0] || chain.orphans[0] || null;
+    }
 
     var entry = def.entry
       ? '<span class="wf-def-entry">入口 <code>' + esc(def.entry) + "</code></span>"
@@ -12382,8 +13011,8 @@
       "</div>" +
       error +
       '<div class="wf-steps"' + (wfUI.defView === "json" ? " hidden" : "") + ">" +
-      steps + orphans +
-      (chain.ids.length ? "" : '<div class="empty sm">这张图还没有步骤。点右上角「添加步骤」开始。</div>') +
+      wfIndexOfHtml(def, chain) +
+      (chain.ids.length || chain.orphans.length ? wfDetailHtml(def, chain) : "") +
       "</div>" +
       '<textarea class="wf-def" id="wf-def" spellcheck="false" rows="18"' +
       (wfUI.defView === "json" ? "" : " hidden") + ">" + esc(jsonValue) + "</textarea>" +
@@ -12419,7 +13048,8 @@
     wfBindDetails(wrap);
 
     if (focusNode) {
-      var card = wrap.querySelector('[data-node="' + focusNode + '"] textarea[data-field="task"]');
+      // 并行节点的任务框是 input（说明），别的节点的框是 textarea。
+      var card = wrap.querySelector('[data-node="' + focusNode + '"] [data-field="task"]');
       if (card) card.focus();
     }
   }
@@ -12746,6 +13376,7 @@
   function wfDeleteStep(root, id) {
     var def = wfDef();
     var refs = wfCountRefs(id);
+    var seat = wfChain(def).ids.indexOf(id);
     def.nodes = (def.nodes || []).filter(function (node) {
       return !node || node.id !== id;
     });
@@ -12756,6 +13387,12 @@
       });
     });
     if (def.entry === id) def.entry = def.nodes.length ? (def.nodes[0].id || "") : "";
+    /* 删掉的正是正在看的那一步时，选中落到原位（原来第三步没了就落在新的第三步上），
+       否则详情卡会突然空掉，看起来像「页面坏了」。 */
+    if (wfUI.sel === id) {
+      var rest = wfChain(def).ids;
+      wfUI.sel = rest[Math.min(Math.max(seat, 0), rest.length - 1)] || null;
+    }
     if (refs) {
       toast("已删除，但还有 " + refs + " 处模板在引用 {{nodes." + id + "}}，保存会被拒", "err");
     }
@@ -12827,8 +13464,32 @@
       return;
     }
 
+    if (act === "def-select") {
+      if (wfUI.sel === nodeId) return;
+      wfUI.sel = nodeId;
+      wfDefPaint(root);
+      // 总览一多（十来步）就比一屏还高，详情卡会落在折叠线以下：点完没反应的样子。
+      var opened = $("#wf-def-wrap .wf-detail", root);
+      if (opened) opened.scrollIntoView({ block: "nearest" });
+      return;
+    }
+
+    if (act === "def-prev" || act === "def-next") {
+      var ids = wfChain(def).ids;
+      var seat = ids.indexOf(nodeId);
+      var want = seat + (act === "def-prev" ? -1 : 1);
+      if (seat >= 0 && want >= 0 && want < ids.length) {
+        wfUI.sel = ids[want];
+        wfDefPaint(root);
+        var detail = $("#wf-def-wrap .wf-detail", root);
+        if (detail) detail.scrollIntoView({ block: "nearest" });
+      }
+      return;
+    }
+
     if (act === "def-add") {
       var added = wfAddStep(root);
+      wfUI.sel = added;
       wfDefPaint(root, added);
       return;
     }
@@ -12987,6 +13648,7 @@
     wfUI.defRaw = null;
     wfUI.defOpen = {};
     wfUI.defError = null;
+    wfUI.sel = null;
     wfLoadWorkflowAgents();
 
     root.innerHTML = pageHead({
@@ -13004,7 +13666,8 @@
       '<div class="card">' +
       cardHead("流程清单", "share", '<span class="chip" id="wf-count">—</span>') +
       '<div id="wf-body"><div class="skeleton" style="width:60%"></div></div>' +
-      '<p class="hint">触发只有一种：在对话里发 <code>/workflow &lt;标识&gt; &lt;要说的事&gt;</code>。' +
+      '<p class="hint">触发：在对话输入框的下拉里选这条流程（正文就是它的输入），或发 ' +
+      '<code>/workflow &lt;标识&gt; &lt;要说的事&gt;</code>。' +
       "结论会落在那条会话里，写操作走同一条审批链。这里不提供「立即运行」——" +
       "那样跑出来的结论没有归属，用户看不见、审计也查不到。" +
       "另外，「最长几跳」必须不超过发起方智能体配的「最大转交深度」，超了会在开跑前被拒。</p>" +
@@ -13029,6 +13692,7 @@
       wfUI.defRaw = null;
       wfUI.defOpen = {};
       wfUI.defError = null;
+      wfUI.sel = null;
       renderWorkflows(root);
       var name = $("#wf-name", root);
       if (name) name.focus();
@@ -13131,6 +13795,7 @@
       wfUI.form.definition = wfDefClone(WF_TEMPLATE);
       wfUI.defRaw = null;
       wfUI.defError = null;
+      wfUI.sel = null;
       if (wfUI.defView === "steps") wfDefPaint(root, "classify");
       else wfDefPaint(root);
       return;
@@ -13183,6 +13848,7 @@
         wfUI.defRaw = null;
         wfUI.defOpen = {};
         wfUI.defError = null;
+        wfUI.sel = null;
         renderWorkflows(root);
         var slot = $("#wf-form-slot", root);
         if (slot) slot.scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -13257,6 +13923,7 @@
       toast(editing ? "已保存（修订号 +1）" : "已创建");
       wfUI.form = null;
       wfUI.defError = null;
+      wfUI.sel = null;
       await loadWorkflows(root);
     } catch (e) {
       /* 保存即编译：422 里带着 {code, message, node}。message 是给人照着改的
@@ -13267,9 +13934,12 @@
         : errText(e);
       wfUI.defError = { node: (detail && detail.node) || "", message: msg };
       if (wfUI.defView === "steps") {
+        // 后端点名了哪一个节点，就把它选开：详情卡直接显示那一格要改的东西，
+        // 总览里同时标红。只标红不选中的话，人还得自己去点开猜是哪个字段。
+        if (wfUI.defError.node) wfUI.sel = wfUI.defError.node;
         wfDefPaint(root);
         var bad = wfUI.defError.node
-          ? $("#wf-def-wrap [data-node='" + wfUI.defError.node + "']", root)
+          ? $("#wf-def-wrap [data-act='def-select'][data-node='" + wfUI.defError.node + "']", root)
           : null;
         if (bad) bad.scrollIntoView({ block: "nearest", behavior: "smooth" });
       }
@@ -13298,12 +13968,8 @@
     var navBtn = $("#btn-nav");
     if (navBtn) navBtn.addEventListener("click", flipNav);
 
-    // 「从文件新建」常驻侧栏，不挂在任何一条路由上：它的用途恰恰是
-    // 「我还不知道该去哪个页面」的时候。
-    var newBtn = $("#btn-new-import");
-    if (newBtn) newBtn.addEventListener("click", openImportDialog);
-
     // 构建助手是常驻 UI，不挂在任何一条路由上：在任何页面都能打开它改配置。
+    // 文件导入也在这一个入口里：上传附件 + 说明用途，由它按内容判类后入库。
     initStudio();
 
     window.addEventListener("hashchange", function () {

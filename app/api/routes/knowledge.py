@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -44,6 +45,7 @@ from app.knowledge.upload import (
     precheck_upload,
 )
 from app.models.audit import AuditEventType
+from app.models.document import Document
 from app.schemas.common import APIModel, as_utc
 from app.schemas.knowledge import (
     KnowledgeChunkItem,
@@ -574,3 +576,548 @@ async def knowledge_search(
         citations=result.citations,
         rerank=result.rerank,
     )
+
+
+# ---------------------------------------------------------------- 治理：加工流水线
+#
+# 下面这一组是「知识加工与治理」页面的数据源。全部要求 knowledge:write：
+# 流水线指标本身不敏感，但同一组接口里还有反馈原文（用户当时问的什么）
+# 与评测标注，把读权限放宽到全体成员，等于把手写事故记录公开在列表页。
+
+
+class FeedbackRequest(APIModel):
+    """点赞/踩。答案由前端带上，是因为写工具跑在另一条请求里，
+    事后回查消息要多一次跨表读；这次反馈的现场就在这里，一次写入最省。"""
+
+    verdict: str = Field(pattern="^(up|down)$")
+    message_id: str | None = Field(default=None, max_length=64)
+    conversation_id: str | None = Field(default=None, max_length=64)
+    run_id: str | None = Field(default=None, max_length=64)
+    query: str = Field(default="", max_length=4000)
+    answer: str = Field(default="", max_length=20000)
+    reason: str | None = Field(default=None, max_length=32)
+    comment: str | None = Field(default=None, max_length=2000)
+    chunk_ids: list[str] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
+
+
+class FeedbackHandledRequest(APIModel):
+    handled: bool = True
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class FeedbackToCaseRequest(APIModel):
+    expect_document: list[str] = Field(default_factory=list)
+    expect_section: str | None = Field(default=None, max_length=256)
+
+
+class EvalCaseRequest(APIModel):
+    id: str | None = None
+    query: str = Field(min_length=1, max_length=4000)
+    expect_found: bool = True
+    expect_document: list[str] = Field(default_factory=list)
+    expect_section: str | None = Field(default=None, max_length=256)
+    category: str | None = Field(default=None, max_length=64)
+    note: str | None = Field(default=None, max_length=2000)
+    enabled: bool = True
+    source: str = "manual"
+
+
+class EvalRunRequest(APIModel):
+    k: int = Field(default=5, ge=1, le=10)
+    # 只跑某一类。补完一类语料就只看这一类，比全量数字更能说明问题。
+    category: str | None = None
+
+
+class EvalImportRequest(APIModel):
+    cases: list[dict] = Field(default_factory=list)
+
+
+class RetireRequest(APIModel):
+    document_ids: list[str] = Field(default_factory=list)
+
+
+@router.get("/governance")
+async def knowledge_governance(
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """治理总览：八个阶段 + 满意度 + 最近一次评测 + 老化摘要。"""
+    from app.knowledge import evaluation, feedback, lifecycle, pipeline
+
+    _require_write(identity)
+
+    stages = await pipeline.overview(session, identity.tenant_id)
+    sat = await feedback.satisfaction(session, identity.tenant_id)
+    life = await lifecycle.inspect(session, identity.tenant_id)
+    runs = await _recent_runs(session, identity.tenant_id, limit=1)
+    cases = await evaluation.list_cases(session, identity.tenant_id)
+
+    return {
+        **stages,
+        "satisfaction": sat,
+        "latest_eval": runs[0] if runs else None,
+        "eval_cases": {
+            "total": len(cases),
+            "scored": sum(1 for item in cases if item["scored"]),
+            "enabled": sum(1 for item in cases if item["enabled"]),
+        },
+        "lifecycle": life["summary"],
+    }
+
+
+async def _recent_runs(session: AsyncSession, tenant_id: str, *, limit: int = 20) -> list[dict]:
+    from sqlalchemy import select
+
+    from app.models.knowledge_gov import KnowledgeEvalRun
+    from app.tenancy.context import tenant_scope
+
+    with tenant_scope(tenant_id):
+        rows = list(
+            (
+                await session.scalars(
+                    select(KnowledgeEvalRun)
+                    .where(KnowledgeEvalRun.tenant_id == tenant_id)
+                    .order_by(KnowledgeEvalRun.created_at.desc())
+                    .limit(max(1, limit))
+                )
+            ).all()
+        )
+
+    return [
+        {
+            "id": str(row.id),
+            "k": row.k,
+            "case_total": row.case_total,
+            "scored": row.scored,
+            "recall": row.recall,
+            "precision": row.precision,
+            "hit_at_k": row.hit_at_k,
+            "mrr": row.mrr,
+            "false_hit_rate": row.false_hit_rate,
+            "zero_hit_rate": row.zero_hit_rate,
+            "index_version": row.index_version,
+            "elapsed_ms": row.elapsed_ms,
+            "summary": row.summary,
+            "created_by": row.created_by,
+            "created_at": as_utc(row.created_at),
+        }
+        for row in rows
+    ]
+
+
+@router.get("/documents/{document_id}/pipeline")
+async def knowledge_document_pipeline(
+    document_id: str,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """单篇的加工明细。老文档没有入库快照时按现有切片现算，标 derived。"""
+    from app.knowledge import pipeline
+
+    _require_write(identity)
+    row = await documents.get_document(session, identity.tenant_id, document_id)
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    chunks = await documents.chunks_of(session, identity.tenant_id, document_id, limit=200)
+
+    try:
+        target = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="文档不存在。") from None
+
+    with tenant_scope(identity.tenant_id):
+        orm_row = await session.get(Document, target)
+
+    if orm_row is None or orm_row.tenant_id != identity.tenant_id:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    payload = pipeline.document_detail(
+        orm_row,
+        [
+            {"section": chunk.section, "content": chunk.content}
+            for chunk in chunks
+        ],
+    )
+
+    return {"document": _item(identity, row), **payload}
+
+
+# ---------------------------------------------------------------- 治理：评测
+
+
+@router.get("/eval/cases")
+async def knowledge_eval_cases(
+    enabled: bool | None = Query(default=None),
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.knowledge import evaluation
+
+    _require_write(identity)
+    items = await evaluation.list_cases(session, identity.tenant_id, enabled=enabled)
+
+    return {
+        "items": items,
+        "total": len(items),
+        "scored": sum(1 for item in items if item["scored"]),
+    }
+
+
+@router.post("/eval/cases")
+async def knowledge_eval_case_save(
+    payload: EvalCaseRequest,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.knowledge import evaluation
+
+    _require_write(identity)
+
+    try:
+        item = await evaluation.upsert_case(
+            session,
+            identity.tenant_id,
+            case_id=payload.id,
+            query=payload.query,
+            expect_found=payload.expect_found,
+            expect_document=payload.expect_document,
+            expect_section=payload.expect_section,
+            category=payload.category,
+            note=payload.note,
+            enabled=payload.enabled,
+            source=payload.source,
+            actor=identity.user_id,
+        )
+    except evaluation.CaseRejected as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await session.commit()
+
+    return item
+
+
+@router.delete("/eval/cases/{case_id}")
+async def knowledge_eval_case_delete(
+    case_id: str,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.knowledge import evaluation
+
+    _require_write(identity)
+
+    if not await evaluation.delete_case(session, identity.tenant_id, case_id):
+        raise HTTPException(status_code=404, detail="用例不存在。")
+
+    await session.commit()
+
+    return {"deleted": 1}
+
+
+@router.post("/eval/import")
+async def knowledge_eval_import(
+    payload: EvalImportRequest,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.knowledge import evaluation
+
+    _require_write(identity)
+
+    if not payload.cases:
+        raise HTTPException(status_code=400, detail="cases 不能为空。")
+
+    result = await evaluation.import_cases(
+        session, identity.tenant_id, payload.cases, actor=identity.user_id
+    )
+    await session.commit()
+
+    return result
+
+
+@router.post("/eval/run")
+async def knowledge_eval_run(
+    payload: EvalRunRequest,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """跑一次评测并落库。
+
+    用当前在线索引、当前身份可见的分级——评的就是这个人实际能检索到的东西。
+    """
+    import time
+
+    from app.knowledge import evaluation, store
+    from app.models.knowledge_gov import KnowledgeEvalRun
+
+    _require_write(identity)
+
+    cases = await evaluation.list_cases(session, identity.tenant_id, enabled=True)
+
+    if payload.category:
+        cases = [item for item in cases if (item.get("category") or "") == payload.category]
+
+    if not cases:
+        raise HTTPException(
+            status_code=400,
+            detail="没有可跑的用例。先在「评估用例」里加几条，或从 bad case 转一条过来。",
+        )
+
+    started = time.monotonic()
+
+    try:
+        summary, results = await evaluation.run_online(
+            session,
+            identity.tenant_id,
+            cases,
+            k=payload.k,
+            # 传原始授权而不是展开后的分级：评测内部要复用线上那条
+            # `service._retrieve`，它自己会把 scope 折成可见分级。
+            # 把已展开的集合再折一次会得到空集，评测就变成「什么都看不到」。
+            scopes=identity.scopes,
+            roles=tuple(identity.roles),
+            user_id=identity.user_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    elapsed = int((time.monotonic() - started) * 1000)
+    stats = await store.stats(session, identity.tenant_id)
+
+    row = KnowledgeEvalRun(
+        tenant_id=identity.tenant_id,
+        k=payload.k,
+        case_total=summary["cases"],
+        scored=summary["scored"],
+        recall=summary["recall"],
+        precision=summary["precision"],
+        hit_at_k=summary["hit_at_k"],
+        mrr=summary["mrr"],
+        false_hit_rate=summary["false_hit_rate"],
+        zero_hit_rate=summary["zero_hit_rate"],
+        index_version=stats.version,
+        elapsed_ms=elapsed,
+        summary=summary,
+        detail=[item.to_dict() for item in results],
+        created_by=identity.user_id,
+    )
+    session.add(row)
+    await session.commit()
+
+    return {
+        "id": str(row.id),
+        "metrics": summary,
+        "index_version": stats.version,
+        "elapsed_ms": elapsed,
+        "detail": [item.to_dict() for item in results],
+    }
+
+
+@router.get("/eval/runs")
+async def knowledge_eval_runs(
+    limit: int = Query(default=20, ge=1, le=100),
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    _require_write(identity)
+    runs = await _recent_runs(session, identity.tenant_id, limit=limit)
+
+    return {"items": runs, "total": len(runs)}
+
+
+@router.get("/eval/runs/{run_id}")
+async def knowledge_eval_run_detail(
+    run_id: str,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.models.knowledge_gov import KnowledgeEvalRun
+
+    _require_write(identity)
+
+    try:
+        target = uuid.UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="评测记录不存在。") from None
+
+    with tenant_scope(identity.tenant_id):
+        row = await session.get(KnowledgeEvalRun, target)
+
+    if row is None or row.tenant_id != identity.tenant_id:
+        raise HTTPException(status_code=404, detail="评测记录不存在。")
+
+    return {
+        "id": str(row.id),
+        "k": row.k,
+        "summary": row.summary,
+        "index_version": row.index_version,
+        "elapsed_ms": row.elapsed_ms,
+        "created_at": as_utc(row.created_at),
+        "detail": row.detail,
+    }
+
+
+# ---------------------------------------------------------------- 治理：反馈
+
+
+@router.post("/feedback")
+async def knowledge_feedback_submit(
+    payload: FeedbackRequest,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """应用端的点赞/踩。
+
+    **不要求 knowledge:write**：这是使用者的动作，不是管理员操作。
+    能提问的人就能评价回答——把入口挡在权限后面，就永远收不到 bad case。
+    """
+    from app.knowledge import feedback
+
+    try:
+        item = await feedback.record(
+            session,
+            identity.tenant_id,
+            message_id=payload.message_id,
+            conversation_id=payload.conversation_id,
+            run_id=payload.run_id,
+            query=payload.query,
+            answer=payload.answer,
+            verdict=payload.verdict,
+            reason=payload.reason,
+            comment=payload.comment,
+            chunk_ids=payload.chunk_ids,
+            document_ids=payload.document_ids,
+            actor=identity.user_id,
+        )
+    except feedback.FeedbackRejected as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await session.commit()
+
+    return item
+
+
+@router.get("/feedback")
+async def knowledge_feedback_list(
+    verdict: str | None = Query(default=None),
+    handled: bool | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.knowledge import feedback
+
+    _require_write(identity)
+
+    return await feedback.list_feedback(
+        session, identity.tenant_id, verdict=verdict, handled=handled, limit=limit
+    )
+
+
+@router.post("/feedback/{feedback_id}/handled")
+async def knowledge_feedback_handled(
+    feedback_id: str,
+    payload: FeedbackHandledRequest,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.knowledge import feedback
+
+    _require_write(identity)
+
+    item = await feedback.mark_handled(
+        session, identity.tenant_id, feedback_id, handled=payload.handled, note=payload.note
+    )
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="反馈不存在。")
+
+    await session.commit()
+
+    return item
+
+
+@router.post("/feedback/{feedback_id}/case")
+async def knowledge_feedback_to_case(
+    feedback_id: str,
+    payload: FeedbackToCaseRequest,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """把差评升格成评测用例——这是反馈闭环真正闭合的那一步。"""
+    from app.knowledge import feedback
+
+    _require_write(identity)
+
+    item = await feedback.promote_to_case(
+        session,
+        identity.tenant_id,
+        feedback_id,
+        expect_document=payload.expect_document,
+        expect_section=payload.expect_section,
+        actor=identity.user_id,
+    )
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="反馈不存在。")
+
+    await session.commit()
+
+    return item
+
+
+# ---------------------------------------------------------------- 治理：生命周期
+
+
+@router.get("/lifecycle")
+async def knowledge_lifecycle(
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.knowledge import lifecycle
+
+    _require_write(identity)
+
+    return await lifecycle.inspect(session, identity.tenant_id)
+
+
+@router.post("/lifecycle/retire")
+async def knowledge_lifecycle_retire(
+    payload: RetireRequest,
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """批量下架。必须显式给出 id —— 没有「一键清理全部候选」。"""
+    from app.knowledge import lifecycle
+
+    _require_write(identity)
+
+    if not payload.document_ids:
+        raise HTTPException(status_code=400, detail="document_ids 不能为空。")
+
+    if len(payload.document_ids) > 50:
+        raise HTTPException(status_code=400, detail="一次最多下架 50 份，分批处理。")
+
+    result = await lifecycle.retire(session, identity.tenant_id, payload.document_ids)
+
+    for document_id in result["retired"]:
+        await _audit(
+            session,
+            identity,
+            operation="retire",
+            document_id=document_id,
+            detail="生命周期治理：批量下架",
+        )
+
+    await session.commit()
+    _invalidate(identity.tenant_id)
+
+    return {
+        **result,
+        "message": f"已下架 {len(result['retired'])} 份，未找到 {len(result['missing'])} 份。",
+    }

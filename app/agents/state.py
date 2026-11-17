@@ -82,7 +82,7 @@ class AgentState(TypedDict, total=False):
     attachments: list[dict[str, Any]]
 
     # 更早的对话：{"summary": str, "turns": [{"role", "text"}]}，由
-    # `context_service` 在轮间算好。
+    # `context_service` 在轮间算好（docs/CONTEXT.md）。
     #
     # **不要加进 `_PER_TURN_FIELDS`。** 那张表清的是「本轮产出了什么」，
     # 而这是本轮的输入，和 attachments、roles 同级。误放进归零表的表现是

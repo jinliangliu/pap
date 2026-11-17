@@ -313,6 +313,7 @@ class ChatService:
         message: str,
         attachments: list | None = None,
         boundary: AgentBoundary | None = None,
+        workflow: str | None = None,
     ) -> ChatResponse:
         client_id = validate_client_thread_id(thread_id)
 
@@ -323,6 +324,7 @@ class ChatService:
                 message=message,
                 attachments=attachments,
                 boundary=boundary or agent_service.BASELINE,
+                workflow=workflow,
             )
 
     async def _handle_message(
@@ -333,6 +335,7 @@ class ChatService:
         message: str,
         attachments: list | None = None,
         boundary: AgentBoundary | None = None,
+        workflow: str | None = None,
     ) -> ChatResponse:
         boundary = boundary or agent_service.BASELINE
 
@@ -396,6 +399,7 @@ class ChatService:
                 internal_thread=internal_thread,
                 trace=trace,
                 boundary=boundary,
+                workflow=workflow,
             )
 
         # 记忆抽取排在回答落地之后：它要读完整的一问一答，
@@ -424,6 +428,7 @@ class ChatService:
         internal_thread: str,
         trace: Any,
         boundary: AgentBoundary | None = None,
+        workflow: str | None = None,
     ) -> ChatResponse:
         """一轮对话的实体：落库 → 跑图 → 收尾。
 
@@ -529,7 +534,12 @@ class ChatService:
 
         # 编排是显式触发的。不给规划器增加「workflow 意图」：让模型自己挑一张图，
         # 等于把刚买到的确定性又交回给模型（ORCHESTRATION.md §4 D5）。
+        # 界面上选了一条流程时走同一个入口：`triggered_command` 与
+        # `parse_command` 共用名字校验，两种触发方式不可能长出两套行为。
+        # 消息正文本身以 `/workflow` 开头时以正文为准——那是更明确的那句话。
         command = workflow_service.parse_command(message)
+        if command is None and workflow:
+            command = workflow_service.triggered_command(workflow, message)
         if command is not None:
             return await self._run_workflow_turn(
                 identity=identity,

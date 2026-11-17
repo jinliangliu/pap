@@ -62,7 +62,25 @@ async def chat(
     thread_id 由客户端提供以定位会话，但身份一律取自服务端认证结果。
     客户端传入的 user_id / tenant_id / 权限字段一律忽略。
     """
-    boundary = await resolve_agent_boundary(identity=identity, agent_ref=payload.agent)
+    # 两个都传等于「这句话既交给这个人、又交给这条流程」：流程的每一步用的是
+    # 节点自带的智能体，`agent` 在这里没有任何作用。与其静默丢掉一个，
+    # 不如说清楚——「我选了它，它却换了一个人」是最难排查的那种。
+    if payload.workflow and payload.agent:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "CHAT_TARGET_CONFLICT",
+                "message": "一条消息只能选一个对象：智能体，或一条流程。",
+            },
+        )
+
+    # 选了流程就不解析智能体边界：流程节点各自带智能体，这里只需一个基线，
+    # 免得为一次流程触发顺手创建出租户的默认 Agent。
+    boundary = (
+        agent_service.BASELINE
+        if payload.workflow
+        else await resolve_agent_boundary(identity=identity, agent_ref=payload.agent)
+    )
 
     try:
         return await service.handle_message(
@@ -72,6 +90,7 @@ async def chat(
             # images 是旧字段名，合并进来一起处理。
             attachments=payload.merged_attachments(),
             boundary=boundary,
+            workflow=payload.workflow,
         )
     except RuntimeError as exc:
         # 图或运行时未初始化，属于部署问题，不伪装成业务失败。

@@ -104,6 +104,18 @@ def parse_command(message: str) -> Command | None:
     return Command(name=name, input_text=payload)
 
 
+def triggered_command(name: str, input_text: str) -> Command:
+    """界面上直接选了一条流程时，拼出与 `/workflow` 完全相同的 `Command`。
+
+    两个入口必须共用同一份名字校验：口径分开写，就会出现「手打的名字不合法、
+    下拉选同一个名字却放行」，排查时谁也想不到是那两个分支不一样。
+    """
+    clean = (name or "").strip()
+    if not clean or not _NAME_RE.match(clean):
+        return Command(name="", input_text="", invalid=True)
+    return Command(name=clean, input_text=(input_text or "").strip())
+
+
 # ---------------------------------------------------------------- 图的管理
 
 

@@ -296,7 +296,7 @@ async def create_action_plan(
         span_attrs["tools.names_cut"] = True
 
     # 用量收集器：只在调用方要的时候挂。它收集的是「这一轮模型实际看到了多少
-    # token」，下一轮据此决定要不要压缩上下文。
+    # token」，下一轮据此决定要不要压缩上下文（docs/CONTEXT.md §2.4）。
     collector = UsageCollector() if usage_sink is not None else None
 
     try:

@@ -5,7 +5,7 @@
 逐条 INSERT 会把观测变成「业务之外的第二份数据库开销」。这里用一个消费者
 任务攒批写入，请求侧只做一次 `put_nowait`（微秒级）。
 
-三条硬规则：
+三条硬规则（见 docs/OBSERVABILITY.md §6）：
 
 1. 队列满 → 丢最旧并计数。宁可丢观测，不可拖慢对话。
 2. 写库失败 → 记一次日志、不重试、不抛。表被删了也不能让对话 500。
@@ -112,7 +112,7 @@ class ObsWriter:
         if self._task is not None:
             return
         if not runtime_settings.obs_enabled():
-            # 关闭时也要留一行。验收清单靠这条日志
+            # 关闭时也要留一行。验收清单（OBSERVABILITY.md §11.2）靠这条日志
             # 判断「开关确实生效了」——什么都不打的话，「关了」与「启动日志被
             # 截断」「进程根本没重启」长得一模一样。
             logger.info(
@@ -152,7 +152,7 @@ class ObsWriter:
             logger.warning(
                 "生产环境开启了观测：完整 prompt 与回答会写入 obs_traces/obs_spans，"
                 "按 OBS_RETENTION_DAYS 清理。如需关闭，走控制台「运行配置 → 观测」，"
-                "不需要改 .env、也不需要重启。",
+                "不需要改 .env、也不需要重启（docs/OBSERVABILITY.md §11.2）。",
                 extra={"event": "observability_enabled_in_production"},
             )
 
@@ -250,7 +250,7 @@ class ObsWriter:
         起始行（`type="start"`）单独一条规则：**采样率不到 1 就一条都不写**。
         被采掉的那一轮不会再有收尾行，它的起始行会永久停在 `running`——
         「现在谁在跑」这张视图的全部可信度都押在这里，宁可少几行起始记录，
-        也不留一个永远不会收尾的假活人。
+        也不留一个永远不会收尾的假活人（RUNTIME_VIEW.md §5.1）。
         """
         rate = settings.obs_sample_rate
         if rate >= 1.0:

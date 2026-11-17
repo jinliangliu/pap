@@ -38,13 +38,14 @@ from typing import Any
 
 import httpx
 
+# 直接 `python scripts/pap_push.py …` 时 sys.path[0] 是 scripts/，项目根不在里面。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.knowledge.titles import clean_title  # noqa: E402
 from scripts.ocr_json_to_md import convert
 
 MCP_CONFIG = Path.home() / ".workbuddy" / "mcp.json"
 ENDPOINT_HINT = "http://127.0.0.1:8080/mcp"
-# 与 `app/knowledge/upload.py:MAX_TITLE_CHARS` 对齐：那边会截断，这里先截好再发。
-MAX_TITLE_CHARS = 200
-
 
 class PushError(Exception):
     """可预期的失败：凭据、网络、服务端拒绝。"""
@@ -118,16 +119,11 @@ def _default_title(path: Path) -> str:
 
     `GB 27791-2011 城镇燃气调压箱.pdf_by_PaddleOCR-VL-1.6.json`
     → `GB 27791-2011 城镇燃气调压箱`。标题会进检索的标题加权，长尾是纯噪声。
+
+    规则本身在 `app/knowledge/titles.py`：服务端入库时也会清一遍，
+    这里只是让上传时就带上干净名字（省得列表里先脏一下再变）。
     """
-    stem = path.stem
-
-    for marker in (".pdf_by_", ".PDF_by_", "_by_PaddleOCR"):
-        head, separator, _ = stem.partition(marker)
-
-        if separator:
-            return head.strip()[:MAX_TITLE_CHARS]
-
-    return stem[:MAX_TITLE_CHARS]
+    return clean_title(path.stem)
 
 
 def push(

@@ -204,6 +204,16 @@ async def upsert_document(
                 and existing.content_hash == raw_hash
                 and current_chunks == document.chunk_count
                 and existing_version == document.chunker_version
+                # 流水线快照是后加的字段，老行没有它。不把它纳入判定，
+                # 「重建一次补齐快照」会被判成 unchanged，快照永远补不上——
+                # 治理页就会永远显示「14/14 篇未采集」。有快照之后这条恒为真，
+                # 增量行为与以前逐字一致。
+                and existing_meta.get("pipeline")
+                # 标题也算「库里这份东西」的一部分。标题归一规则改过之后
+                # （清 OCR 长尾），只靠内容哈希判 unchanged，重建也改不掉
+                # 显示名——线上就留过一份带 `.pdf_by_PaddleOCR-VL-1.6` 的标题，
+                # 点重建、报成功、标题照旧。标题不变时这条恒为真。
+                and existing.title == document.title
             ):
                 return "unchanged"
 
@@ -236,6 +246,9 @@ async def upsert_document(
             "acl": document.acl,
             "updated_at": document.updated_at,
             "chunker_version": document.chunker_version,
+            # 加工流水线的产物量快照。重建会覆盖它——这正是我们要的：
+            # 它记的是「这份切片是怎么来的」，切片变了旧快照就该作废。
+            "pipeline": document.pipeline,
         }
 
         if existing is None:
@@ -268,7 +281,10 @@ async def upsert_document(
                         ),
                         "updated_at": document.updated_at,
                         "document_type": "knowledge_document",
-                        "tags": [],
+                        # 每片冗余一份：检索引用要显示标准号，老化判定要按
+                        # 文档类型分组，都犯不上为了几个字符串回查文档行。
+                        "tags": list(document.tags),
+                        **document.acl,
                         **document.acl,
                     },
                     is_active=True,
@@ -652,7 +668,8 @@ def parse_for_reindex(tenant_id: str, row: DocumentRow) -> ParsedDocument:
         raise DocumentError("原文已不存在，无法重建。请重新上传。")
 
     raw = path.read_bytes()
-    text = extract_text_from_bytes(raw, path.name)
+    stats: dict[str, Any] = {}
+    text = extract_text_from_bytes(raw, path.name, stats=stats)
 
     meta: dict[str, str] = {}
 
@@ -670,4 +687,5 @@ def parse_for_reindex(tenant_id: str, row: DocumentRow) -> ParsedDocument:
         size_bytes=len(raw),
         meta=meta,
         acl_hint=row.source_uri,
+        pre_stats=stats,
     )

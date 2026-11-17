@@ -136,6 +136,19 @@ const delegated = A.fromMeta(
 );
 check("委派信息要还原到卡上", delegated.preview.delegation, { from: "cs", depth: 1 });
 
+// ---- 一张单子一处卡 ----
+//
+// 执行完成后服务端会往会话里补一条带同一个 approval_id 的结论消息，委派与编排
+// 续跑还会再补。照单全收，刷新之后同一次操作会顶着两三张卡（当场只渲染了发起
+// 的一条，所以这个错只有刷新才看得见）。
+const owners = A.cardOwners();
+check("发起那条拿到卡", owners({ approval_id: AP_ID }), AP_ID);
+check("结论那条不再拿卡", owners({ approval_id: AP_ID, approval_action: "confirm" }), "");
+check("编排续跑那条也不拿卡", owners({ approval_id: AP_ID, intent: "workflow" }), "");
+check("没有审批号的消息不拿卡", owners({ intent: "chat" }), "");
+check("另一张单子照常拿卡", owners({ approval_id: "8f1d2c3b-0000-4000-8000-000000000002" }),
+  "8f1d2c3b-0000-4000-8000-000000000002");
+
 // ---- 词表 ----
 check("未知状态原样显示", A.statusText("SOMETHING_NEW"), "SOMETHING_NEW");
 check("没有状态时不写空白", A.statusText(null), "");

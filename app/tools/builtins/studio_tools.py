@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -593,6 +594,147 @@ async def _describe_history(
     )
 
 
+# ---------------- 编排流程（workflow） ----------------
+
+
+def _workflow_view(row: Any, last_run: Any = None) -> dict[str, Any]:
+    """流程的一行摘要。形状与控制台「编排」页的列表卡一致。
+
+    节点数与跳数来自重新编译（`plan_of`），不存第二份计数：存一份就会在
+    「有人直接改了库里的定义」时与实际图不符，而那张卡正是人用来判断图对不对的。
+    """
+    from app.services import workflow_service
+
+    plan = workflow_service.plan_of(row)
+
+    view: dict[str, Any] = {
+        "name": str(row.name),
+        "display_name": str(row.display_name),
+        "description": row.description,
+        "enabled": bool(row.enabled),
+        "revision": int(row.revision or 0),
+        "entry": plan.entry if plan else "",
+        "node_count": plan.size if plan else 0,
+        "depth_hops": plan.depth_hops if plan else 0,
+        "max_nodes": plan.max_nodes if plan else 0,
+        "updated_at": _when(row.updated_at),
+    }
+
+    if last_run is not None:
+        status = getattr(last_run.status, "value", last_run.status)
+        view["last_run"] = {
+            "status": str(status),
+            "nodes_used": int(last_run.nodes_used or 0),
+            "started_at": _when(last_run.started_at),
+            "error": last_run.error_code,
+        }
+
+    return view
+
+
+async def _describe_workflows(
+    context: ToolExecutionContext,
+    ref: str,
+) -> ToolExecutionResult:
+    """列出编排流程；带 ref 时给出整张图。
+
+    **图要进 message，不能只放 result。** 结果渲染器对嵌套列表只保留标题与
+    标识字段（它是为站点列表写的），一份 `nodes[].next[].when` 进去会被削平；
+    模型拿着残缺的图去「改一步」，改出来的东西保存时才炸，而它已经照着念完了。
+    """
+    from app.services import workflow_service
+
+    if ref:
+        row = await workflow_service.get_workflow(context.tenant_id, ref)
+        if row is None:
+            return _fail(f"没有找到标识为「{ref}」的流程。", resource="workflow")
+
+        runs = await workflow_service.recent_runs(
+            tenant_id=context.tenant_id, workflow_name=str(row.name), limit=1
+        )
+        view = _workflow_view(row, runs[0] if runs else None)
+        definition = row.definition or {}
+
+        lines = [
+            f"{view['name']}（{view['display_name']}）· "
+            + ("启用" if view["enabled"] else "停用")
+            + f" · v{view['revision']} · {view['node_count']} 个节点 / {view['depth_hops']} 跳"
+            f" · 入口 {view['entry'] or '—'}"
+        ]
+        if view["description"]:
+            lines.append(f"说明：{view['description']}")
+
+        last = view.get("last_run")
+        if last:
+            lines.append(
+                f"最近一次运行：{last['status']}（走了 {last['nodes_used']} 个节点，"
+                f"{last['started_at']}" + (f"，错误 {last['error']}" if last["error"] else "") + "）"
+            )
+        else:
+            lines.append("这张流程还没有运行记录。")
+
+        lines.append(
+            "图（要改就整份传回 studio_workflow_save，只改那几个节点；"
+            "别凭印象重写——没传的节点等于删掉了）："
+        )
+        lines.append(json.dumps(definition, ensure_ascii=False, indent=2))
+
+        return ToolExecutionResult(
+            success=True,
+            verified=True,
+            result={"resource": "workflow", "workflow": view, "definition": definition},
+            message="\n".join(lines),
+            verification={"source": "workflows_table", "ref": str(row.name)},
+        )
+
+    rows = await workflow_service.list_workflows(context.tenant_id)
+    # 一次取回、在内存里按名字取第一条：流程是个位数，N+1 查询却会随卡片数线性增长
+    # （与 `GET /api/v1/workflows` 同一处理）。
+    runs = await workflow_service.list_runs(tenant_id=context.tenant_id, limit=200)
+    latest: dict[str, Any] = {}
+    for run in runs:
+        latest.setdefault(str(run.workflow_name), run)
+
+    items = [_workflow_view(row, latest.get(str(row.name))) for row in rows]
+
+    if not items:
+        return ToolExecutionResult(
+            success=True,
+            verified=True,
+            result={"resource": "workflow", "items": [], "total": 0, "truncated": False},
+            message=(
+                "当前租户还没有任何编排流程。新建用 studio_workflow_save mode=create，"
+                "触发方式是在对话里发「/workflow <标识> <要做的事>」。"
+            ),
+            verification={"source": "workflows_table", "count": 0},
+        )
+
+    lines = [f"共 {len(items)} 张编排流程："]
+    for item in items[:MAX_LIST_ITEMS]:
+        last = item.get("last_run") or {}
+        lines.append(
+            f"- {item['name']}（{item['display_name']}）· "
+            + ("启用" if item["enabled"] else "停用")
+            + f" · v{item['revision']} · {item['node_count']} 个节点 / {item['depth_hops']} 跳"
+            + (f" · 最近 {last['status']}" if last.get("status") else " · 还没跑过")
+            + (f" · {item['description']}" if item["description"] else "")
+        )
+    lines.append("要看某一张的图，用 ref 传它的标识；改/删分别用 studio_workflow_save / studio_workflow_delete。")
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={
+            "resource": "workflow",
+            "items": items[:MAX_LIST_ITEMS],
+            "total": len(items),
+            "truncated": len(items) > MAX_LIST_ITEMS,
+        },
+        message="\n".join(lines),
+        verification={"source": "workflows_table", "count": len(items)},
+    )
+
+
 async def studio_describe(
     context: ToolExecutionContext,
     arguments: dict[str, Any],
@@ -720,6 +862,11 @@ async def studio_describe(
             if resource == "history":
                 return await _describe_history(session, context, ref)
 
+    # 流程自己开会话（与 run / trace 同样的理由：`workflow_service` 内部的每一处
+    # 都自带租户上下文，复用一个外部会话反而会在 RLS 上踩坑）。
+    if resource == "workflow":
+        return await _describe_workflows(context, ref)
+
     if resource == "tool":
         from app.tools.dependencies import get_tool_gateway
 
@@ -756,8 +903,8 @@ async def studio_describe(
         )
 
     return _fail(
-        f"不支持的查询对象「{resource}」。可以查 agent、skill、tool、run、trace、"
-        "knowledge、history 或 platform。",
+        f"不支持的查询对象「{resource}」。可以查 agent、skill、tool、workflow、run、"
+        "trace、knowledge、history 或 platform。",
         resource=resource,
     )
 
@@ -1393,6 +1540,20 @@ _PLATFORM_GUIDE = {
         "平台没有「边界版本表」，每个版本的边界是靠审计里的 before/after 记下来的，"
         "所以能恢复到多远取决于审计保留期。恢复只覆盖边界字段，会生成一个新版本。"
     ),
+    "workflow": (
+        "编排流程是一张有向无环图，保存时编译，存进库的一定是能跑的图。"
+        "形状：{entry: 起点节点id, nodes: [{id, kind?, agent?, task, emit?, inputs?, next}]}。"
+        "kind 省略即 agent 节点（调 agent 指定的智能体）；kind=compose 只汇总不调人；"
+        "kind=parallel 用 branches[{id, agent, task}] 并行再汇总。"
+        "task 里能用的占位符只有 {{input.text}}（用户那句话）、{{nodes.<id>}}、"
+        "{{nodes.<id>.<field>}}、{{inputs.<name>}}、{{upstream}}（已跑过的汇总）。"
+        "next = [{when: null | {key, op, value}, to}]，op 取 eq/neq/in/gt/lt；"
+        "除终点（next: []）外每条分支都必须有一条 when=null 的兜底边，否则命中不了就静默死掉。"
+        "条件里的 key 必须是上游 emit 出来的（emit.field 决定键名，emit.values/pattern 可把"
+        "自由文本收敛成一个值）。节点数上限 20，id 用小写字母开头。"
+        "触发只有一种：对话里发「/workflow <标识> <要做的事>」，或在对话窗口下拉里选它；"
+        "没有「立即运行」接口，因为结论必须落在会话里。"
+    ),
     "runtime": (
         "运行状态与日志来自观测（obs_traces / obs_spans），默认只看近 7 天；"
         "观测为空可能是被 OBS_ENABLED 关掉或已过保留期，不代表没跑过。"
@@ -1412,6 +1573,7 @@ def build_studio_tools() -> list[ToolDefinition]:
             description=(
                 "查看平台配置与运行情况。resource 取："
                 "agent（智能体，带 ref 看单个）/ skill（技能）/ tool（可用工具）/ "
+                "workflow（编排流程，带 ref 看整张图与最近一次运行）/ "
                 "run（最近运行，带 ref 按智能体过滤）/ trace（单次运行的 span，ref 传 trace_id）/ "
                 "knowledge（知识库文档清单）/ history（某个智能体的边界版本，ref 必填）/ "
                 "platform（平台用法摘要）。"
@@ -1430,6 +1592,7 @@ def build_studio_tools() -> list[ToolDefinition]:
                             "agent",
                             "skill",
                             "tool",
+                            "workflow",
                             "run",
                             "trace",
                             "knowledge",
