@@ -5083,6 +5083,171 @@ body.lb-open { overflow: hidden; }
 .wf-def:focus { outline: 2px solid var(--green-line); outline-offset: 1px; }
 .wf-form { margin-top: 14px; }
 .wf-form .field { margin-top: 12px; }
+.wf-form .field > label { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+
+/* ---------- 图编辑器：步骤清单 ----------
+   一张卡片 = 一个节点，出口写在卡片底部。不画坐标：PAP 的图形状只有
+   「链 + 条件分叉 + 并行收集」，位置不携带信息，却会让人以为能随便连。 */
+.wf-def-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.wf-def-entry { font-size: 12px; color: var(--muted); }
+.wf-def-entry code { font: 600 12px var(--mono); color: var(--text); }
+.wf-def-entry.err { color: var(--red); }
+.wf-def-max {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; color: var(--muted);
+}
+.wf-def-max input { width: 56px; height: 26px; padding: 0 6px; font-size: 12px; }
+.wf-def-views { margin-left: auto; }
+
+/* 分段按钮：视图切换与节点类型共用一套，切换的代价一眼可见。 */
+.wf-seg {
+  display: inline-flex; border: 1px solid var(--line); border-radius: 8px;
+  overflow: hidden; background: var(--surface);
+}
+.wf-seg button {
+  border: 0; background: transparent; padding: 4px 9px;
+  font: inherit; font-size: 11.5px; color: var(--muted); cursor: pointer;
+}
+.wf-seg button + button { border-left: 1px solid var(--line); }
+.wf-seg button:hover { background: var(--surface-2); color: var(--text); }
+.wf-seg button.on { background: var(--green-soft); color: var(--green); font-weight: 600; }
+
+/* 后端拒了这张图：把理由放在图上方，同时标红对应卡片（见 .wf-step.bad）。
+   只给 toast 的话，滑走之后就不知道是哪一步了。 */
+.wf-def-err {
+  margin-bottom: 8px; padding: 8px 10px;
+  border: 1px solid var(--red-line); border-left: 3px solid var(--red);
+  border-radius: 8px; background: var(--red-soft);
+  color: #6d1d18; font-size: 12px; line-height: 1.6;
+}
+
+.wf-steps { display: flex; flex-direction: column; gap: 10px; }
+.wf-step {
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface); padding: 10px 12px 12px;
+}
+.wf-step.bad { border-color: var(--red-line); box-shadow: 0 0 0 3px var(--red-soft); }
+.wf-step.orphan { border-style: dashed; }
+.wf-step-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wf-step-no {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; flex: none;
+  border: 1px solid var(--line-soft); border-radius: 6px;
+  background: var(--surface-2); font: 600 11px var(--mono); color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+/* 带 `#wf-def-wrap` 前缀是必要的：全局的 `input[type="text"]` 是 (0,1,1)，
+   单个 class 的 (0,1,0) 压不住它，框会撑满整行、把同一行的按钮挤到下一行。 */
+#wf-def-wrap .wf-step-id { width: 150px; height: 28px; padding: 0 8px; font: 600 12px var(--mono); }
+.wf-kinds { margin-left: auto; }
+.wf-x {
+  width: 24px; height: 24px; flex: none; padding: 0;
+  border: 0; border-radius: 6px; background: transparent;
+  color: var(--faint); font-size: 15px; line-height: 1; cursor: pointer;
+}
+.wf-x:hover { background: var(--red-soft); color: var(--red); }
+
+.wf-step-body { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.wf-row { display: flex; align-items: center; gap: 8px; }
+.wf-row > label {
+  flex: none; width: 96px; display: flex; flex-direction: column;
+  font-size: 12px; color: var(--muted);
+}
+.wf-row > label .faint { font-size: 11px; }
+.wf-row input, .wf-row select { flex: 1; width: auto; height: 30px; font-size: 12px; }
+.wf-task textarea {
+  width: 100%; min-height: 62px; padding: 8px 10px;
+  font: 12.5px/1.65 var(--sans);
+}
+.wf-tokens { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 4px; }
+.wf-token {
+  padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface-2); font: 11px var(--mono); color: var(--text-2);
+  cursor: pointer;
+}
+.wf-token:hover { border-color: var(--green-line); color: var(--green); }
+
+/* 出口：顺序就是选边顺序。兜底固定最后一条，缺了就红着说缺。 */
+.wf-exits {
+  margin-top: 10px; padding-top: 9px;
+  border-top: 1px dashed var(--line);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.wf-exits-head {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 11.5px; font-weight: 600; color: var(--text-2);
+}
+.wf-exit { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.wf-exit input, .wf-exit select { height: 28px; font-size: 12px; }
+.wf-exit .wf-key { width: 110px; font-family: var(--mono); }
+.wf-exit select[data-part="op"] { width: 84px; }
+.wf-exit .wf-to { width: 130px; font-family: var(--mono); }
+.wf-exit [data-part="value"] { flex: 1 1 120px; width: auto; min-width: 90px; }
+.wf-exit-tag { font-size: 11.5px; color: var(--muted); }
+.wf-exit-note { font-size: 11px; color: var(--faint); }
+.wf-exit.fallback { color: var(--muted); }
+.wf-exit.missing {
+  padding: 7px 9px; border: 1px solid var(--red-line); border-radius: 8px;
+  background: var(--red-soft); color: var(--red); font-size: 12px; line-height: 1.6;
+}
+/* 第二条兜底：编译期会被拒，但得让人看见它存在、能删。 */
+.wf-exit.extra {
+  padding: 6px 8px; border: 1px dashed var(--red-line); border-radius: 8px;
+  background: var(--red-soft); color: var(--red);
+}
+.wf-exit.end { color: var(--muted); font-size: 12px; }
+.wf-exit.missing .btn, .wf-exit.end .btn { margin-left: auto; }
+.wf-add {
+  align-self: flex-start; padding: 3px 9px;
+  border: 1px dashed var(--line); border-radius: 8px; background: transparent;
+  font: inherit; font-size: 11.5px; color: var(--muted); cursor: pointer;
+}
+.wf-add:hover { border-color: var(--green-line); color: var(--green); }
+
+/* 并行：分支各自带 agent / task / emit，合成文本由引擎拼，界面不装懂。 */
+.wf-branches {
+  display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  border: 1px solid var(--line-soft); border-radius: 9px; background: var(--surface-2);
+}
+.wf-branch {
+  display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  border: 1px solid var(--line-soft); border-radius: 8px; background: var(--surface);
+}
+.wf-branch-head { display: flex; align-items: center; gap: 6px; }
+.wf-branch-head input, .wf-branch-head select { height: 28px; font-size: 12px; }
+#wf-def-wrap .wf-branch-id { width: 64px; flex: none; font: 600 12px var(--mono); }
+.wf-branch-head select { width: 150px; flex: none; }
+.wf-branch-head input:not(.wf-branch-id) { flex: 1; width: auto; }
+.wf-branch textarea { width: 100%; font: 12px/1.6 var(--sans); }
+
+/* 「输出与边界」：平时收起。关掉的是噪音，不是能力。 */
+.wf-more {
+  padding: 6px 10px; border: 1px solid var(--line-soft); border-radius: 9px;
+  background: var(--surface-2);
+}
+.wf-more summary { font-size: 11.5px; color: var(--muted); cursor: pointer; }
+.wf-more-body { display: flex; flex-direction: column; gap: 8px; padding: 8px 0 4px; }
+.wf-inputs {
+  display: flex; flex-direction: column; gap: 5px;
+  padding-top: 8px; border-top: 1px dashed var(--line);
+}
+.wf-inputs-head {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 11.5px; color: var(--muted);
+}
+.wf-input { display: flex; align-items: center; gap: 6px; }
+.wf-input input { height: 28px; font-size: 12px; }
+.wf-input input[data-part="name"] { width: 110px; flex: none; font-family: var(--mono); }
+.wf-input input[data-part="ref"] { flex: 1; width: auto; font-family: var(--mono); }
+
+.wf-orphans {
+  display: flex; flex-direction: column; gap: 8px; padding: 10px;
+  border: 1px dashed var(--amber-line); border-radius: 10px; background: var(--amber-soft);
+}
+.wf-orphans-head { font-size: 12px; line-height: 1.65; color: var(--amber); }
 
 .wf-runs { display: flex; flex-direction: column; gap: 6px; }
 .wf-run { border: 1px solid var(--line-soft); border-radius: 9px; overflow: hidden; }

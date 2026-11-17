@@ -157,6 +157,9 @@ async def test_save_rejects_broken_definition(client, seeded_identity):
     result = await _save(client, broken)
     assert result["status"] == 422
     assert result["body"]["detail"]["code"] == "WORKFLOW_NO_FALLBACK"
+    # 前端靠 `node` 把出错的那张卡片标红。少了它只能显示一句 message，
+    # 图一长就变成「自己去找哪一步」。
+    assert result["body"]["detail"]["node"] == "a"
 
 
 async def test_saved_workflow_is_listed_with_shape(client, seeded_identity):

@@ -154,7 +154,9 @@ async def save_workflow(
     except workflow_service.WorkflowError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": exc.code, "message": exc.message},
+            # `node` 让界面把出错的那张卡片标红；定位不到时是 null，前端退回
+            # 只显示这句 message，不会因此多一个分支。
+            detail={"code": exc.code, "message": exc.message, "node": exc.node},
         ) from exc
 
     summary = _summary(row, None)

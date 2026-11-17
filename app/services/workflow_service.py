@@ -51,12 +51,17 @@ PENDING_STATUSES = (WorkflowRunStatus.RUNNING, WorkflowRunStatus.PAUSED)
 
 
 class WorkflowError(Exception):
-    """配置层错误。`code` 给接口与前端分支，`message` 直接给人看。"""
+    """配置层错误。`code` 给接口与前端分支，`message` 直接给人看。
 
-    def __init__(self, code: str, message: str) -> None:
+    `node` 是编译期指出的那个节点 id（能定位时才填）。带上它，界面就能把
+    对应的那张卡片标红——「第几步错了」比「哪个 id 错了」好找得多。
+    """
+
+    def __init__(self, code: str, message: str, *, node: str | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.node = node
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +155,7 @@ async def save_workflow(
     try:
         plan = compile_definition(definition)
     except DefinitionError as exc:
-        raise WorkflowError(exc.code, exc.message) from exc
+        raise WorkflowError(exc.code, exc.message, node=exc.node) from exc
 
     compiled = plan.as_json()
 

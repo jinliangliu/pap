@@ -330,7 +330,10 @@ def _parse_node(item: Any) -> Node:
         )
 
     task = str(item.get("task") or "").strip()
-    if not task:
+    # 并行节点自己不执行任何任务——它下面每个分支各带 task，引擎也只渲染分支的。
+    # 所以这里不要求它写，写了也只当说明用。曾经的写法是「所有节点都要 task」，
+    # 结果是画图的人被要求填一段永远不执行的文字，而那段文字在运行记录里也看不到。
+    if not task and kind != KIND_PARALLEL:
         raise DefinitionError(
             "WORKFLOW_NO_TASK",
             f"节点「{node_id}」没有任务描述。",

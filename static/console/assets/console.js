@@ -11765,7 +11765,14 @@
     runs: [],
     /* 展开节点流水的 run id。同一条流水只展开一条：同时摊开三条没人看得下去。 */
     openRun: null,
-    form: null
+    form: null,
+    /* 图编辑器：谁可以当节点（下拉用）、当前视图、JSON 视图里还没解析的原文、
+       展开着的「输出与边界」、以及后端最近一次拒绝指到哪个节点。 */
+    agents: [],
+    defView: "steps",
+    defRaw: null,
+    defOpen: {},
+    defError: null
   };
 
   function wfChip(status) {
@@ -11911,12 +11918,1014 @@
       "</tbody></table></div>";
   }
 
+  /* ---------- 结构化的图编辑器 ----------
+   *
+   * 这一格原来是一个 JSON 文本框：能改，但「第三个节点之后分了两岔」在 JSON 里
+   * 看不出来，改错也要等保存才被后端拒。
+   *
+   * 这里给的是一张**步骤清单**，不是自由画布：PAP 的图只有「链 + 条件分叉 +
+   * 并行收集」三种形状，自由坐标不携带任何信息，却会让人以为节点可以随便连；
+   * 而后端只接受 DAG、必须有兜底边、不能有走不到的节点。
+   *
+   * 四条约定：
+   *   1. **前端不判这张图能不能存**。规则只有 `compile_definition` 一份；这里
+   *      只把 422 里的 `node` 指回那张卡片。抄一份规则进来，两套口径迟早打架。
+   *   2. **只改认识的键**，其余原样留在对象里：切回 JSON 不会丢字段。
+   *   3. **打字不重绘**。只有增删节点/分支/条件、换类型、换视图才重建 DOM——
+   *      每次输入都 innerHTML 一遍，光标会跳到行首。
+   *   4. 出口（next）写在卡片底部：条件行在前、兜底行固定最后。顺序就是选边
+   *      顺序，而「兜底写了却排在前面」正是后端要拒的那种图。
+   */
+
+  var WF_OPS = [
+    ["eq", "等于"],
+    ["neq", "不等于"],
+    ["in", "属于"],
+    ["gt", "大于"],
+    ["lt", "小于"]
+  ];
+
+  function wfDefClone(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function wfDef() {
+    var form = wfUI.form;
+    if (!form) return null;
+    var def = form.definition;
+    if (!def || typeof def !== "object" || Array.isArray(def)) {
+      def = {};
+      form.definition = def;
+    }
+    if (!Array.isArray(def.nodes)) def.nodes = [];
+    return def;
+  }
+
+  function wfNodeById(id) {
+    var nodes = wfDef() ? wfDef().nodes : [];
+    for (var i = 0; i < nodes.length; i += 1) {
+      if (nodes[i] && nodes[i].id === id) return nodes[i];
+    }
+    return null;
+  }
+
+  function wfFirstAgent() {
+    var list = wfUI.agents || [];
+    for (var i = 0; i < list.length; i += 1) {
+      if (list[i] && list[i].name) return list[i].name;
+    }
+    return "";
+  }
+
+  function wfNewNodeId() {
+    var used = {};
+    (wfDef().nodes || []).forEach(function (node) {
+      if (node && node.id) used[node.id] = true;
+    });
+    var n = 1;
+    while (used["step" + n]) n += 1;
+    return "step" + n;
+  }
+
+  /* 显示顺序 = 从入口沿边遍历的顺序。不按数组顺序：人在 JSON 里调换过节点
+     次序之后，页面看起来仍应是一条链——数组顺序对运行没有任何意义。 */
+  function wfChain(def) {
+    var nodes = (def && def.nodes) || [];
+    var byId = {};
+    nodes.forEach(function (node) {
+      if (node && node.id) byId[node.id] = node;
+    });
+
+    var seen = {};
+    var ids = [];
+    var queue = def && def.entry && byId[def.entry] ? [def.entry] : [];
+    while (queue.length) {
+      var id = queue.shift();
+      if (seen[id]) continue;
+      seen[id] = true;
+      ids.push(id);
+      var node = byId[id];
+      var edges = node && Array.isArray(node.next) ? node.next : [];
+      edges.forEach(function (edge) {
+        var to = edge && edge.to;
+        if (to && !seen[to]) queue.push(to);
+      });
+    }
+
+    var orphans = nodes.filter(function (node) {
+      return node && node.id && !seen[node.id];
+    }).map(function (node) { return node.id; });
+
+    return { ids: ids, orphans: orphans, byId: byId };
+  }
+
+  function wfTerminal(def) {
+    var chain = wfChain(def);
+    var last = null;
+    chain.ids.forEach(function (id) {
+      var node = chain.byId[id];
+      if (node && (!Array.isArray(node.next) || !node.next.length)) last = node;
+    });
+    return last;
+  }
+
+  function wfEmitKeys(def) {
+    var keys = [];
+    (def.nodes || []).forEach(function (node) {
+      if (!node) return;
+      var field = node.emit && node.emit.field;
+      if (field && keys.indexOf(field) < 0) keys.push(field);
+      (Array.isArray(node.branches) ? node.branches : []).forEach(function (branch) {
+        var bf = branch && branch.emit && branch.emit.field;
+        if (bf && keys.indexOf(bf) < 0) keys.push(bf);
+      });
+    });
+    return keys;
+  }
+
+  function wfRefs(def) {
+    var out = [];
+    (def.nodes || []).forEach(function (node) {
+      if (!node || !node.id) return;
+      out.push("$nodes." + node.id);
+      var field = node.emit && node.emit.field;
+      if (field) out.push("$nodes." + node.id + "." + field);
+    });
+    return out;
+  }
+
+  function wfAgentOptions(selected) {
+    var rows = ['<option value="">未指定</option>'];
+    var found = false;
+    (wfUI.agents || []).forEach(function (agent) {
+      var value = agent && agent.name;
+      if (!value) return;
+      if (value === selected) found = true;
+      rows.push('<option value="' + esc(value) + '"' + (value === selected ? " selected" : "") +
+        ">" + esc((agent.display_name || value) + " · " + value) + "</option>");
+    });
+    /* 清单里没有的名字照样要显示出来：它可能刚被改名，或者这份图来自别的租户。
+       静默丢成空值，保存时会把「ops」改成「未指定」，那是改坏了而不是没改。 */
+    if (selected && !found) {
+      rows.push('<option value="' + esc(selected) + '" selected>' +
+        esc(selected) + "（当前清单里没有）</option>");
+    }
+    return rows.join("");
+  }
+
+  function wfTargetSelect(node, selected, index) {
+    var rows = ['<option value="">选目标</option>'];
+    (wfDef().nodes || []).forEach(function (other) {
+      if (!other || !other.id || other.id === node.id) return;
+      rows.push('<option value="' + esc(other.id) + '"' +
+        (other.id === selected ? " selected" : "") + ">" + esc(other.id) + "</option>");
+    });
+    return '<select class="wf-to" data-node="' + esc(node.id) + '" data-edge="' +
+      index + '" data-part="to">' + rows.join("") + "</select>";
+  }
+
+  function wfValueInput(node, index, when) {
+    var op = when.op || "eq";
+    var value = when.value;
+    var text = "";
+    if (op === "in") {
+      text = Array.isArray(value) ? value.join("，") : (value == null ? "" : String(value));
+    } else if (value != null) {
+      text = String(value);
+    }
+    var common = 'data-node="' + esc(node.id) + '" data-edge="' + index + '" data-part="value"';
+
+    if (op === "in") {
+      return '<input type="text" ' + common + ' value="' + esc(text) + '"' +
+        ' placeholder="泄漏，超压（逗号分隔）">';
+    }
+    if (op === "gt" || op === "lt") {
+      return '<input type="number" step="any" ' + common + ' value="' + esc(text) + '" placeholder="数字">';
+    }
+    return '<input type="text" ' + common + ' value="' + esc(text) + '" placeholder="值">';
+  }
+
+  function wfCondRowHtml(node, edge, index) {
+    var when = edge.when || {};
+    var op = when.op || "eq";
+    var ops = WF_OPS.map(function (pair) {
+      return '<option value="' + pair[0] + '"' + (pair[0] === op ? " selected" : "") +
+        ">" + esc(pair[1]) + "</option>";
+    }).join("");
+
+    return '<div class="wf-exit">' +
+      '<span class="wf-exit-tag">当</span>' +
+      '<input class="wf-key" type="text" list="wf-keys" spellcheck="false" data-node="' + esc(node.id) +
+      '" data-edge="' + index + '" data-part="key" value="' + esc(when.key || "") + '" placeholder="键">' +
+      '<select data-node="' + esc(node.id) + '" data-edge="' + index + '" data-part="op">' + ops + "</select>" +
+      wfValueInput(node, index, when) +
+      '<span class="wf-exit-tag">→</span>' +
+      wfTargetSelect(node, edge.to, index) +
+      '<button class="wf-x" type="button" data-act="def-cond-del" data-node="' + esc(node.id) +
+      '" data-edge="' + index + '" title="删掉这条条件">×</button>' +
+      "</div>";
+  }
+
+  function wfFallbackRowHtml(node, edge, index, extra) {
+    return '<div class="wf-exit fallback' + (extra ? " extra" : "") + '">' +
+      '<span class="wf-exit-tag">' + (extra ? "多余的兜底" : "其余情况") + "</span>" +
+      '<span class="wf-exit-note">' + (extra
+        ? "一个节点只能有一条兜底，保存会被拒"
+        : "条件都不满足时走这里") + "</span>" +
+      '<span class="wf-exit-tag">→</span>' +
+      wfTargetSelect(node, edge.to, index) +
+      '<button class="wf-x" type="button" data-act="def-cond-del" data-node="' + esc(node.id) +
+      '" data-edge="' + index + '" title="删掉这条兜底（删完就没有兜底了）">×</button>' +
+      "</div>";
+  }
+
+  /* 按数据里的顺序画，不重排。两种「排错了」的图在编译期会被拒
+     （DUPLICATE_FALLBACK / FALLBACK_NOT_LAST），如果这里按好看的顺序显示，
+     人看着明明对、保存却报错——那条错误就变成了平台在刁难他。 */
+  function wfExitsHtml(node) {
+    var edges = Array.isArray(node.next) ? node.next : [];
+    var rows = [];
+    var firstFallback = -1;
+
+    edges.forEach(function (edge, index) {
+      if (!edge) return;
+      if (edge.when) {
+        rows.push(wfCondRowHtml(node, edge, index));
+        return;
+      }
+      var extra = firstFallback >= 0;
+      if (!extra) firstFallback = index;
+      rows.push(wfFallbackRowHtml(node, edge, index, extra));
+    });
+
+    var tail = "";
+    if (!edges.length) {
+      tail = '<div class="wf-exit end">终点：流程在这里结束。' +
+        '<button class="btn sm" type="button" data-act="def-fallback" data-node="' +
+        esc(node.id) + '">' + ico("plus") + "接下一步</button></div>";
+    } else if (firstFallback < 0) {
+      /* 缺兜底不是「还没配完」，而是这张图一定会卡死：条件全不命中时流程静默停住。
+         与其等保存被拒，不如在这里指着说。 */
+      tail = '<div class="wf-exit missing">缺兜底边：条件都不满足时流程会停在这一步，保存会被拒。' +
+        '<button class="btn sm" type="button" data-act="def-fallback" data-node="' +
+        esc(node.id) + '">' + ico("plus") + "补一条兜底</button></div>";
+    } else if (edges[edges.length - 1] && edges[edges.length - 1].when) {
+      // 兜底写在了条件前面：后面那些条件永远不会成立——「配了但不起作用」，
+      // 图上看着还都在。编译期同样拒，这里给个一键归位。
+      tail = '<div class="wf-exit missing">兜底边排在条件前面，后面的条件永远不会成立（保存会被拒）。' +
+        '<button class="btn sm" type="button" data-act="def-fallback-last" data-node="' +
+        esc(node.id) + '">移到末尾</button></div>';
+    }
+
+    return '<div class="wf-exits">' +
+      '<div class="wf-exits-head">下一步 <span class="faint">按顺序判断，命中即走</span></div>' +
+      rows.join("") + tail +
+      '<button class="wf-add" type="button" data-act="def-cond" data-node="' +
+      esc(node.id) + '">+ 条件分支</button>' +
+      "</div>";
+  }
+
+  function wfTokensHtml(node, def, branch) {
+    var chain = wfChain(def);
+    var index = chain.ids.indexOf(node.id);
+    var tokens = ["{{input.text}}", "{{upstream}}"];
+    chain.ids.slice(0, index < 0 ? 0 : index).forEach(function (id) {
+      var prev = chain.byId[id];
+      if (!prev) return;
+      tokens.push("{{nodes." + id + "}}");
+      var field = prev.emit && prev.emit.field;
+      if (field) tokens.push("{{nodes." + id + "." + field + "}}");
+    });
+
+    var branchAttr = branch ? ' data-branch="' + esc(branch) + '"' : "";
+    return '<div class="wf-tokens"><span class="faint">插入：</span>' +
+      tokens.map(function (token) {
+        return '<button class="wf-token" type="button" data-act="def-ins" data-node="' +
+          esc(node.id) + '"' + branchAttr + ' data-token="' + esc(token) + '">' +
+          esc(token) + "</button>";
+      }).join("") + "</div>";
+  }
+
+  function wfBranchesHtml(node, def) {
+    var branches = Array.isArray(node.branches) ? node.branches : [];
+    var cards = branches.map(function (branch) {
+      var bid = branch.id || "";
+      return '<div class="wf-branch">' +
+        '<div class="wf-branch-head">' +
+        '<input class="wf-branch-id" type="text" spellcheck="false" data-node="' + esc(node.id) +
+        '" data-branch="' + esc(bid) + '" data-field="id" value="' + esc(bid) + '" title="分支 id">' +
+        '<select data-node="' + esc(node.id) + '" data-branch="' + esc(bid) + '" data-field="agent">' +
+        wfAgentOptions(branch.agent || "") + "</select>" +
+        '<input type="text" spellcheck="false" data-node="' + esc(node.id) + '" data-branch="' + esc(bid) +
+        '" data-field="emit" value="' + esc((branch.emit && branch.emit.field) || "") +
+        '" title="这个分支的结论存到黑板的哪个字段（可空）" placeholder="存到黑板的字段（可空）">' +
+        '<button class="wf-x" type="button" data-act="def-branch-del" data-node="' + esc(node.id) +
+        '" data-branch="' + esc(bid) + '" title="删掉这个分支">×</button>' +
+        "</div>" +
+        '<textarea rows="2" data-node="' + esc(node.id) + '" data-branch="' + esc(bid) +
+        '" data-field="task" placeholder="这个分支要做什么">' + esc(branch.task || "") + "</textarea>" +
+        wfTokensHtml(node, def, bid) +
+        "</div>";
+    }).join("");
+
+    return '<div class="wf-branches">' + cards +
+      (branches.length >= 4
+        ? '<div class="faint">分支上限 4 个（数据库连接池与供应商速率限制）。</div>'
+        : '<button class="wf-add" type="button" data-act="def-branch-add" data-node="' +
+          esc(node.id) + '">+ 加一个分支</button>') +
+      "</div>";
+  }
+
+  function wfInputsHtml(node) {
+    var inputs = node.inputs && typeof node.inputs === "object" ? node.inputs : {};
+    var rows = Object.keys(inputs).map(function (name) {
+      return '<div class="wf-input">' +
+        '<input type="text" spellcheck="false" data-node="' + esc(node.id) + '" data-input="' + esc(name) +
+        '" data-part="name" value="' + esc(name) + '" title="键名">' +
+        '<span class="faint">←</span>' +
+        '<input type="text" spellcheck="false" list="wf-refs" data-node="' + esc(node.id) +
+        '" data-input="' + esc(name) + '" data-part="ref" value="' + esc(inputs[name] || "") +
+        '" placeholder="$nodes.classify.category">' +
+        '<button class="wf-x" type="button" data-act="def-input-del" data-node="' + esc(node.id) +
+        '" data-input="' + esc(name) + '" title="删掉这个入参">×</button>' +
+        "</div>";
+    }).join("");
+
+    return '<div class="wf-inputs"><div class="wf-inputs-head">显式入参' +
+      '<span class="faint">键必须在必经路径上出现过，否则保存会被拒</span></div>' + rows +
+      '<button class="wf-add" type="button" data-act="def-input-add" data-node="' +
+      esc(node.id) + '">+ 纳入参</button></div>';
+  }
+
+  function wfMoreHtml(node) {
+    var id = node.id;
+    var emit = node.emit && typeof node.emit === "object" ? node.emit : {};
+    var values = Array.isArray(emit.values) ? emit.values.join("，") : "";
+    var open = wfUI.defOpen["more:" + id] ? " open" : "";
+
+    return '<details class="wf-more" data-node="' + esc(id) + '"' + open + ">" +
+      "<summary>输出与边界</summary>" +
+      '<div class="wf-more-body">' +
+      '<div class="wf-row"><label>存到黑板的字段</label>' +
+      '<input type="text" spellcheck="false" data-node="' + esc(id) + '" data-field="emit.field" value="' +
+      esc(emit.field || "") + '" placeholder="category（下游用它判断）"></div>' +
+      '<div class="wf-row"><label>写入上限</label>' +
+      '<input type="number" min="1" max="8000" data-node="' + esc(id) + '" data-field="emit.chars" value="' +
+      esc(emit.max_chars == null ? "" : String(emit.max_chars)) + '" placeholder="2000（默认）"></div>' +
+      '<div class="wf-row"><label>枚举抽取</label>' +
+      '<input type="text" spellcheck="false" data-node="' + esc(id) + '" data-field="emit.values" value="' +
+      esc(values) + '" placeholder="正常，异常（逗号分隔）"></div>' +
+      '<div class="wf-row"><label>正则抽取</label>' +
+      '<input type="text" spellcheck="false" data-node="' + esc(id) + '" data-field="emit.pattern" value="' +
+      esc(emit.pattern || "") + '" placeholder="（与枚举二选一）"></div>' +
+      '<div class="wf-row"><label>失败时</label>' +
+      '<select data-node="' + esc(id) + '" data-field="on_error">' +
+      '<option value="fail"' + ((node.on_error || "fail") === "fail" ? " selected" : "") + ">整条流程失败</option>" +
+      '<option value="skip"' + (node.on_error === "skip" ? " selected" : "") + ">跳过这一步</option>" +
+      "</select></div>" +
+      wfInputsHtml(node) +
+      "</div></details>";
+  }
+
+  function wfStepHtml(node, def, index, orphan) {
+    var id = node.id || "";
+    var kind = node.kind || "agent";
+    var bad = wfUI.defError && wfUI.defError.node === id;
+    var body = [];
+
+    var kinds = ["agent", "compose", "parallel"].map(function (k) {
+      return '<button type="button" data-act="def-kind" data-node="' + esc(id) +
+        '" data-kind="' + k + '"' + (kind === k ? ' class="on"' : "") + ">" +
+        esc(WF_KIND[k]) + "</button>";
+    }).join("");
+
+    if (kind === "parallel") {
+      body.push(wfBranchesHtml(node, def));
+      body.push('<div class="wf-row"><label>说明' +
+        '<span class="faint">可选，不参与执行</span></label>' +
+        '<input type="text" spellcheck="false" data-node="' + esc(id) +
+        '" data-field="task" value="' + esc(node.task || "") + '" placeholder="给读图的人看的一句话"></div>');
+    } else {
+      if (kind === "agent") {
+        body.push('<div class="wf-row"><label>执行的智能体</label>' +
+          '<select data-node="' + esc(id) + '" data-field="agent">' +
+          wfAgentOptions(node.agent || "") + "</select></div>");
+      }
+      body.push('<div class="wf-task">' +
+        '<textarea rows="3" spellcheck="false" data-node="' + esc(id) + '" data-field="task" ' +
+        'placeholder="' + (kind === "compose" ? "把上游结论汇成一句话" : "这一步要它做什么") + '">' +
+        esc(node.task || "") + "</textarea>" +
+        wfTokensHtml(node, def) + "</div>");
+    }
+
+    body.push(wfMoreHtml(node));
+
+    return '<div class="wf-step' + (bad ? " bad" : "") + (orphan ? " orphan" : "") +
+      '" data-node="' + esc(id) + '">' +
+      '<div class="wf-step-head">' +
+      '<span class="wf-step-no">' + esc(String(index + 1)) + "</span>" +
+      '<input class="wf-step-id" type="text" spellcheck="false" data-node="' + esc(id) +
+      '" data-field="id" value="' + esc(id) + '" title="节点 id：改这里会同步所有指向它的边与模板引用">' +
+      '<span class="wf-seg wf-kinds">' + kinds + "</span>" +
+      '<button class="wf-x" type="button" data-act="def-del" data-node="' + esc(id) +
+      '" title="删除这一步">×</button>' +
+      "</div>" +
+      '<div class="wf-step-body">' + body.join("") + "</div>" +
+      wfExitsHtml(node) +
+      "</div>";
+  }
+
+  function wfDefHtml() {
+    var def = wfDef();
+    var chain = wfChain(def);
+    var steps = chain.ids.map(function (id, index) {
+      var node = chain.byId[id];
+      return node ? wfStepHtml(node, def, index, false) : "";
+    }).join("");
+
+    var orphans = chain.orphans.length
+      ? '<div class="wf-orphans">' +
+        '<div class="wf-orphans-head"><strong>未接入（' + esc(String(chain.orphans.length)) + '）</strong>' +
+        "从入口走不到，保存时会被拒。接到某一步的「下一步」里，或删掉。</div>" +
+        chain.orphans.map(function (id, index) {
+          var node = wfNodeById(id);
+          return node ? wfStepHtml(node, def, index, true) : "";
+        }).join("") + "</div>"
+      : "";
+
+    var entry = def.entry
+      ? '<span class="wf-def-entry">入口 <code>' + esc(def.entry) + "</code></span>"
+      : '<span class="wf-def-entry err">还没有入口</span>';
+
+    var views = [
+      ["steps", "步骤"],
+      ["json", "JSON"]
+    ].map(function (pair) {
+      return '<button type="button" data-act="def-view" data-view="' + pair[0] + '"' +
+        (wfUI.defView === pair[0] ? ' class="on"' : "") + ">" + pair[1] + "</button>";
+    }).join("");
+
+    var jsonValue = wfUI.defRaw != null
+      ? wfUI.defRaw
+      : JSON.stringify(wfUI.form.definition || {}, null, 2);
+
+    var error = wfUI.defError
+      ? '<div class="wf-def-err">' + esc(wfUI.defError.message) + "</div>"
+      : "";
+
+    return '<div class="wf-def-bar">' + entry +
+      '<label class="wf-def-max">最多 <input type="number" id="wf-max" min="1" max="20" ' +
+      'value="' + esc(def.max_nodes == null ? "" : String(def.max_nodes)) + '" ' +
+      'placeholder="12"> 步</label>' +
+      '<button class="btn sm" type="button" data-act="def-add">' + ico("plus") + "添加步骤</button>" +
+      '<span class="wf-seg wf-def-views">' + views + "</span>" +
+      "</div>" +
+      error +
+      '<div class="wf-steps"' + (wfUI.defView === "json" ? " hidden" : "") + ">" +
+      steps + orphans +
+      (chain.ids.length ? "" : '<div class="empty sm">这张图还没有步骤。点右上角「添加步骤」开始。</div>') +
+      "</div>" +
+      '<textarea class="wf-def" id="wf-def" spellcheck="false" rows="18"' +
+      (wfUI.defView === "json" ? "" : " hidden") + ">" + esc(jsonValue) + "</textarea>" +
+      '<datalist id="wf-keys">' + wfEmitKeys(def).map(function (key) {
+        return '<option value="' + esc(key) + '"></option>';
+      }).join("") + "</datalist>" +
+      '<datalist id="wf-refs">' + wfRefs(def).map(function (ref) {
+        return '<option value="' + esc(ref) + '"></option>';
+      }).join("") + "</datalist>";
+  }
+
+  function wfBindDetails(wrap) {
+    if (!wrap) return;
+    Array.prototype.forEach.call(wrap.querySelectorAll("details"), function (box) {
+      if (box.__wfBound) return;
+      box.__wfBound = true;
+      box.addEventListener("toggle", function () {
+        var id = box.getAttribute("data-node");
+        if (!id) return;
+        if (box.open) wfUI.defOpen["more:" + id] = true;
+        else delete wfUI.defOpen["more:" + id];
+      });
+    });
+  }
+
+  function wfDefPaint(root, focusNode) {
+    var wrap = $("#wf-def-wrap", root);
+    if (!wrap) return;
+    wrap.innerHTML = wfDefHtml();
+
+    // <details> 的展开状态不进 DOM 快照，重绘后要还原；toggle 不回填，
+    // 下一次重绘就又收起来了。
+    wfBindDetails(wrap);
+
+    if (focusNode) {
+      var card = wrap.querySelector('[data-node="' + focusNode + '"] textarea[data-field="task"]');
+      if (card) card.focus();
+    }
+  }
+
+  function wfSetEmit(node, key, value) {
+    var emit = node.emit && typeof node.emit === "object" ? node.emit : {};
+    if (value === undefined || value === "" || (Array.isArray(value) && !value.length)) {
+      delete emit[key];
+    } else {
+      emit[key] = value;
+    }
+    if (Object.keys(emit).length) node.emit = emit;
+    else delete node.emit;
+  }
+
+  function wfParseValue(op, raw) {
+    var text = String(raw == null ? "" : raw);
+    if (op === "in") {
+      return text.split(/[,，]/).map(function (item) {
+        return item.trim();
+      }).filter(Boolean);
+    }
+    if (op === "gt" || op === "lt") {
+      var trimmed = text.trim();
+      var num = Number(trimmed);
+      return trimmed !== "" && !isNaN(num) ? num : trimmed;
+    }
+    return text;
+  }
+
+  /* 改 id 要级联：边、入口、模板里的 `{{nodes.x}}`、入参里的 `$nodes.x`。
+     只改一半的后果是「名字改了，图还在指旧名字」，而这种图保存时会被拒，
+     理由说的是「指了不存在的节点」——很难联想到是自己刚改了 id。 */
+  function wfRenameNode(node, next) {
+    var def = wfDef();
+    var prev = node.id;
+    if (!next || next === prev) return 0;
+    if (!/^[a-z][a-z0-9_]{0,31}$/.test(next)) {
+      toast("节点 id 只能小写字母开头，后接小写字母、数字或下划线（最长 32）", "err");
+      return 0;
+    }
+    if (wfNodeById(next)) {
+      toast("节点 id「" + next + "」已经有人用了", "err");
+      return 0;
+    }
+
+    var touched = 0;
+    node.id = next;
+    if (def.entry === prev) def.entry = next;
+
+    (def.nodes || []).forEach(function (other) {
+      if (!other) return;
+      (Array.isArray(other.next) ? other.next : []).forEach(function (edge) {
+        if (edge && edge.to === prev) {
+          edge.to = next;
+          touched += 1;
+        }
+      });
+      var rewrites = [
+        ["{{nodes." + prev + "}}", "{{nodes." + next + "}}"],
+        ["{{nodes." + prev + ".", "{{nodes." + next + "."],
+        ["$nodes." + prev + ".", "$nodes." + next + "."],
+        ["$nodes." + prev, "$nodes." + next]
+      ];
+      var before = JSON.stringify(other);
+      rewrites.forEach(function (pair) {
+        other.task = String(other.task || "").split(pair[0]).join(pair[1]);
+        (Array.isArray(other.branches) ? other.branches : []).forEach(function (branch) {
+          if (branch) branch.task = String(branch.task || "").split(pair[0]).join(pair[1]);
+        });
+        if (other.inputs && typeof other.inputs === "object") {
+          Object.keys(other.inputs).forEach(function (name) {
+            other.inputs[name] = String(other.inputs[name] || "").split(pair[0]).join(pair[1]);
+          });
+        }
+      });
+      if (JSON.stringify(other) !== before) touched += 1;
+    });
+    return touched;
+  }
+
+  function wfCountRefs(id) {
+    var def = wfDef();
+    var needles = ["{{nodes." + id + "}}", "{{nodes." + id + ".", "$nodes." + id + ".", "$nodes." + id];
+    var hits = 0;
+    (def.nodes || []).forEach(function (node) {
+      if (!node) return;
+      var texts = [String(node.task || "")];
+      (Array.isArray(node.branches) ? node.branches : []).forEach(function (branch) {
+        if (branch) texts.push(String(branch.task || ""));
+      });
+      if (node.inputs && typeof node.inputs === "object") {
+        Object.keys(node.inputs).forEach(function (name) {
+          texts.push(String(node.inputs[name] || ""));
+        });
+      }
+      texts.forEach(function (text) {
+        needles.forEach(function (needle) {
+          hits += text.split(needle).length - 1;
+        });
+      });
+    });
+    return hits;
+  }
+
+  function wfInsertToken(target) {
+    var branch = target.getAttribute("data-branch");
+    var scope = branch ? target.closest(".wf-branch") : target.closest(".wf-step");
+    if (!scope) return;
+    var area = scope.querySelector("textarea[data-field='task']");
+    if (!area) return;
+    var token = target.getAttribute("data-token") || "";
+    var start = area.selectionStart == null ? area.value.length : area.selectionStart;
+    var end = area.selectionEnd == null ? start : area.selectionEnd;
+    area.value = area.value.slice(0, start) + token + area.value.slice(end);
+
+    var node = wfNodeById(scope.getAttribute("data-node"));
+    if (node) {
+      if (branch) {
+        var item = (Array.isArray(node.branches) ? node.branches : []).filter(function (b) {
+          return b && b.id === branch;
+        })[0];
+        if (item) item.task = area.value;
+      } else {
+        node.task = area.value;
+      }
+    }
+
+    area.focus();
+    area.selectionStart = area.selectionEnd = start + token.length;
+  }
+
+  function wfDefInput(el, root) {
+    if (!el.closest || !el.closest("#wf-def-wrap")) return;
+
+    if (el.id === "wf-def") {
+      wfUI.defRaw = el.value;
+      return;
+    }
+
+    var def = wfDef();
+    if (!def) return;
+
+    if (el.id === "wf-max") {
+      var limit = parseInt(el.value, 10);
+      if (isNaN(limit)) delete def.max_nodes;
+      else def.max_nodes = limit;
+      return;
+    }
+
+    var nodeId = el.getAttribute("data-node");
+    var node = nodeId ? wfNodeById(nodeId) : null;
+    if (!node) return;
+
+    var field = el.getAttribute("data-field");
+    var branchId = el.getAttribute("data-branch");
+    var edgeIndex = el.getAttribute("data-edge");
+    var inputName = el.getAttribute("data-input");
+    var part = el.getAttribute("data-part");
+
+    if (branchId != null) {
+      var branch = (Array.isArray(node.branches) ? node.branches : []).filter(function (item) {
+        return item && item.id === branchId;
+      })[0];
+      if (!branch) return;
+      if (field === "task") branch.task = el.value;
+      else if (field === "agent") branch.agent = el.value;
+      else if (field === "emit") {
+        if (el.value.trim()) branch.emit = { field: el.value.trim() };
+        else delete branch.emit;
+      }
+      return;
+    }
+
+    if (inputName != null) {
+      if (part === "ref") {
+        node.inputs = node.inputs || {};
+        node.inputs[inputName] = el.value;
+      }
+      return;
+    }
+
+    if (edgeIndex != null) {
+      var edges = Array.isArray(node.next) ? node.next : (node.next = []);
+      var edge = edges[Number(edgeIndex)];
+      if (!edge) return;
+      if (part === "to") edge.to = el.value;
+      else if (part === "key") {
+        edge.when = edge.when || { key: "", op: "eq", value: "" };
+        edge.when.key = el.value;
+      } else if (part === "value") {
+        edge.when = edge.when || { key: "", op: "eq", value: "" };
+        edge.when.value = wfParseValue(edge.when.op || "eq", el.value);
+      }
+      return;
+    }
+
+    if (field === "task") { node.task = el.value; return; }
+    if (field === "agent") { node.agent = el.value; return; }
+    if (field === "on_error") { node.on_error = el.value; return; }
+    if (field === "emit.field") { wfSetEmit(node, "field", el.value.trim()); return; }
+    if (field === "emit.chars") {
+      var chars = parseInt(el.value, 10);
+      wfSetEmit(node, "max_chars", isNaN(chars) ? undefined : chars);
+      return;
+    }
+    if (field === "emit.values") {
+      var list = el.value.split(/[,，]/).map(function (item) {
+        return item.trim();
+      }).filter(Boolean);
+      wfSetEmit(node, "values", list);
+      /* 枚举与正则互斥（后端会拒）。在这里互相清掉，比让人读一条 422 再回来改成
+         「原来两个都填了」要快；判定仍然是后端那份。 */
+      if (list.length && node.emit && node.emit.pattern) {
+        delete node.emit.pattern;
+        toast("已清空正则抽取：枚举与正则只能留一个");
+        wfDefPaint(root);
+      }
+      return;
+    }
+    if (field === "emit.pattern") {
+      var pattern = el.value.trim();
+      wfSetEmit(node, "pattern", pattern);
+      if (pattern && node.emit && Array.isArray(node.emit.values) && node.emit.values.length) {
+        delete node.emit.values;
+        toast("已清空枚举抽取：枚举与正则只能留一个");
+        wfDefPaint(root);
+      }
+    }
+  }
+
+  function wfDefChange(el, root) {
+    if (!el.closest || !el.closest("#wf-def-wrap")) return;
+
+    var nodeId = el.getAttribute("data-node");
+    var node = nodeId ? wfNodeById(nodeId) : null;
+    if (!node) return;
+
+    var field = el.getAttribute("data-field");
+    var branchId = el.getAttribute("data-branch");
+    var edgeIndex = el.getAttribute("data-edge");
+    var inputName = el.getAttribute("data-input");
+    var part = el.getAttribute("data-part");
+
+    if (part === "to" && edgeIndex != null) {
+      // 改了目标，链的遍历顺序就变了：第几步、谁是终点、后面谁排前面全不一样。
+      // 不重绘的话页面还按旧顺序堆着，编号和「终点」标记都是错的。
+      wfDefPaint(root);
+      return;
+    }
+
+    if (part === "op" && edgeIndex != null) {
+      var edges = Array.isArray(node.next) ? node.next : [];
+      var edge = edges[Number(edgeIndex)];
+      if (edge && edge.when) {
+        edge.when.op = el.value;
+        // 值控件随算子变（in 要数组、gt/lt 要数字），只有重绘能换掉它。
+        if (el.value === "in") edge.when.value = [];
+        else if (el.value === "gt" || el.value === "lt") edge.when.value = 0;
+        else edge.when.value = "";
+        wfDefPaint(root);
+      }
+      return;
+    }
+
+    if (branchId != null && field === "id") {
+      var branch = (Array.isArray(node.branches) ? node.branches : []).filter(function (item) {
+        return item && item.id === branchId;
+      })[0];
+      if (!branch) return;
+      var bid = el.value.trim();
+      if (!/^[a-z][a-z0-9_]{0,31}$/.test(bid)) {
+        toast("分支 id 也只能小写字母开头", "err");
+        wfDefPaint(root);
+        return;
+      }
+      branch.id = bid;
+      wfDefPaint(root);
+      return;
+    }
+
+    if (inputName != null && part === "name") {
+      var next = el.value.trim();
+      var inputs = node.inputs || {};
+      if (!next || !/^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(next) || inputs[next] != null) {
+        toast("入参键不合法或已存在", "err");
+        wfDefPaint(root);
+        return;
+      }
+      inputs[next] = inputs[inputName];
+      delete inputs[inputName];
+      node.task = String(node.task || "").split("{{inputs." + inputName + "}}")
+        .join("{{inputs." + next + "}}");
+      wfDefPaint(root);
+      return;
+    }
+
+    if (field === "id") {
+      var moved = wfRenameNode(node, el.value.trim());
+      wfDefPaint(root);
+      if (moved) toast("已同步 " + moved + " 处引用");
+      return;
+    }
+  }
+
+  function wfAddStep(root) {
+    var def = wfDef();
+    var id = wfNewNodeId();
+    var terminal = wfTerminal(def);
+    def.nodes.push({ id: id, agent: wfFirstAgent(), task: "" });
+
+    /* 「加一步」的唯一含义是接在末尾。让人先加一个孤立节点再自己去连线，
+       等于把「这个节点现在还跑不到」这条错误留给保存那一刻。 */
+    if (!def.entry) def.entry = id;
+    else if (terminal) {
+      terminal.next = Array.isArray(terminal.next) ? terminal.next : [];
+      terminal.next.push({ when: null, to: id });
+    } else {
+      toast("这张图没有终点（每一步都有出口），新步骤先放在「未接入」里，需要手动连线", "err");
+    }
+    return id;
+  }
+
+  function wfDeleteStep(root, id) {
+    var def = wfDef();
+    var refs = wfCountRefs(id);
+    def.nodes = (def.nodes || []).filter(function (node) {
+      return !node || node.id !== id;
+    });
+    (def.nodes || []).forEach(function (node) {
+      if (!node || !Array.isArray(node.next)) return;
+      node.next = node.next.filter(function (edge) {
+        return !edge || edge.to !== id;
+      });
+    });
+    if (def.entry === id) def.entry = def.nodes.length ? (def.nodes[0].id || "") : "";
+    if (refs) {
+      toast("已删除，但还有 " + refs + " 处模板在引用 {{nodes." + id + "}}，保存会被拒", "err");
+    }
+  }
+
+  function wfSwitchKind(node, kind) {
+    if (!node || !kind || (node.kind || "agent") === kind) return;
+    if (kind === "parallel") {
+      if (!Array.isArray(node.branches) || !node.branches.length) {
+        node.branches = [
+          { id: "a", agent: wfFirstAgent(), task: "" },
+          { id: "b", agent: wfFirstAgent(), task: "" }
+        ];
+      }
+      delete node.agent;
+    } else {
+      delete node.branches;
+      if (kind === "compose") delete node.agent;
+      else if (!node.agent) node.agent = wfFirstAgent();
+    }
+    if (kind === "agent") delete node.kind;
+    else node.kind = kind;
+  }
+
+  function wfAddCondition(node) {
+    var edges = Array.isArray(node.next) ? node.next.slice() : [];
+    var conds = edges.filter(function (edge) { return edge && edge.when; });
+    var fallbacks = edges.filter(function (edge) { return edge && !edge.when; });
+    // 新条件必须插在兜底之前：兜底排前面会让后面所有条件永远不成立。
+    // 多余的第二条兜底保留着不动（显示上单独标出来），悄悄删掉等于替人改图。
+    conds.push({
+      when: { key: "", op: "eq", value: "" },
+      to: fallbacks.length ? fallbacks[0].to : ""
+    });
+    node.next = conds.concat(fallbacks);
+  }
+
+  function wfDefAction(act, target, root) {
+    var def = wfDef();
+    if (!def) return;
+
+    var nodeId = target.getAttribute("data-node");
+    var node = nodeId ? wfNodeById(nodeId) : null;
+
+    if (act === "def-view") {
+      var view = target.getAttribute("data-view");
+      if (view === wfUI.defView) return;
+      if (view === "steps") {
+        var area = $("#wf-def", root);
+        var raw = area ? area.value : (wfUI.defRaw || "");
+        var parsed = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (e) {
+          toast("JSON 不成立：" + e.message + "，改好再切回步骤", "err");
+          return;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          toast("图的顶层必须是一个对象", "err");
+          return;
+        }
+        wfUI.form.definition = parsed;
+        wfUI.defRaw = null;
+      } else {
+        wfUI.defRaw = JSON.stringify(wfUI.form.definition || {}, null, 2);
+      }
+      wfUI.defView = view;
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-add") {
+      var added = wfAddStep(root);
+      wfDefPaint(root, added);
+      return;
+    }
+
+    if (act === "def-del") {
+      wfDeleteStep(root, nodeId);
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-kind") {
+      wfSwitchKind(node, target.getAttribute("data-kind"));
+      wfDefPaint(root);
+      return;
+    }
+
+    if (!node) return;
+
+    if (act === "def-cond") {
+      wfAddCondition(node);
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-cond-del") {
+      var index = Number(target.getAttribute("data-edge"));
+      if (Array.isArray(node.next)) node.next.splice(index, 1);
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-fallback") {
+      node.next = Array.isArray(node.next) ? node.next : [];
+      if (!node.next.some(function (edge) { return edge && !edge.when; })) {
+        node.next.push({ when: null, to: "" });
+      }
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-fallback-last") {
+      var ordered = Array.isArray(node.next) ? node.next : [];
+      node.next = ordered.filter(function (edge) { return !edge || edge.when; })
+        .concat(ordered.filter(function (edge) { return edge && !edge.when; }));
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-branch-add") {
+      node.branches = Array.isArray(node.branches) ? node.branches : [];
+      if (node.branches.length >= 4) { toast("并行分支最多 4 个", "err"); return; }
+      var used = {};
+      node.branches.forEach(function (branch) { if (branch && branch.id) used[branch.id] = true; });
+      var letter = "abcdefgh";
+      var bid = "";
+      for (var i = 0; i < letter.length; i += 1) {
+        if (!used[letter[i]]) { bid = letter[i]; break; }
+      }
+      node.branches.push({ id: bid || "b" + node.branches.length, agent: wfFirstAgent(), task: "" });
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-branch-del") {
+      var dropBranch = target.getAttribute("data-branch");
+      node.branches = (Array.isArray(node.branches) ? node.branches : []).filter(function (branch) {
+        return !branch || branch.id !== dropBranch;
+      });
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-input-add") {
+      node.inputs = node.inputs && typeof node.inputs === "object" ? node.inputs : {};
+      var name = "in1";
+      var n = 1;
+      while (node.inputs[name] != null) { n += 1; name = "in" + n; }
+      node.inputs[name] = "";
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-input-del") {
+      var dropInput = target.getAttribute("data-input");
+      if (node.inputs && node.inputs[dropInput] != null) delete node.inputs[dropInput];
+      wfDefPaint(root);
+      return;
+    }
+
+    if (act === "def-ins") wfInsertToken(target);
+  }
+
   function wfFormHtml() {
     var form = wfUI.form;
     if (!form) return "";
 
     var editing = form.mode === "edit";
-    var def = editing ? form.definition : WF_TEMPLATE;
 
     return '<div class="card wf-form">' +
       cardHead(editing ? "编辑流程" : "新建流程", "share",
@@ -11932,9 +12941,9 @@
       '<div class="field"><label>一句话说明</label>' +
       '<input type="text" id="wf-desc" value="' + esc(form.description || "") +
       '" placeholder="分类 → 排查 → 汇总"></div>' +
-      '<div class="field"><label>图（保存即编译：没兜底边、有环、引用不可达节点都会被当场拒绝）</label>' +
-      '<textarea id="wf-def" class="wf-def" spellcheck="false" rows="14">' +
-      esc(JSON.stringify(def, null, 2)) + "</textarea></div>" +
+      '<div class="field"><label>图' +
+      '<span class="faint">保存即编译：没兜底边、有环、引用走不到的节点都会被当场拒绝</span></label>' +
+      '<div id="wf-def-wrap">' + wfDefHtml() + "</div></div>" +
       '<div class="actions">' +
       '<button class="btn primary" type="button" data-act="form-save">' + ico("save") + "保存</button>" +
       '<button class="btn" type="button" data-act="form-template">' + ico("code") + "填入模板</button>" +
@@ -11958,6 +12967,7 @@
       if (form.getAttribute("data-key") !== key) {
         form.setAttribute("data-key", key);
         form.innerHTML = wfFormHtml();
+        wfBindDetails($("#wf-def-wrap", root));
       }
     }
 
@@ -11973,6 +12983,11 @@
     wfUI.runsOf = null;
     wfUI.runs = [];
     wfUI.openRun = null;
+    wfUI.defView = "steps";
+    wfUI.defRaw = null;
+    wfUI.defOpen = {};
+    wfUI.defError = null;
+    wfLoadWorkflowAgents();
 
     root.innerHTML = pageHead({
       eyebrow: PAGES.workflows.eyebrow,
@@ -12001,10 +13016,31 @@
     $("#wf-refresh").addEventListener("click", function () { loadWorkflows(root); });
     $("#wf-new").addEventListener("click", function () {
       if (!wfUI.canManage) { toast("缺少 agent:write 权限", "err"); return; }
-      wfUI.form = { mode: "new", name: "", display_name: "", description: "" };
+      wfUI.form = {
+        mode: "new",
+        name: "",
+        display_name: "",
+        description: "",
+        // 模板必须克隆：直接引 WF_TEMPLATE 的话，编辑一轮就把常量改掉了，
+        // 同一页面里「关闭再新建」拿到的是一张被改过的图。
+        definition: wfDefClone(WF_TEMPLATE)
+      };
+      wfUI.defView = "steps";
+      wfUI.defRaw = null;
+      wfUI.defOpen = {};
+      wfUI.defError = null;
       renderWorkflows(root);
       var name = $("#wf-name", root);
       if (name) name.focus();
+    });
+
+    /* 图编辑器是逐字段编辑：打字走 input（不重绘），换算子/改 id 走 change
+       （要重绘，因为值的控件类型会变）。两件事分开挂，避免输入时重建 DOM。 */
+    $("#wf-ui", root).addEventListener("input", function (event) {
+      wfDefInput(event.target, root);
+    });
+    $("#wf-ui", root).addEventListener("change", function (event) {
+      wfDefChange(event.target, root);
     });
 
     $("#wf-ui", root).addEventListener("click", function (event) {
@@ -12014,6 +13050,18 @@
     });
 
     loadWorkflows(root);
+  }
+
+  /* 节点下拉要的是「能把活转交给谁」的清单。读不到就空着：这时下拉只有
+     「未指定」，已有的名字不会被抹掉（不在清单里的值会单独列出来）。 */
+  async function wfLoadWorkflowAgents() {
+    try {
+      var data = await api("/api/v1/agents");
+      wfUI.agents = (data && data.items) || [];
+    } catch (e) {
+      wfUI.agents = [];
+    }
+    if (wfUI.form) wfDefPaint(document);
   }
 
   async function loadWorkflows(root) {
@@ -12076,8 +13124,20 @@
     }
 
     if (act === "form-template") {
-      var area = $("#wf-def", root);
-      if (area) area.value = JSON.stringify(WF_TEMPLATE, null, 2);
+      // 「填入模板」现在是重置整张图，不再往文本框里塞一段 JSON：
+      // 两种视图下都能用，且重置后光标停在第一步上。
+      var confirmText = "把当前的图换成内置模板？已改的内容会被覆盖。";
+      if (!window.confirm(confirmText)) return;
+      wfUI.form.definition = wfDefClone(WF_TEMPLATE);
+      wfUI.defRaw = null;
+      wfUI.defError = null;
+      if (wfUI.defView === "steps") wfDefPaint(root, "classify");
+      else wfDefPaint(root);
+      return;
+    }
+
+    if (act.indexOf("def-") === 0) {
+      wfDefAction(act, target, root);
       return;
     }
 
@@ -12119,6 +13179,10 @@
           description: detail.description || "",
           definition: detail.definition || {}
         };
+        wfUI.defView = "steps";
+        wfUI.defRaw = null;
+        wfUI.defOpen = {};
+        wfUI.defError = null;
         renderWorkflows(root);
         var slot = $("#wf-form-slot", root);
         if (slot) slot.scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -12172,28 +13236,43 @@
     if (!payload.name) { toast("请填写标识", "err"); return; }
     if (!payload.display_name) { toast("请填写显示名", "err"); return; }
 
-    // 先在本地解一次 JSON：语法错误在这里说「第几行」，比服务端一句
-    // 「422 Unprocessable Entity」有用得多。
-    var raw = $("#wf-def", root).value;
-    try {
-      payload.definition = JSON.parse(raw);
-    } catch (e) {
-      toast("图的 JSON 不成立：" + e.message, "err");
-      return;
+    /* 两种视图取值：JSON 视图以文本框为准（可能还没同步回对象），
+       步骤视图直接取对象。解析失败仍然在这里说「第几行」——比服务端一句
+       422 有用得多。 */
+    if (wfUI.defView === "json") {
+      var area = $("#wf-def", root);
+      var raw = area ? area.value : (wfUI.defRaw || "");
+      try {
+        payload.definition = JSON.parse(raw);
+      } catch (e) {
+        toast("图的 JSON 不成立：" + e.message, "err");
+        return;
+      }
+    } else {
+      payload.definition = wfUI.form.definition;
     }
 
     try {
       await api("/api/v1/workflows", { method: "POST", body: payload });
       toast(editing ? "已保存（修订号 +1）" : "已创建");
       wfUI.form = null;
+      wfUI.defError = null;
       await loadWorkflows(root);
     } catch (e) {
-      /* 保存即编译：422 里带着 {code, message}，那是给人照着改的一句话，
-         直接显示比翻文档快。 */
+      /* 保存即编译：422 里带着 {code, message, node}。message 是给人照着改的
+         一句话，node 用来把那张卡片标红——「第几步」比「哪个 id」好找。 */
       var detail = e.payload && e.payload.detail;
       var msg = detail && detail.message
         ? detail.code + "：" + detail.message
         : errText(e);
+      wfUI.defError = { node: (detail && detail.node) || "", message: msg };
+      if (wfUI.defView === "steps") {
+        wfDefPaint(root);
+        var bad = wfUI.defError.node
+          ? $("#wf-def-wrap [data-node='" + wfUI.defError.node + "']", root)
+          : null;
+        if (bad) bad.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
       toast("这张图跑不了 —— " + msg, "err");
     }
   }

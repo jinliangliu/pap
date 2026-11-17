@@ -361,6 +361,32 @@ async def test_persist_is_called_before_each_node():
     assert saved == ["classify", "diagnose", "answer"]
 
 
+def test_parallel_node_needs_no_task_of_its_own():
+    """并行节点自己不执行任何东西，不要求它写 task。
+
+    它下面每个分支各带 task，引擎也只渲染分支的；要求一段永远不执行的文字，
+    只会让画图的人多填一格，而这段文字在运行记录里也看不到。
+    """
+    plan = compile_definition(
+        {
+            "entry": "collect",
+            "nodes": [
+                {
+                    "id": "collect",
+                    "kind": "parallel",
+                    "branches": [
+                        {"id": "a", "agent": "ops", "task": "查一号泵", "emit": {"field": "a"}},
+                        {"id": "b", "agent": "ops", "task": "查二号泵", "emit": {"field": "b"}},
+                    ],
+                    "next": [],
+                }
+            ],
+        }
+    )
+    assert plan.node("collect").task == ""
+    assert [b.id for b in plan.node("collect").branches] == ["a", "b"]
+
+
 def test_missing_fallback_is_rejected_at_compile_time():
     """没有兜底边 → 保存时就拒。跑到那里才停的流程，在用户看来是「点了没反应」。"""
     from app.orchestration.definition import DefinitionError
