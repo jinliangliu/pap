@@ -212,6 +212,12 @@ class Settings(BaseSettings):
     knowledge_rerank_enabled: bool = True
     knowledge_rerank_candidates: int = 12
     knowledge_rerank_timeout_seconds: float = 8.0
+    # 答复归纳：命中片段后由 chat 模型整理成「一句一事」的答复，
+    # 而不是把前 top_k 条切片原样拼给用户。关掉它（False）就回到
+    # 「原文摘录」——同一次检索，只是不做表述整理。
+    # 归纳失败（超时、未配模型、一个引用都没标）自动回落到摘录，不会变成空答复。
+    knowledge_summary_enabled: bool = True
+    knowledge_summary_timeout_seconds: float = 20.0
     # 字段加权：把标题 / section 的分词重复若干次并入 BM25 索引。
     # 原先只索引正文，标题里的词（尤其无标题文档的唯一语义标签）完全不参与召回；
     # 这不等价于向量检索，只是把已有的结构化元数据用起来。0 = 回到只索引正文。

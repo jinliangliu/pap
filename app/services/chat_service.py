@@ -705,6 +705,19 @@ class ChatService:
         # 追问项跟着消息一起入库：刷新会话后卡片要能原样回来。
         # 只放在响应里的话，用户一刷新就只剩「请在下面选择…」这句没有选项的话。
         clarify = (result.get("response_metadata") or {}).get("clarify")
+        # 这次真正送进检索的那句话。规划器做的最小改写用户看不见，
+        # 而「对话命中 A、检索验证页命中 B」正是从这里开始分叉的——
+        # 落库后验证页才能拿它复跑，不必去翻 checkpoint。
+        knowledge_query = (result.get("response_metadata") or {}).get("knowledge_query")
+        # 这条答复是归纳出来的还是原样摘的。同一句「切断阀有何作用」在
+        # 开关切换前后措辞不同，没有这个字段就只能猜；它同时是
+        # 「归纳失败回落了几次」的唯一留存（日志会轮转）。
+        knowledge_mode = (result.get("response_metadata") or {}).get(
+            "knowledge_answer_mode"
+        )
+        knowledge_fallback = (result.get("response_metadata") or {}).get(
+            "knowledge_answer_fallback"
+        )
 
         async with span("persist.assistant_message", "db", attrs={"table": "messages"}):
             async with async_session_factory() as session:
@@ -722,6 +735,13 @@ class ChatService:
                             # 只放在响应里的话，这一轮过去就再也找不回来了。
                             **({"ocr_text": ocr_text} if ocr_text else {}),
                             **({"clarify": clarify} if clarify else {}),
+                            **({"knowledge_query": knowledge_query} if knowledge_query else {}),
+                            **({"knowledge_answer_mode": knowledge_mode} if knowledge_mode else {}),
+                            **(
+                                {"knowledge_answer_fallback": knowledge_fallback}
+                                if knowledge_fallback
+                                else {}
+                            ),
                         },
                     )
 

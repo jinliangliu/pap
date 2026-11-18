@@ -38,6 +38,7 @@ from app.agents.slots import (
 from app.agents.state import AgentState
 from app.core.config import settings
 from app.db.session import async_session_factory
+from app.knowledge.compose import ComposeResult, compose_answer
 from app.knowledge.service import answer_from_knowledge
 from app.models.conversation import RunStatus
 from app.observability.callbacks import stash_usage_for_run
@@ -1252,9 +1253,29 @@ async def retrieve_knowledge(state: AgentState) -> dict[str, Any]:
         user_id=state.get("user_id", ""),
     )
 
+    # 检索已经决定了「哪几段」，这里再决定「怎么讲」。
+    # 归纳失败时 answer.answer 仍是原文摘录拼接——与加这一步之前完全一致，
+    # 所以知识问答不会因为模型侧的问题变成空答复。
+    composed = ComposeResult()
+    if answer.documents:
+        composed = await compose_answer(query=query, documents=answer.documents)
+
+    text = composed.text or answer.answer
+    mode = "summary" if composed.text else "excerpt"
+
+    metadata: dict[str, Any] = {"citation_count": len(answer.citations)}
+    if query:
+        metadata["knowledge_query"] = query
+    if answer.documents:
+        # 只给排查用：「这条答复是归纳出来的，还是原样摘的」。
+        # 界面上不显示，翻库和看日志时才需要它解释「措辞为什么不一样」。
+        metadata["knowledge_answer_mode"] = mode
+        if composed.meta.fallback:
+            metadata["knowledge_answer_fallback"] = composed.meta.fallback
+
     return {
         "intent": "knowledge",
-        "final_response": answer.answer,
+        "final_response": text,
         "citations": answer.citations,
         "retrieved_documents": [
             {
@@ -1264,7 +1285,10 @@ async def retrieve_knowledge(state: AgentState) -> dict[str, Any]:
             }
             for document in answer.documents
         ],
-        "response_metadata": {"citation_count": len(answer.citations)},
+        # 把真正送进检索的那句话带出来：规划器会做最小改写，
+        # 用户看到的却是自己那句原话。两者不一致时（对话命中 A、验证页
+        # 命中 B）只能靠这个字段自查，否则只能去翻 checkpoint。
+        "response_metadata": metadata,
         "error_category": None if answer.found else "knowledge_not_found",
     }
 

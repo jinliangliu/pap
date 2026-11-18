@@ -1300,8 +1300,35 @@ pre.code {
 }
 .ocr-fold .pg { color: var(--green); font-weight: 600; }
 
-.cites { margin: 7px 0 0; padding-left: 16px; font-size: 11.5px; color: var(--muted); }
+/* 引用列表带编号：正文里的 [n] 指的就是这里的第 n 条。
+   用编号而不是默认圆点，因为「哪条对应哪个结论」是要被核对的，
+   圆点不给位置。 */
+.cites {
+  margin: 7px 0 0;
+  padding-left: 0;
+  list-style: none;
+  font-size: 11.5px;
+  color: var(--muted);
+}
 .cites li { margin: 2px 0; }
+.cites .cite-no {
+  display: inline-block;
+  min-width: 22px;
+  font-family: var(--mono);
+  color: var(--faint);
+  /* 写死的编号不该被 text-align 带跑，也不该在窄栏里换行 */
+  white-space: nowrap;
+}
+
+/* 「实际检索词」贴在引用上方：它解释的是下面这批引用为什么是这几条。
+   比正文淡一档，因为它不是结论，是给核对用的凭据。 */
+.msg .query-line {
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--faint);
+  word-break: break-all;
+}
+.msg .query-line .mono { font-family: var(--mono); font-size: inherit; }
 
 /* ---------------- 追问卡片（radio 选择） ----------------
  *
@@ -2455,6 +2482,44 @@ body.lb-open { overflow: hidden; }
   border-radius: 6px;
   background: #fff;
 }
+
+/* ---- 会话行的「更多」菜单 ----
+   一行只放一个 ⋯：重命名与删除常驻在标题右边时，列表里每条标题都被提前截断，
+   而这两个动作一天用不到一次。fixed 的坐标由 JS 给（列表有 overflow，absolute 会被裁）。 */
+.conv-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 132px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: 0 12px 30px rgba(16, 24, 20, .16);
+}
+.conv-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.conv-menu-item:hover { background: #f1f3f1; color: var(--text); }
+.conv-menu-item svg { width: 14px; height: 14px; flex: none; opacity: .75; }
+.conv-menu-item.danger { color: var(--red); }
+.conv-menu-item.danger:hover { background: rgba(168, 39, 31, .07); }
+.conv-menu-item.danger svg { opacity: .9; }
+/* 当前会话那一行不必等悬停：⋯ 是它唯一可见的「更多」，藏起来等于没有。 */
+.conv-item.active .icon-btn { opacity: .55; }
+.conv-item.active .icon-btn:hover { opacity: 1; }
+.conv-item .conv-more .ico { width: 14px; height: 14px; }
 
 .icon-btn {
   display: inline-grid;
@@ -5643,6 +5708,15 @@ body.lb-open { overflow: hidden; }
   background: var(--surface); color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
 }
 .fb-btn:hover { color: var(--text); border-color: #d2d7d3; background: var(--surface-2); }
+/* 投票的两个按钮只有图标：做成等宽方块，两个拇指才左右对称；
+   名字留给 title 与 aria-label，屏幕阅读器读到的是「这条回答有用」而不是「赞」。 */
+.fb-btn.fb-vote {
+  width: 28px; height: 28px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.fb-vote .ico { width: 16px; height: 16px; }
+/* 「踩」是同一枚拇指转 180°：手掌朝下、拇指朝下，正是它的镜像。 */
+.fb-vote.down .ico { transform: rotate(180deg); }
 .fb-reasons { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .fb-reasons[hidden] { display: none !important; }
 .fb-reasons .fb-btn { font-size: 11px; height: 24px; padding: 0 9px; }

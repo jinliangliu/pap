@@ -120,6 +120,11 @@
     image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
     file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
     close: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+    // 三个实心点：行内的「更多」。用 fill 而不是 stroke——描边的圆点在 13px 下
+    // 会糊成三个小圈，读起来像「未读」而不是「还有什么操作」。
+    dots: '<circle cx="5" cy="12" r="1.7" fill="currentColor" stroke="none"/>' +
+      '<circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/>' +
+      '<circle cx="19" cy="12" r="1.7" fill="currentColor" stroke="none"/>',
     up: '<polyline points="18 15 12 9 6 15"/>',
     down: '<polyline points="6 9 12 15 18 9"/>',
     minus: '<line x1="5" y1="12" x2="19" y2="12"/>',
@@ -132,7 +137,12 @@
     logo: '<path d="M12 2l8 4.5v11L12 22l-8-4.5v-11L12 2z"/><path d="M12 8l4 2.2v4.6L12 17l-4-2.2v-4.6L12 8z"/>',
     // 钥匙：柄圈 + 直杆 + 两颗齿。别用 shield（那是「审计」），也别用 link
     // （那是「连接器」）——「令牌」要能被一眼认成凭据，而不是又一个入口。
-    key: '<circle cx="7.5" cy="15.5" r="4"/><path d="M10.4 12.6 20 3"/><path d="M16.5 6.5l2.5 2.5"/><path d="M13.5 9.5l2.5 2.5"/>'
+    key: '<circle cx="7.5" cy="15.5" r="4"/><path d="M10.4 12.6 20 3"/><path d="M16.5 6.5l2.5 2.5"/><path d="M13.5 9.5l2.5 2.5"/>',
+    // 回答反馈投票：经典竖拇指。用图形而不是「赞 / 踩」两个字——两个汉字挤在
+    // 26px 高的胶囊里既不对称，也得读一遍才知道哪个是哪个；拇指的手势一眼就认出。
+    // 只存一个向上的形状，「踩」由 CSS 旋转 180° 得到：那正好就是它的镜像，
+    // 免得两份路径各改一处、慢慢长得不一样。
+    "thumb-up": '<path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/>'
   };
 
   function ico(name) {
@@ -1208,8 +1218,10 @@
 
     return '<div class="fb-line" data-fb-line="' + index + '">' +
       '<span class="hint">这条回答有用吗</span>' +
-      '<button class="fb-btn" type="button" data-fb="up" data-fb-idx="' + index + '">赞</button>' +
-      '<button class="fb-btn" type="button" data-fb="down" data-fb-idx="' + index + '">踩</button>' +
+      '<button class="fb-btn fb-vote" type="button" data-fb="up" data-fb-idx="' + index +
+      '" title="这条回答有用" aria-label="这条回答有用">' + ico("thumb-up") + "</button>" +
+      '<button class="fb-btn fb-vote down" type="button" data-fb="down" data-fb-idx="' + index +
+      '" title="这条回答没用" aria-label="这条回答没用">' + ico("thumb-up") + "</button>" +
       '<span class="fb-reasons" data-fb-reasons="' + index + '"' +
       (msg.feedbackOpen ? "" : " hidden") + ">" + reasons + "</span></div>";
   }
@@ -1278,12 +1290,24 @@
     if (msg.meta) {
       out += '<div class="meta-line">' + esc(msg.meta) + "</div>";
     }
+    /* 实际送进检索的那句话。规划器会做最小改写，用户看到的是自己那句原话；
+       两者不一致时（同一个问题在对话与验证页命中不同章节），没有这一行
+       就只能去翻 checkpoint。只在确实与原文不同时才值得看一眼，但它一直
+       显示——判断「有没有被改写」本身就是它存在的理由。 */
+    if (msg.knowledgeQuery) {
+      out += '<div class="query-line">实际检索词：<span class="mono">' +
+        esc(msg.knowledgeQuery) + "</span></div>";
+    }
     if (msg.citations && msg.citations.length) {
-      out += '<ul class="cites">' + msg.citations.map(function (c) {
+      /* 编号与正文里的 [n] 对齐：答复是归纳出来的，每个要点后面标的
+         [1]、[1][3] 指的就是这一张表里的第几条。没有编号，读者只能
+         按顺序猜。 */
+      out += '<ul class="cites">' + msg.citations.map(function (c, ci) {
         var score = typeof c.score === "number" ? c.score.toFixed(3) : c.score;
         var link = "#/knowledge?doc=" + encodeURIComponent(c.document_id || "") +
           "&chunk=" + encodeURIComponent(c.chunk_id || "");
-        return '<li><a class="linkish" href="' + esc(link) + '">' +
+        return '<li><span class="cite-no">[' + (ci + 1) + "]</span>" +
+          '<a class="linkish" href="' + esc(link) + '">' +
           esc(c.title || "未命名") + " · " + esc(c.section || "—") + "</a>" +
           " · score=" + esc(score) + "</li>";
       }).join("") + "</ul>";
@@ -2099,14 +2123,117 @@
     return '<div class="conv-item' + active + '" data-id="' + esc(c.id) + '">' +
       '<div class="conv-line">' +
       '<span class="conv-title" title="' + esc(c.title) + '">' + esc(c.title) + "</span>" +
-      '<button class="icon-btn" type="button" data-act="rename" data-id="' + esc(c.id) +
-      '" title="重命名">' + ico("edit") + "</button>" +
-      '<button class="icon-btn danger" type="button" data-act="delete" data-id="' + esc(c.id) +
-      '" title="删除">' + ico("trash") + "</button>" +
+      // 一行只留一个入口：重命名与删除挤在标题右边，等于每天从标题里扣掉
+      // 半个字宽——列表里全是「用知识库回答：GB 2…」这种被截断的标题。
+      '<button class="icon-btn conv-more" type="button" data-act="menu" data-id="' +
+      esc(c.id) + '" title="更多操作" aria-label="更多操作" aria-haspopup="menu"' +
+      ' aria-expanded="false">' + ico("dots") + "</button>" +
       "</div>" +
       '<div class="conv-meta">' + esc(shortTime(c.last_active_at)) + " · " +
       esc(c.message_count) + " 条</div>" +
       "</div>";
+  }
+
+  /* ---- 会话行的「更多」菜单 ----
+   *
+   * 菜单只有一份、挂在页面根上：每行各带一个弹层，滚动时就会有一堆被裁掉的
+   * 半截卡片，而且同一时刻只该有一个菜单是开着的。
+   *
+   * 定位用 fixed + 实测矩形，理由同底栏菜单：.conv-list 有 overflow-y:auto，
+   * absolute 会按列表的可视区裁剪，菜单贴着最后一行时只剩上半截。
+   */
+
+  var convMenu = { id: null, anchor: null };
+
+  function convMenuNode() { return $("#conv-menu"); }
+
+  function closeConvMenu() {
+    var menu = convMenuNode();
+    if (!menu || menu.hidden) return;
+    menu.hidden = true;
+    if (convMenu.anchor) convMenu.anchor.setAttribute("aria-expanded", "false");
+    convMenu.id = null;
+    convMenu.anchor = null;
+  }
+
+  function placeConvMenu() {
+    var menu = convMenuNode();
+    var anchor = convMenu.anchor;
+    if (!menu || !anchor) return;
+
+    var box = anchor.getBoundingClientRect();
+    var width = menu.offsetWidth || 148;
+    var height = menu.offsetHeight || 84;
+    // 右缘对齐按钮：往右展开会越出这一栏，落进对话区上方，看着像另一张卡。
+    var left = Math.min(box.right - width, window.innerWidth - width - 8);
+    var top = box.bottom + 4;
+    // 贴着列表底部时向上翻，否则菜单会被视口切掉最后一项「删除」。
+    if (top + height > window.innerHeight - 8) top = box.top - height - 4;
+    menu.style.left = Math.round(Math.max(8, left)) + "px";
+    menu.style.top = Math.round(Math.max(8, top)) + "px";
+  }
+
+  function openConvMenu(id, anchor) {
+    var menu = convMenuNode();
+    if (!menu) return;
+    // 再点同一个按钮 = 收起，和常见下拉一致。
+    if (!menu.hidden && convMenu.id === id) { closeConvMenu(); return; }
+
+    closeConvMenu();
+    convMenu.id = id;
+    convMenu.anchor = anchor;
+    menu.hidden = false;
+    anchor.setAttribute("aria-expanded", "true");
+    placeConvMenu();
+    var first = menu.querySelector(".conv-menu-item");
+    if (first) first.focus();
+  }
+
+  function runConvMenuAction(action) {
+    var id = convMenu.id;
+    // 先收菜单再执行：删除会弹确认框，菜单压在弹层上会遮住它的标题。
+    closeConvMenu();
+    if (!id) return;
+    if (action === "rename") startRename(id);
+    else if (action === "delete") askDelete(id);
+  }
+
+  var convMenuDocBound = false;
+
+  function bindConvMenu() {
+    var menu = convMenuNode();
+    if (!menu || menu.dataset.bound === "1") return;
+    menu.dataset.bound = "1";
+
+    $$(".conv-menu-item", menu).forEach(function (item) {
+      item.addEventListener("click", function () {
+        runConvMenuAction(item.getAttribute("data-conv-act"));
+      });
+    });
+
+    // 列表节点每次进这一页都会重建，滚动监听跟着节点走；document 上的那几个
+    // 只装一次，处理时用 convMenuNode() 取当前节点，避免闭包里攥着旧的。
+    var list = $("#conv-list");
+    if (list) list.addEventListener("scroll", closeConvMenu, { passive: true });
+    if (convMenuDocBound) return;
+    convMenuDocBound = true;
+
+    // 点空白处、按 Esc、窗口变化、列表滚动——四种情况菜单都不该以原坐标悬着。
+    document.addEventListener("click", function (ev) {
+      var node = convMenuNode();
+      if (!node || node.hidden) return;
+      if (node.contains(ev.target)) return;
+      if (ev.target.closest && ev.target.closest('[data-act="menu"]')) return;
+      closeConvMenu();
+    });
+    document.addEventListener("keydown", function (ev) {
+      var node = convMenuNode();
+      if (ev.key !== "Escape" || !node || node.hidden) return;
+      var anchor = convMenu.anchor;
+      closeConvMenu();
+      if (anchor) anchor.focus();
+    });
+    window.addEventListener("resize", closeConvMenu);
   }
 
   function renderConversationList() {
@@ -2124,17 +2251,18 @@
       return;
     }
 
+    // 列表重绘会把按钮换掉，菜单若还开着就成了一张悬在旧坐标上的孤儿卡。
+    closeConvMenu();
     box.innerHTML = chatUI.conversations.map(convItem).join("");
 
     $$("[data-act]", box).forEach(function (btn) {
       btn.addEventListener("click", function (ev) {
         ev.stopPropagation();
         var id = btn.getAttribute("data-id");
-        if (btn.getAttribute("data-act") === "rename") {
-          startRename(id);
-        } else {
-          askDelete(id);
-        }
+        var act = btn.getAttribute("data-act");
+        if (act === "menu") openConvMenu(id, btn);
+        else if (act === "rename") startRename(id);
+        else askDelete(id);
       });
     });
 
@@ -2218,6 +2346,9 @@
           meta: meta.join(" · "),
           // 识别原文随消息入库，刷新后还能展开核对，不是只在当时那一轮可见。
           ocrText: m.role === "assistant" && m.metadata ? (m.metadata.ocr_text || null) : null,
+          // 检索词随消息入库：刷新后仍能对照「我问的」与「实际检索的」。
+          knowledgeQuery:
+            m.role === "assistant" && m.metadata ? (m.metadata.knowledge_query || null) : null,
           /* 追问选项也随消息入库（`metadata.clarify`），刷新后整张卡能原样回来。
              选了什么没有单独存：用户的选择就是紧跟着的那条用户消息，
              多存一份就多一处可能和气泡对不上的地方。 */
@@ -2664,6 +2795,14 @@
       '<p class="card-sub">只显示当前身份自己的会话；删除会销毁消息与附件，不可恢复。</p>' +
       '<div class="conv-list" id="conv-list"><div class="skeleton" style="width:80%"></div></div>' +
       "</aside>" +
+      // 会话行的操作菜单：整页只有这一份，放在网格外面（fixed，不占格）。
+      // 菜单项是固定的两项，点哪一行都由 JS 记着当前 id。
+      '<div class="conv-menu" id="conv-menu" role="menu" aria-label="会话操作" hidden>' +
+      '<button class="conv-menu-item" type="button" role="menuitem" data-conv-act="rename">' +
+      ico("edit") + "重命名</button>" +
+      '<button class="conv-menu-item danger" type="button" role="menuitem" data-conv-act="delete">' +
+      ico("trash") + "删除</button>" +
+      "</div>" +
       '<div class="card chat-card">' +
       '<div class="chat-head"><span class="chat-head-title" id="chat-current-title">新会话</span>' +
       '<span class="faint mono" id="chat-thread-mono" style="font-size:10.5px">' +
@@ -2779,6 +2918,7 @@
 
     bindChatFind();
     bindChatRail();
+    bindConvMenu();
 
     renderAttachTray();
     renderChatLog();
@@ -2891,6 +3031,7 @@
       placeholder.at = r.assistant_message_at || new Date().toISOString();
       placeholder.ocrText = r.ocr_text || null;
       placeholder.citations = r.citations || [];
+      placeholder.knowledgeQuery = (r.metadata && r.metadata.knowledge_query) || null;
       var meta = [];
       if (r.metadata && r.metadata.intent) meta.push("intent=" + r.metadata.intent);
       if (r.metadata && r.metadata.tool_name) meta.push("tool=" + r.metadata.tool_name);
@@ -5565,6 +5706,9 @@
       '<input type="text" id="kb-query" class="span2" placeholder="例如：停机前要确认哪些项目" style="flex:1">' +
       '<button class="btn primary" type="button" id="kb-search">检索</button>' +
       "</div>" +
+      /* 这个框里的字会被原样拿去检索，而对话里那一轮用的是规划器改写过的句子。
+         不把那一句摆出来，同一个问题两边命中不同章节就只能靠猜。 */
+      '<p class="hint" id="kb-recent" hidden></p>' +
       '<div id="kb-result" style="margin-top:12px">' +
       '<div class="empty"><strong>尚未检索</strong>输入问题后回车，验证召回与打分是否符合预期。</div>' +
       "</div>" +
@@ -5989,9 +6133,10 @@
         if (r.answer) html += '<pre class="code">' + esc(r.answer) + "</pre>";
 
         if (r.citations && r.citations.length) {
-          html += '<ul class="cites">' + r.citations.map(function (c) {
+          html += '<ul class="cites">' + r.citations.map(function (c, ci) {
             var score = typeof c.score === "number" ? c.score.toFixed(3) : c.score;
-            return '<li><button class="linkish" type="button" data-cite-doc="' +
+            return '<li><span class="cite-no">[' + (ci + 1) + "]</span>" +
+              '<button class="linkish" type="button" data-cite-doc="' +
               esc(c.document_id || "") + '" data-cite-chunk="' + esc(c.chunk_id || "") + '">' +
               esc(c.title || "—") + " · " + esc(c.section || "—") + "</button>" +
               " · score=" + esc(score) + ' · <span class="mono">' + esc(c.source_path || "") +
@@ -6007,6 +6152,43 @@
       }
     }
 
+    /* 最近一次对话真正用的检索词。这一行是辅助信息，取不到就当没有——
+       不能因为它失败把整个页面打成错误。 */
+    async function loadRecentQuery() {
+      var box = root.querySelector("#kb-recent");
+      if (!box) return;
+
+      var r = null;
+
+      try {
+        r = await api("/api/v1/knowledge/recent-query");
+      } catch (e) {
+        box.hidden = true;
+        return;
+      }
+
+      if (!r || !r.query) {
+        box.hidden = true;
+        return;
+      }
+
+      box.hidden = false;
+      box.innerHTML = "上次对话实际检索的是「" +
+        '<span class="mono">' + esc(r.query) + "</span>」" +
+        (r.asked_at ? " · " + esc(shortTime(r.asked_at)) : "") +
+        (r.conversation_title ? " · " + esc(r.conversation_title) : "") +
+        ' · <button class="linkish" type="button" id="kb-recent-use">用它复跑</button>';
+
+      var use = box.querySelector("#kb-recent-use");
+
+      if (use) {
+        use.addEventListener("click", function () {
+          root.querySelector("#kb-query").value = r.query;
+          doSearch();
+        });
+      }
+    }
+
     root.querySelector("#kb-search").addEventListener("click", doSearch);
     root.querySelector("#kb-query").addEventListener("keydown", function (ev) {
       if (ev.key === "Enter") {
@@ -6019,6 +6201,7 @@
 
     await loadStatus();
     await loadDocs();
+    await loadRecentQuery();
 
     if (!state.canWrite) {
       uploadBtn.disabled = true;

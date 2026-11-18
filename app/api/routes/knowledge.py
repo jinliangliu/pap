@@ -17,10 +17,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_identity
@@ -552,6 +554,60 @@ async def _migrate_outdated_uploads(
 
 
 # ---------------------------------------------------------------- 检索验证
+
+
+class KnowledgeRecentQueryResponse(APIModel):
+    """最近一次「对话里的知识库回答」真正送进检索的那句话。
+
+    规划器会把用户原话做最小改写（去掉口语词、把代词换成上文对象）。
+    改写本身是有意的，但用户看不到，于是同一个问题在对话里和在验证页里
+    可能命中不同切片——排障的人会以为是检索坏了。这个接口把那一句交出来，
+    验证页可以拿它复跑，对不上的时候一眼看出差在哪儿。
+    """
+
+    query: str
+    asked_at: datetime | None = None
+    conversation_id: str | None = None
+    conversation_title: str | None = None
+
+
+@router.get("/recent-query", response_model=KnowledgeRecentQueryResponse | None)
+async def knowledge_recent_query(
+    identity: Identity = Depends(get_current_identity),
+    session: AsyncSession = Depends(get_session),
+) -> KnowledgeRecentQueryResponse | None:
+    """没有历史时返回 null，不是 404——「还没问过」不是错误。"""
+    from app.models.conversation import Conversation, Message, MessageRole
+
+    # 只取自己的对话：同租户成员能看同租户的文档，但「别人问过什么」
+    # 不属于验证页需要知道的事。join 会话表才能按发起人收窄。
+    row = (
+        await session.execute(
+            select(Message, Conversation.title)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .where(Message.role == MessageRole.ASSISTANT)
+            .where(Conversation.user_id == identity.user_id)
+            .where(Message.metadata_json.op("->>")("knowledge_query").isnot(None))
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(1)
+        )
+    ).first()
+
+    if row is None:
+        return None
+
+    message, title = row
+    query = str((message.metadata_json or {}).get("knowledge_query") or "")
+
+    if not query:
+        return None
+
+    return KnowledgeRecentQueryResponse(
+        query=query,
+        asked_at=as_utc(message.created_at),
+        conversation_id=str(message.conversation_id) if message.conversation_id else None,
+        conversation_title=title,
+    )
 
 
 @router.post("/search", response_model=KnowledgeSearchResponse)
