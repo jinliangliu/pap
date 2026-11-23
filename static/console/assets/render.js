@@ -1171,8 +1171,16 @@
       if (!node || !at) return "";
 
       var kind = String(node.kind || "agent");
-      var sub = String(node.sub || node.agent || "");
-      var title = id + (node.agent ? "（" + node.agent + "）" : (sub ? "（" + sub + "）" : ""));
+      /* 副标题写**显示名**：这张图是给人核对「谁在第几步」的，而 `assistant`
+         是运行时取智能体用的键。平台知道「通用助手 = assistant」，就该替人做这次
+         翻译——否则用户要在心里对一遍，图上写着 `field-ops`、嘴里说的是「现场作业」。
+         标识仍留在悬停提示里：排查时按标识搜日志是常态，图上看不见它并不省事。 */
+      var who = String(node.agent_label || node.agent || "");
+      var sub = String(node.sub || who || "");
+      var hint = (node.agent_label && node.agent && node.agent_label !== node.agent)
+        ? who + " / " + node.agent
+        : who;
+      var title = id + (hint ? "（" + hint + "）" : (sub ? "（" + sub + "）" : ""));
 
       return '<g class="wf-node ' + esc(kind) + (id === entry ? " entry" : "") + '">' +
         '<title>' + esc(title) + "</title>" +

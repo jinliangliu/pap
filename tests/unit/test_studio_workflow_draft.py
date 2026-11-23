@@ -129,9 +129,12 @@ async def test_draft_accepts_a_runnable_graph():
         "diagnose",
         "answer",
     ]
-    assert "步骤：classify（cs） → diagnose（ops） → answer（汇总）" in result.message
-    # 起草后必须告诉它下一步是保存，否则它会以为交上来就算建好了。
-    assert "studio_workflow_save" in result.message
+    # 文字行用显示名（seed 里是 name.upper()）：与图上同一份名字。
+    assert "步骤：classify（CS） → diagnose（OPS） → answer（汇总）" in result.message
+    # 起草后必须让它知道自己还没保存。这句话是**给用户看的正文**，
+    # 所以不写工具名与参数模式——「还没落库」把事实说给两边听。
+    assert "还没落库" in result.message
+    assert "studio_workflow_save" not in result.message
 
 
 async def test_draft_does_not_write_anything():
@@ -242,7 +245,7 @@ async def test_draft_mentions_an_existing_name_without_calling_it_an_error():
 
     # 同名不是图的问题：把它算成 error 会让模型去改图，改一圈才发现是模式选错。
     assert result.result["ok"] is True
-    assert "mode=update" in result.message
+    assert "保存会覆盖它" in result.message
 
 
 async def test_draft_rejects_a_definition_that_is_not_an_object():

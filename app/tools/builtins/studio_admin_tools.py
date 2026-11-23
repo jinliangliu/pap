@@ -1867,7 +1867,10 @@ def _edge_short_label(edge: Any) -> str:
     return str(edge.when.value)
 
 
-def _workflow_graph(plan: Any) -> dict[str, Any]:
+def _workflow_graph(
+    plan: Any,
+    labels: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """把编译过的图摊成界面能画的形状。
 
     只给**形状**：节点、边、每条边上那个条件。不分层、不算坐标——排版是界面的事，
@@ -1875,6 +1878,11 @@ def _workflow_graph(plan: Any) -> dict[str, Any]:
 
     不画 `inputs` 里的模板引用：那些是数据流，而这张图回答的是「谁在第几步」。
     把两类边画在一起，读的人会以为两个节点之间有一条「控制」关系。
+
+    `labels` 是 `标识 -> 显示名`，只用来多带一个 `agent_label`。图是给人核对
+    「谁在第几步」的，而标识（`assistant`）是运行时用的键：用户嘴里说「通用助手」，
+    图上写 `assistant`，等于让他在心里做一次翻译——平台知道这个对应关系，就该替他对。
+    两者相同时不带这个字段：多一个一模一样的值只是噪音。
     """
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -1887,8 +1895,16 @@ def _workflow_graph(plan: Any) -> dict[str, Any]:
         elif node.kind == "parallel":
             item["sub"] = f"并行 {len(node.branches)} 路"
             item["agents"] = [branch.agent for branch in node.branches]
+            named = [
+                (labels or {}).get(branch.agent, "") for branch in node.branches
+            ]
+            if any(named):
+                item["agent_labels"] = named
         elif node.agent:
             item["agent"] = node.agent
+            label = str((labels or {}).get(node.agent) or "").strip()
+            if label and label != node.agent:
+                item["agent_label"] = label
         nodes.append(item)
 
         for edge in node.next:
@@ -1904,8 +1920,60 @@ def _workflow_graph(plan: Any) -> dict[str, Any]:
     return {"entry": plan.entry, "nodes": nodes, "edges": edges}
 
 
-def _step_label(node: Any) -> str:
-    """一步在摘要里怎么写：`check（field-ops）` / `report（汇总）`。
+async def _agent_labels(context: ToolExecutionContext, plan: Any) -> dict[str, str]:
+    """`图上写的那个字 -> 显示名`，只给图用。
+
+    键要**两种都登记**：起草与保存后的图已经换成标识（`assistant`），而确认卡的图
+    是原样参数（可能还写着「通用助手」——`_summarize_workflow_call` 不改写它）。
+    两种键都指向同一个显示名，渲染侧只查一次，不必知道当初写的是哪一种。
+
+    只查图上真出现的几个名字（`plan_agents`），不是整表：这张图的读者要的是
+    「这一步谁做」，名单在别的工具里已经列得够全了。
+
+    **出错返空、绝不抛。** 这张图在三个位置出现：起草的气泡、确认卡、
+    保存后的气泡。确认卡那一处要是因为一次查询失败就生不出卡来，用户看到的是
+    「保存没反应」——而显示名取不到时退回标识，图照样能读、能确认。
+    """
+    try:
+        from app.services import agent_service, workflow_service
+        from app.tenancy.context import tenant_scope
+
+        wanted = {name for _, name in workflow_service.plan_agents(plan)}
+        if not wanted:
+            return {}
+
+        with tenant_scope(context.tenant_id):
+            async with async_session_factory() as session:
+                rows = await agent_service.list_agents(session)
+
+        table: dict[str, str] = {}
+        for row in rows:
+            name = str(row.name)
+            display = str(getattr(row, "display_name", "") or "").strip()
+            if not display:
+                continue
+            table[name] = display
+            # 标识占住的键不被显示名覆盖，与 `agent_lookup` 同一条口径。
+            table.setdefault(display, display)
+        return {key: value for key, value in table.items() if key in wanted}
+    except Exception:  # noqa: BLE001 - 展示用，取不到就退回标识
+        logger.debug("编排图的显示名取不到，退回标识", exc_info=True)
+        return {}
+
+
+def _who(agent: str, labels: dict[str, str] | None) -> str:
+    """图上、文字里都写同一个名字：有显示名就用它，没有才退回标识。"""
+    if not agent:
+        return "未指定智能体"
+    return str((labels or {}).get(agent) or agent)
+
+
+def _step_label(node: Any, labels: dict[str, str] | None = None) -> str:
+    """一步在摘要里怎么写：`check（现场作业）` / `report（汇总）`。
+
+    名字用**显示名**（与图上同一份 `labels`）：同一屏里同一个角色出现两个名字
+    （图上「现场作业」、这行 `field-ops`），读的人得先判断这是不是同一个人。
+    取不到显示名时退回标识——图能读，文字照样能懂。
 
     角色必须进这一步，不能只列节点 id：实测出现过「用户说让 ops 判断，
     图里全程是 field-ops」，而当时的结果只写了 `check → advise → report`，
@@ -1914,9 +1982,9 @@ def _step_label(node: Any) -> str:
     if node.kind == "compose":
         return f"{node.id}（汇总）"
     if node.kind == "parallel":
-        names = "、".join(branch.agent for branch in node.branches) or "未指定"
+        names = "、".join(_who(branch.agent, labels) for branch in node.branches)
         return f"{node.id}（并行：{names}）"
-    return f"{node.id}（{node.agent or '未指定智能体'}）"
+    return f"{node.id}（{_who(node.agent, labels)}）"
 
 
 def _condition_label(edge: Any) -> str:
@@ -1929,7 +1997,11 @@ def _condition_label(edge: Any) -> str:
 
 
 def _workflow_roles(plan: Any) -> tuple[dict[str, list[str]], int]:
-    """(每个智能体负责的节点, 不调智能体的节点数)。"""
+    """(每个智能体负责的节点, 不调智能体的节点数)。
+
+    键是**标识**：这份是结构化结果（`workflow.roles`），调用方按标识取 Agent。
+    要显示名请在 `_roles_line` 那一层换——那里才是给人读的。
+    """
     roles: dict[str, list[str]] = {}
     silent = 0
     for node_id in plan.order:
@@ -1945,8 +2017,15 @@ def _workflow_roles(plan: Any) -> tuple[dict[str, list[str]], int]:
     return roles, silent
 
 
-def _roles_line(roles: dict[str, list[str]], silent: int) -> str:
-    parts = [f"{agent}（{'、'.join(node_ids)}）" for agent, node_ids in roles.items()]
+def _roles_line(
+    roles: dict[str, list[str]],
+    silent: int,
+    labels: dict[str, str] | None = None,
+) -> str:
+    parts = [
+        f"{_who(agent, labels)}（{'、'.join(node_ids)}）"
+        for agent, node_ids in roles.items()
+    ]
     if silent:
         parts.append(f"{silent} 个汇总节点不调智能体")
     return "角色：" + "；".join(parts) if parts else ""
@@ -1959,6 +2038,7 @@ def _summarize_workflow(
     display_name: str,
     *,
     with_steps: bool = True,
+    labels: dict[str, str] | None = None,
 ) -> str:
     """确认卡正文：几步、什么顺序、每步谁做、按什么分流。
 
@@ -1971,11 +2051,16 @@ def _summarize_workflow(
     把它留在卡上，读者要在两处读同一份顺序。
     """
     lines = [f"{mode}流程「{name}」{f'（{display_name}）' if display_name and display_name != name else ''}"]
-    lines.extend(_workflow_steps_text(plan, with_steps=with_steps))
+    lines.extend(_workflow_steps_text(plan, with_steps=with_steps, labels=labels))
     return "\n".join(lines)
 
 
-def _workflow_steps_text(plan: Any, *, with_steps: bool = True) -> list[str]:
+def _workflow_steps_text(
+    plan: Any,
+    *,
+    with_steps: bool = True,
+    labels: dict[str, str] | None = None,
+) -> list[str]:
     """「步骤 / 分流 / 角色」这三行，起草与确认卡共用一份。
 
     起草工具也要把这三行说给模型听（它据此判断「是不是用户要的那个过程」），
@@ -1984,7 +2069,9 @@ def _workflow_steps_text(plan: Any, *, with_steps: bool = True) -> list[str]:
     """
     lines: list[str] = []
     if with_steps:
-        steps = " → ".join(_step_label(plan.node(node_id)) for node_id in plan.order)
+        steps = " → ".join(
+            _step_label(plan.node(node_id), labels) for node_id in plan.order
+        )
         lines.append(f"步骤：{steps}")
 
     # 分流只列「有条件的边」：兜底边写出来只是噪音，人要看的是「什么情况下
@@ -2004,7 +2091,7 @@ def _workflow_steps_text(plan: Any, *, with_steps: bool = True) -> list[str]:
         lines.append("分流：" + "；".join(decision))
 
     roles, silent = _workflow_roles(plan)
-    roles_line = _roles_line(roles, silent)
+    roles_line = _roles_line(roles, silent, labels)
     if roles_line:
         lines.append(roles_line)
 
@@ -2015,7 +2102,10 @@ async def _summarize_workflow_call(
     context: ToolExecutionContext,
     arguments: dict[str, Any],
 ) -> ToolBrief:
-    """`ToolDefinition.summarize` 的入口：只按参数说话，不查库、不校验。
+    """`ToolDefinition.summarize` 的入口：只按参数说话，不做校验。
+
+    唯一的例外是图上的角色显示名（`_agent_labels`）：那是**展示**，不是判定，
+    而且它出错就退回标识，不影响这张卡能不能生成、要不要拦。
 
     图不成立时不去猜顺序（`compile_definition` 抛了就直说编译不过），
     因为确认卡上的顺序与实际执行的顺序不一致，比不写顺序更糟——同样地，
@@ -2039,11 +2129,14 @@ async def _summarize_workflow_call(
             text=f"{mode}流程「{name}」：这张图现在编译不过（{exc.code}），保存会被拒绝。"
         )
 
-    graph = _workflow_graph(plan)
+    labels = await _agent_labels(context, plan)
+    graph = _workflow_graph(plan, labels)
     return ToolBrief(
         # 图给得出来就不写「步骤：」那行：卡片上已经画了顺序，还多一行文字
         # 等于让人在两处读同一件事，而文字那行表达不了分叉。
-        text=_summarize_workflow(plan, mode, name, display_name, with_steps=graph is None),
+        text=_summarize_workflow(
+            plan, mode, name, display_name, with_steps=graph is None, labels=labels
+        ),
         graph=graph,
     )
 
@@ -2190,7 +2283,10 @@ async def studio_workflow_draft(
         )
 
     plan, problems, writable, renames = await _workflow_agent_facts(context, plan)
-    graph = _workflow_graph(plan)
+    # 图、步骤行、角色行用同一份名字：同一屏里同一个角色出现「现场作业」和
+    # `field-ops` 两个写法，读的人得先判断这是不是同一个人。
+    labels = await _agent_labels(context, plan)
+    graph = _workflow_graph(plan, labels)
 
     # 名字冲突只在给了 name 时才查，且不算错误：同名意味着「保存要用 update」，
     # 而不是「这张图错了」。放进 errors 会让模型去改图，改一整圈才发现是模式选错。
@@ -2201,7 +2297,7 @@ async def studio_workflow_draft(
 
         existing = await workflow_service.get_workflow(context.tenant_id, name)
 
-    lines = ["这张图能存。", *_workflow_steps_text(plan)]
+    lines = ["这张图能存。", *_workflow_steps_text(plan, labels=labels)]
     if renames:
         # 说清「换成了谁」：图里从此显示 `assistant`，而用户说的是「通用助手」。
         # 不说明的话，卡上那个人在他眼里就是凭空出现的。
@@ -2223,14 +2319,24 @@ async def studio_workflow_draft(
         lines = ["这张图的形状没问题，但还不能保存："]
         lines.extend(f"- 节点「{item['node']}」：{item['message']}" for item in problems)
 
-    lines.append("下一步：改好之后用 studio_workflow_save 保存（mode=create/update）。")
+    if problems:
+        lines.append("下一步：图还不能存。把上面这几处改掉再交回来，不用重发整张图。")
+    else:
+        # 这段会原样呈现给**用户**（读工具的结果就是正文），所以既不能写
+        # 「调 studio_workflow_save（mode=create/update）」这种参数提示，
+        # 也不能写成一句完成态的结论——那会让模型照抄成交付物、然后就停了手
+        # （线上实测：起草完直接把这段当成回答发出来，保存根本没发生）。
+        # 「还没落库」同时说清两件事：用户知道库里没动，模型知道这一步没完。
+        lines.append(
+            "图还没落库。要存就保存——会弹一次确认卡，那是唯一一次确认；"
+            "不想存就说改哪一步。"
+        )
+        lines.append("要调顺序或换人，改对应的那个节点再交回来，不必重写整张图。")
     if existing is not None:
         lines.append(
-            f"注意：标识「{name}」下已经有一张流程（v{int(existing.revision or 0)}），"
-            "保存时要用 mode=update；要新建一张请换个标识。"
+            f"注意：这个标识下已经有一张流程（第 {int(existing.revision or 0)} 版），"
+            "保存会覆盖它；要另建一张请换个标识。"
         )
-    if not problems:
-        lines.append("要调顺序或换人，改对应的那个节点再交回来，不必重写整张图。")
 
     return ToolExecutionResult(
         success=True,
@@ -2470,6 +2576,7 @@ async def studio_workflow_save(
     # 「先查压力还是先下结论」。图按拓扑序存，与实际执行顺序一致（分支处只表示
     # 先后，不表示互斥）。
     steps = list(order)
+    labels = await _agent_labels(context, plan) if plan is not None else {}
     roles, silent = _workflow_roles(plan) if plan is not None else ({}, 0)
     created = existing is None
     action = "新建" if created else "更新"
@@ -2482,7 +2589,7 @@ async def studio_workflow_save(
         lines.append(f"步骤：{' → '.join(steps)}")
     # 角色单独一行，而不是只把 id 串成一串：用户可能点名过某个角色（「让 ops
     # 判断」），而图里用的是另一个。只说 id 时这种替换在对话里完全看不出来。
-    roles_line = _roles_line(roles, silent)
+    roles_line = _roles_line(roles, silent, labels)
     if roles_line:
         lines.append(roles_line)
     lines.append(
@@ -2495,6 +2602,10 @@ async def studio_workflow_save(
         lines.append(
             "发起它的智能体要允许转交（最大转交深度 ≥ 1），否则开跑前就会被拒。"
         )
+
+    saved_graph = (
+        _workflow_graph(plan, labels) if plan is not None else None
+    )
 
     result = ToolExecutionResult(
         success=True,
@@ -2512,7 +2623,7 @@ async def studio_workflow_save(
             # 结果气泡里那张图（`nodes._result_graph` 按顶层 `graph` 键取）。
             # 与确认卡上那张同源，但**按落库后的 plan 重算**：卡上画的是「提交的
             # 那张图」，气泡里是「存下来、以后真会跑的那张」。
-            **({"graph": _workflow_graph(plan)} if plan is not None else {}),
+            **({"graph": saved_graph} if saved_graph else {}),
         },
         message="\n".join(lines),
         verification={"source": "workflows_table", "ref": str(row.name)},
@@ -3906,6 +4017,8 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                 "比来回问几句快得多——问清楚再动手，只该用在保存那一步。"
                 "改一版交一版：它把第一处问题连节点一起指出来，改好那一处再交回来，"
                 "不要因为一处错误就重写整张图（重写最容易漏节点，漏掉等于删掉）。"
+                "**它说能存就直接调 studio_workflow_save**，不要再问一句「确认就回『存』」："
+                "保存会弹确认卡，那是唯一一次确认；口头那句拦不住任何东西，只是多一轮往返。"
                 "它回答：图能不能存（errors 带节点与错误码）、步骤是否就是用户描述的那个过程、"
                 "图里的智能体在库里在不在/是否启用、哪几步允许写（允许写的步骤动手时会停审批）。"
                 "definition 的写法（占位符、next、条件键必须有 emit 来源）见 studio_workflow_save。"

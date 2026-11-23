@@ -459,7 +459,8 @@ async def test_summary_lists_roles_and_branches_without_restating_the_graph():
 
     assert "新建流程「patrol」（早班巡检）" in brief.text
     assert "分流：check 判 level = 严重 → act；其余 → report" in brief.text
-    assert "角色：cs（check）；ops（act）；1 个汇总节点不调智能体" in brief.text
+    # 角色行与图同一份名字（显示名优先，退回标识）。
+    assert "角色：CS（check）；OPS（act）；1 个汇总节点不调智能体" in brief.text
     # 有图就不再写步骤：同一份顺序出现在文字和图上，等于让审批人读两遍。
     assert "步骤：" not in brief.text
 
@@ -640,7 +641,8 @@ async def test_result_shows_which_agent_runs_each_step():
     """
     result = await _create()
 
-    assert "角色：cs（classify）；ops（diagnose）；1 个汇总节点不调智能体" in result.message
+    assert "角色：CS（classify）；OPS（diagnose）；1 个汇总节点不调智能体" in result.message
+    # 结构化那份仍是标识：调用方按标识取 Agent，展示名只活在文字里。
     assert result.result["workflow"]["roles"] == {
         "cs": ["classify"],
         "ops": ["diagnose"],
