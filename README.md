@@ -74,6 +74,7 @@ uv run pytest
 - 工具来源、自定义 HTTP Tool 与导入导出：[`docs/TOOLS.md`](docs/TOOLS.md)
 - 权限：三态工具策略（允许 / 需确认 / 拒绝）、风险只上调与两个平台开关：[`docs/PERMISSIONS.md`](docs/PERMISSIONS.md)
 - 构建助手「从文件导入」：上传一份文件 + 说一句用途，按内容建成知识库文档 / 技能 / OpenAPI 工具：[`docs/STUDIO_IMPORT.md`](docs/STUDIO_IMPORT.md)
+- 用一段话建一张编排图：起草不落库、只改一个节点、回滚走保存前备份：[`docs/WORKFLOW_AUTHORING.md`](docs/WORKFLOW_AUTHORING.md)
 - 知识库：文档入库、增量同步、切片与检索：[`docs/KNOWLEDGE.md`](docs/KNOWLEDGE.md)
 - 智能体：职责边界、生命周期与治理不变量：[`docs/AGENTS.md`](docs/AGENTS.md)
 - 技能：作业指令、触发匹配与工具白名单：[`docs/SKILLS.md`](docs/SKILLS.md)
