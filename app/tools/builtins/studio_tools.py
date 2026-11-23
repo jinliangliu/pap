@@ -207,11 +207,18 @@ def _node_agents_line(rows: list[Agent]) -> str:
     """
     from app.services import workflow_service
 
-    ready = [row for row in rows if row.status == AgentStatus.ACTIVE]
+    # 内置助手（构建助手）**不在**这一行里：它拿的是 `studio_*`，而运行时
+    # `agent_invoker` 会以「不能承接转交任务（内置智能体）」拒绝它。
+    # 列进来只会让模型把它填进图，然后保存时被拒——白跑一轮。
+    ready = [
+        row
+        for row in rows
+        if row.status == AgentStatus.ACTIVE and not bool(getattr(row, "is_builtin", False))
+    ]
     if not ready:
-        return "能放进编排图的：没有——当前没有启用中的智能体，图里任何一步都填不进去。"
+        return "能放进编排图的：没有——当前没有启用中的业务智能体，图里任何一步都填不进去。"
 
-    text = "能放进编排图的（启用中）：" + "、".join(
+    text = "能放进编排图的（启用中的业务智能体）：" + "、".join(
         f"{row.name}（{row.display_name}）" for row in ready[:MAX_LIST_ITEMS]
     )
     idle = [row for row in rows if row.status != AgentStatus.ACTIVE]

@@ -736,6 +736,20 @@ def _ensure_agents_available(plan: WorkflowPlan, rows: Any) -> None:
                 node=nid,
             )
 
+        # 内置助手（目前只有构建助手）不是节点角色：它拿的是 `studio_*`，
+        # 职责是替人改配置，不是替图跑某一步业务。运行时会以
+        # 「不能承接转交任务（内置智能体）」拒绝（`agent_invoker`），
+        # 在这里拦是为了让错误落在保存那一刻——否则图存得进去，
+        # 一直到来人触发才失败，而配图的人早就不在屏幕前了。
+        if bool(getattr(row, "is_builtin", False)):
+            raise WorkflowError(
+                "WORKFLOW_INTERNAL_AGENT",
+                f"第「{nid}」步指定的是内置智能体「{row.display_name or name}」。"
+                "它只在控制台里替人改配置，不承接编排节点——换一个业务智能体，"
+                "没有就先去建一个再保存。",
+                node=nid,
+            )
+
         status = str(getattr(row.status, "value", row.status))
         if status != "active":
             raise WorkflowError(

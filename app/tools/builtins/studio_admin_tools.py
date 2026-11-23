@@ -2279,6 +2279,22 @@ async def _workflow_agent_facts(
             )
             continue
 
+        # 内置助手不能当节点角色（与保存时 `_ensure_agents_available` 同一口径）。
+        # 起草不拦，模型就会把「构建助手」写进图里，保存时才被拒——那正好是
+        # 起草层要消灭的那种白跑一轮。
+        if bool(getattr(row, "is_builtin", False)):
+            problems.append(
+                {
+                    "node": node_id,
+                    "code": "WORKFLOW_INTERNAL_AGENT",
+                    "message": (
+                        f"第「{node_id}」步指定的是内置智能体「{row.display_name or name}」。"
+                        "它只在控制台里替人改配置，不承接编排节点——换一个业务智能体。"
+                    ),
+                }
+            )
+            continue
+
         status = str(getattr(row.status, "value", row.status))
         if status != "active":
             problems.append(

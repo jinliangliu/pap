@@ -93,6 +93,27 @@ async def _seed_agents(*specs: tuple[str, AgentStatus]) -> None:
             await db.commit()
 
 
+async def _seed_builtin() -> None:
+    """直接插一行内置助手：`create_agent` 不允许造 `is_builtin=True`。
+
+    用它来钉起草侧的口径——起草不拦，模型就会把「构建助手」写进图，
+    保存时才被拒，正好是起草层要消灭的那种白跑一轮。
+    """
+    async with async_session_factory() as db:
+        with tenant_scope(TENANT):
+            db.add(
+                Agent(
+                    tenant_id=TENANT,
+                    name="studio",
+                    display_name="构建助手",
+                    status=AgentStatus.ACTIVE,
+                    is_builtin=True,
+                    can_write=True,
+                )
+            )
+            await db.commit()
+
+
 @pytest.fixture(autouse=True)
 async def _clean_db(session, seeded_identity):
     for model in (WorkflowRun, Workflow, Agent):
@@ -196,6 +217,26 @@ async def test_draft_reports_an_agent_that_is_not_active():
     assert result.result["ok"] is False
     assert result.result["errors"][0]["code"] == "WORKFLOW_INACTIVE_AGENT"
     assert "草稿" in result.result["errors"][0]["message"]
+
+
+async def test_draft_reports_the_builtin_assistant_as_a_node():
+    await _seed_builtin()
+
+    result = await _draft(
+        {
+            "entry": "solo",
+            "nodes": [
+                {"id": "solo", "agent": "studio", "task": "查 {{input.text}}", "next": []}
+            ],
+        }
+    )
+
+    assert result.result["ok"] is False
+    error = result.result["errors"][0]
+    assert error["code"] == "WORKFLOW_INTERNAL_AGENT"
+    assert error["node"] == "solo"
+    # 与保存时同一句理由：起草说不行、保存也说不行，不许一个说能存。
+    assert "内置" in error["message"] and "业务智能体" in error["message"]
 
 
 async def test_draft_lists_the_steps_that_are_allowed_to_write():

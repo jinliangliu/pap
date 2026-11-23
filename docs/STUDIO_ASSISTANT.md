@@ -226,7 +226,8 @@ new.allowed_tools ⊆ 请求人当前可见的工具集
 重名的显示名**不猜**——两个「运维」是两张边界，按名字挑一个等于替用户决定了权限。
 
 这也是为什么 `studio_describe resource=agent` 的清单末尾固定有一行
-「能放进编排图的（启用中）：…」：枚举在库里，读一次就有，不该让用户把它再打一遍。
+「能放进编排图的（启用中的业务智能体）：…」：枚举在库里，读一次就有，不该让用户把它再打一遍。
+内置助手（它自己）不在这一行里——它不承接编排节点（保存期 `WORKFLOW_INTERNAL_AGENT`）。
 
 **起草不算第三个写工具。** `studio_workflow_draft` 是 `read`：它把同一份
 `compile_definition` 与同一份 `_ensure_agents_available` 的口径跑一遍，然后**不写库**。
