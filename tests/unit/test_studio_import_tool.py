@@ -435,3 +435,47 @@ async def test_reader_is_refused_before_writing(session):
     assert result.success is False
     assert "knowledge:write" in result.message
     assert await _documents(session) == []
+
+
+async def test_unchanged_import_does_not_claim_the_pipeline_ran_again(session):
+    """同一份文件再导一次：一片都没重切，就不能画「6 步全部完成」。
+
+    步骤卡是「这次真的跑了一遍」的陈述。`unchanged` 那条路只比对内容哈希，
+    什么都没重新加工——跟着返回 stages，用户看到的是六步全绿，而实际上
+    这一次什么也没发生。
+    """
+    file_id = _store(PLAIN_MD, name="valve.md")
+
+    first = await _import({"file_id": file_id, "filename": "valve.md", "target": "knowledge"})
+    # 节点数跟着快照里真实有的阶段走（这份文本没有 HTML 表格，就没有「清洗」那一步）。
+    keys = [stage["key"] for stage in first.result["stages"]]
+    assert keys[0] == "parse" and keys[-1] == "index"
+    assert "chunk" in keys and "index" in keys
+
+    second = await _import({"file_id": file_id, "filename": "valve.md", "target": "knowledge"})
+    inner = second.result.get("result") or {}
+    assert inner.get("action") == "unchanged", inner
+    assert "内容没有变化" in second.message
+    assert "stages" not in second.result
+
+
+async def test_unchanged_import_does_not_claim_the_pipeline_ran_again(session):
+    """同一份文件再导一次：一片都没重切，就不能画「6 步全部完成」。
+
+    步骤卡是「这次真的跑了一遍」的陈述。`unchanged` 那条路只比对内容哈希，
+    什么都没重新加工——跟着返回 stages，用户看到的是六步全绿，而实际上
+    这一次什么也没发生。
+    """
+    file_id = _store(PLAIN_MD, name="valve.md")
+
+    first = await _import({"file_id": file_id, "filename": "valve.md", "target": "knowledge"})
+    # 节点数跟着快照里真实有的阶段走（这份文本没有 HTML 表格，就没有「清洗」那一步）。
+    keys = [stage["key"] for stage in first.result["stages"]]
+    assert keys[0] == "parse" and keys[-1] == "index"
+    assert "chunk" in keys and "index" in keys
+
+    second = await _import({"file_id": file_id, "filename": "valve.md", "target": "knowledge"})
+    inner = second.result.get("result") or {}
+    assert inner.get("action") == "unchanged", inner
+    assert "内容没有变化" in second.message
+    assert "stages" not in second.result

@@ -887,7 +887,8 @@ async def studio_knowledge_add(
             "pipeline": parsed.pipeline,
             "tags": list(parsed.tags),
             # 界面据此画步骤卡；没有快照时是空列表（不猜）。
-            **({"stages": stages} if stages else {}),
+            # 内容没变化时不带：这次没有重新切一遍，别让人看到「六步都跑过」。
+            **({"stages": stages} if stages and action != "unchanged" else {}),
         },
         message=message,
         # 与 studio_import 同一条：审批后的回读核验按这个 id 另起会话再查一遍。
@@ -1154,8 +1155,9 @@ async def studio_import(
     notes = [str(note) for note in (payload.get("notes") or []) if note]
 
     # 顶层也带一份步骤：`payload["result"]` 是导入器的话，界面不该知道它套了几层。
+    # 「内容没变化」时不带：那条路一片都没重切，画一张「6 步全部完成」是假陈述。
     stages = _pipeline_stages(result)
-    if stages:
+    if stages and str(result.get("action") or "") != "unchanged":
         payload = {**payload, "stages": stages}
 
     message = _import_message(
