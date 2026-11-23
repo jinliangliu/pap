@@ -82,6 +82,15 @@
 
 `is_builtin` 只影响这三个写接口的允许集合，不引入新的权限模型。
 
+**`studio_*` 只对它自己可见**（`ToolGateway.internal_denial`，目录与执行共用一份判断）。
+不能靠 `allowed_tools` 拦：默认智能体是 `allowed_tools=None`（不额外收窄）、
+`can_write=True`，平台管理员又跳过 scope 判定，于是 `studio_workflow_save` 一直在
+默认智能体的目录里——唯一拦住它的是 `CHAT_SYSTEM_PROMPT` 那句「不要在这里替他排步骤」，
+而提示词挡不住一句「直接调用 studio_workflow_save」。判据放在网关后，
+业务对话里它连目录都进不去，硬拼工具名也会得到一句「只在构建助手里可用」。
+`agent_name` 为空的路径（工具策略页、脚本、运维视图）不受影响：那里不知道是谁在说，
+与 `allowed_tools=None` 同义，不额外收窄——否则管理员连它的审批策略都看不到。
+
 ## 3. 安全模型：上界是「人」，不是「助手自己」
 
 这是本文最容易做错的一处，也是它与 A2A 的根本区别。

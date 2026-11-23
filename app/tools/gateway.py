@@ -29,6 +29,7 @@ from typing import Any, NoReturn, Protocol
 from app.models.approval import RiskLevel
 from app.observability.context import span
 from app.services import runtime_settings, write_backup_service
+from app.services.agent_service import STUDIO_TOOL_PREFIX, may_use_platform_tools
 from app.services.rate_limit_service import RateLimitExceeded
 from app.services.tenant_service import TenantService, get_tenant_service
 from app.tools.registry import ToolNotFoundError, ToolRegistry
@@ -643,6 +644,38 @@ class ToolGateway:
         return policy.action or default_action, policy.risk_override
 
     @staticmethod
+    def internal_denial(
+        *,
+        tool: ToolDefinition,
+        context: ToolExecutionContext,
+    ) -> str | None:
+        """平台管理工具（`studio_*`）的身份门槛。返回拒绝原因，通过则 None。
+
+        这一条与 `agent_denial` 分开，因为它**不是**从 `allowed_tools` 推出来的：
+        默认智能体的 `allowed_tools` 是 None（不额外收窄）、平台管理员又跳过
+        scope 判定，所以「别人没被授予」对它是成立的假象——只要模型点一次
+        `studio_workflow_save`，一条业务对话就能改租户级配置。这里按身份判。
+
+        `agent_name` 为空表示「这条路径没有会话身份」（工具策略页、脚本、
+        运维视图）：那里不该被收窄，否则管理员在工具页看不到 `studio_*` 的
+        审批策略，也没法回放一次拒绝。空名字与 `allowed_tools=None` 同义——
+        都是「不知道是谁在说，就不额外收窄」。
+
+        目录过滤与执行拦截共用这一份。两处各写一遍时，漏掉的那处表现成
+        「目录里没有、调用却能过」，而日志看起来完全正常。
+        """
+        if not tool.name.startswith(STUDIO_TOOL_PREFIX):
+            return None
+
+        if not context.agent_name or may_use_platform_tools(context.agent_name):
+            return None
+
+        return (
+            f"「{tool.display_name}」是平台管理工具，只在构建助手里可用。"
+            "这条会话里的智能体没有这个能力——要改平台配置，请打开右下角的构建助手。"
+        )
+
+    @staticmethod
     def agent_denial(
         *,
         tool: ToolDefinition,
@@ -727,6 +760,11 @@ class ToolGateway:
         if self.missing_scopes(tool=tool, context=context):
             return False
 
+        # 平台管理工具按身份判，不按 `allowed_tools` 判：默认智能体不收窄，
+        # 只靠边界永远拦不住它（见 `internal_denial`）。
+        if self.internal_denial(tool=tool, context=context):
+            return False
+
         if tool.allowed_roles and not set(tool.allowed_roles) & set(context.roles):
             return False
 
@@ -780,6 +818,17 @@ class ToolGateway:
         context: ToolExecutionContext,
     ) -> None:
         missing_scopes = self.missing_scopes(tool=tool, context=context)
+
+        # 身份先于权限：不是构建助手时，连「缺 scope」都不必提——
+        # 说缺权限会让模型换个身份再试，而这里换不了。
+        internal = ToolGateway.internal_denial(tool=tool, context=context)
+        if internal:
+            await self._deny(
+                tool=tool,
+                context=context,
+                reason=DENIAL_AGENT,
+                message=internal,
+            )
 
         if missing_scopes:
             await self._deny(

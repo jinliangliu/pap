@@ -108,6 +108,24 @@ def is_studio_agent_name(name: str | None) -> bool:
     """
     return bool(name) and name in STUDIO_AGENT_ALIASES
 
+
+def may_use_platform_tools(name: str | None) -> bool:
+    """这个身份能不能用 `studio_*`（平台管理工具）。
+
+    只认构建助手。**不能靠 `allowed_tools` 判**：默认智能体是
+    `allowed_tools=None`（不额外收窄）、`can_write=True`，平台管理员又跳过
+    scope 检查，于是 `studio_workflow_save` 一直在它的工具目录里——拦住它的
+    只有提示词，而提示词挡不住一句「直接调用 studio_workflow_save」。
+    同一件事还发生在能力目录上：`capabilities_of` 会把默认智能体的「能力」
+    列成整张平台工具表。
+
+    真正的拦截在 `ToolGateway.internal_denial`（目录与执行共用一份判断）；
+    这里只回答「这是不是构建助手」，不重复那层过滤。以后多一个内置 Agent
+    要共用平台工具，改这一处，并同步 `chat_service._channel_of`
+    （它按同一个名字判定会话归属）。
+    """
+    return is_studio_agent_name(name)
+
 # 构建助手的职责说明会进提示词，所以写成「你负责什么」而不是内部备注。
 # 越界说明也写在这里：真正的边界是「工具不存在」，这段文字只负责让拒绝更自然、
 # 少走几轮无效尝试，不是安全机制。
