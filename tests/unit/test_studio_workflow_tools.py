@@ -404,7 +404,9 @@ async def test_describe_detail_puts_the_graph_in_the_message():
     assert [node["id"] for node in stored["nodes"]] == ["classify", "diagnose", "answer"]
     assert '"entry": "classify"' in result.message
     # 改图的那句话要连着图一起给，否则模型会自己发明一份新图。
-    assert "studio_workflow_save" in result.message
+    # 但不要写成工具名：这一行是正文，用户会读到的。
+    assert "整份传回来" in result.message and "没传的节点等于删掉了" in result.message
+    assert "studio_" not in result.message
 
 
 async def test_describe_missing_workflow_says_so():

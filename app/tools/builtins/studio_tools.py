@@ -809,8 +809,9 @@ async def _describe_workflows(
         else:
             lines.append("这张流程还没有运行记录。")
 
+        # 这一行也要按「正文」写：图下面那行会被原样念给用户听，工具名留给模型自己知道。
         lines.append(
-            "图（要改就整份传回 studio_workflow_save，只改那几个节点；"
+            "图（要改就整份传回来，只改那几个节点；"
             "别凭印象重写——没传的节点等于删掉了）："
         )
         lines.append(json.dumps(definition, ensure_ascii=False, indent=2))
@@ -838,11 +839,13 @@ async def _describe_workflows(
             success=True,
             verified=True,
             result={"resource": "workflow", "items": [], "total": 0, "truncated": False},
+            # 这段是**给用户看的正文**（读工具的 message 就是正文）：所以只陈述事实与
+            # 下一步能做什么，不写工具名与参数模式。这条曾经原样出现在答复里——
+            # 模型重复调同一个工具时，收敛分支直接把它当答案交了出去。
             message=(
                 "当前租户还没有任何编排流程。"
-                "新建用 studio_workflow_save mode=create，但要先 studio_describe resource=agent "
-                "看有哪些智能体——图里的 agent 只能填清单里启用中的标识。"
-                "触发方式是在对话里发「/workflow <标识> <要做的事>」。"
+                "想建一张，把「谁先做、再做什么、按什么分流」说清楚就行，"
+                "我会起草一版给你确认，确认后才会建。"
             ),
             verification={"source": "workflows_table", "count": 0},
         )
@@ -857,11 +860,8 @@ async def _describe_workflows(
             + (f" · 最近 {last['status']}" if last.get("status") else " · 还没跑过")
             + (f" · {item['description']}" if item["description"] else "")
         )
-    lines.append("要看某一张的图，用 ref 传它的标识；改/删分别用 studio_workflow_save / studio_workflow_delete。")
-    lines.append(
-        "新建之前先 studio_describe resource=agent：图里每一步填的 agent 必须是那份清单里"
-        "启用中的标识，保存时会逐个核对。"
-    )
+    lines.append("要看某一张的图、要改、要删，说它的名字就行。")
+    lines.append("新建时会逐个核对图里每一步的智能体在不在、是不是启用中。")
 
     return ToolExecutionResult(
         success=True,

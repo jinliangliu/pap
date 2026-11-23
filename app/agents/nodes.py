@@ -29,6 +29,7 @@ from app.agents.planner import (
     ModelNotConfiguredError,
     create_action_plan,
 )
+from app.agents.prompts import STUDIO_BUILD_NUDGE
 from app.agents.schemas import ActionType
 from app.agents.slots import (
     build_slot_question,
@@ -780,6 +781,25 @@ async def _record_skill_hit(
         )
 
 
+# 「是不是一段有先后的处置过程」——只用于构建助手那一处纠正，不做通用意图识别。
+# 判据要窄：出现「先」「首先」之类的起手，且有「再」「然后」「最后」这类接续，才算有先后。
+# 带问号的句子一律不算：那是提问，不是要你排图。
+_SEQUENCE_OPEN = ("先", "首先", "第一步")
+_SEQUENCE_NEXT = ("再", "然后", "接着", "最后", "之后", "→")
+_QUESTION_CUES = ("？", "?", "吗", "怎么", "如何", "什么", "哪些", "是不是", "为什么")
+
+
+def _looks_like_process(text: str) -> bool:
+    body = (text or "").strip()
+    if not body or len(body) > 300:
+        return False
+    if any(cue in body for cue in _QUESTION_CUES):
+        return False
+    return any(cue in body for cue in _SEQUENCE_OPEN) and any(
+        cue in body for cue in _SEQUENCE_NEXT
+    )
+
+
 async def plan_request(state: AgentState) -> dict[str, Any]:
     gateway = get_tool_gateway()
     context = _context(state)
@@ -901,6 +921,53 @@ async def plan_request(state: AgentState) -> dict[str, Any]:
     # 实测 token 交给这一轮之外的 `chat_service` 用：按 run_id 暂存，
     # 图返回后它会取走并落库，下一轮据此决定要不要压缩。
     stash_usage_for_run(state.get("run_id"), usage)
+
+    # 构建助手里，用户说了一段「先…再…」的过程，模型却只回了一段话——既没交图，
+    # 也没查任何东西：这一轮等于白过。它要么在替用户复述原则（「这条我记下了」），
+    # 要么在问「要建流程还是先查现场」。起草是只读的、免费的，所以纠一次：
+    # 把「本轮必须交图」追加进 system 再规划一次（和结构化输出那次纠正同一个手法：
+    # 同一句话写在职责说明里三遍都没用，写成「本轮要求」才管用）。
+    #
+    # 只纠一次、只对构建助手、只在 chat 时生效。别的智能体说一段先后，很可能就是要
+    # 你照着做一遍，纠成「去建图」是把它理解错了。
+    if (
+        plan.action is ActionType.CHAT
+        and agent_service.is_studio_agent_name(boundary.agent_name)
+        and _looks_like_process(_last_user_text(state))
+    ):
+        retry_usage: dict[str, Any] = {}
+        try:
+            retry = await create_action_plan(
+                user_message=user_message,
+                available_tools=catalog,
+                pending_tool_name=state.get("planned_tool_name"),
+                pending_slots=state.get("planned_arguments") or {},
+                known_user_facts=known_user_facts,
+                conversation_summary=conversation_summary,
+                recent_turns=recent_turns,
+                agent_block=f"{agent_block}\n\n{STUDIO_BUILD_NUDGE}",
+                skill_block=skill_block,
+                delegation_block=delegation_block,
+                skill_meta=skill_meta,
+                usage_sink=retry_usage,
+            )
+        except Exception as exc:  # noqa: BLE001 - 纠错失败就用原来的答复，不能把这一轮弄挂
+            logger.info(
+                "构建助手的起草纠正失败，沿用原计划。",
+                extra={"event": "studio_build_nudge_failed", "error": str(exc)[:200]},
+            )
+        else:
+            # 两次调用的 token 都要算进这一轮：只记后一次会让压缩水位偏低。
+            for key, value in retry_usage.items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
+                else:
+                    usage[key] = value
+            if retry.action not in (ActionType.CHAT, ActionType.CLARIFY):
+                plan = retry
+                trace = current_trace()
+                if trace is not None:
+                    trace.attrs["studio_build_nudge"] = "retried"
 
     if plan.action is ActionType.CHAT:
         return _answer(plan.response or "我已收到你的请求。", intent="chat")

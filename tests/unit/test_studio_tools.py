@@ -933,3 +933,33 @@ def test_tool_inventory_says_which_tools_can_still_be_removed():
     body = "\n".join(text.splitlines()[:-1])  # 最后一行是通用提示，本身含「代码注册」四个字
     assert "1 个代码注册、删不掉" in body
     assert "可删：prv_b" in body
+
+
+async def test_empty_workflow_list_reads_like_something_a_person_says(monkeypatch):
+    """0 张流程时那句正文，曾经原样出现在用户屏幕上。
+
+    模型重复调同一个工具（同一参数）时，`nodes.plan_request` 的收敛分支直接拿
+    工具的 message 当答案交出去。于是用户读到的是「新建用 studio_workflow_save
+    mode=create，但要先 studio_describe resource=agent……」——给他看的正文里
+    出现了他的工作里不存在的东西。
+
+    读工具的 message 就是正文，所以这条分支只能写「还没有」与「你可以怎么说」。
+    """
+
+    async def _no_workflows(_tenant_id):
+        return []
+
+    async def _no_runs(**_kwargs):
+        return []
+
+    # 工具里是函数内 import，补丁要打在服务模块上。
+    from app.services import workflow_service
+
+    monkeypatch.setattr(workflow_service, "list_workflows", _no_workflows)
+    monkeypatch.setattr(workflow_service, "list_runs", _no_runs)
+
+    result = await studio_tools.studio_describe(_ctx(), {"resource": "workflow"})
+
+    assert "还没有任何编排流程" in result.message
+    assert "studio_" not in result.message
+    assert "mode=" not in result.message
