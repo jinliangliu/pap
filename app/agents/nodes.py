@@ -54,7 +54,6 @@ from app.services.approval_service import (
     ApprovalParameterMismatchError,
     ApprovalStateError,
 )
-from app.services.delegation_limits import DelegationLimits
 from app.services.run_service import finish_run
 from app.tenancy.context import tenant_scope
 from app.tools.catalog import build_model_tool_catalog
@@ -229,6 +228,11 @@ _META_KEYS = frozenset(
         "note",
         "scope",
         "query",
+        # 结果对不对，不是「又给你一份结论」。起草工具（`studio_workflow_draft`）
+        # 的 `message` 里已经说了「这张图能存 / 差在哪」，再铺一行「ok：True」
+        # 等于把报文原样贴给用户；`writable_nodes` 同理（上面那句已经列了）。
+        "ok",
+        "writable_nodes",
         # 查询对象（agent / tool / run …）：这是工具的入参回显，不是结果。
         # 漏在这里的代价是用户会看到「resource：tool」「total：99」这种内部字段，
         # 混在答案后面像半截报文。
@@ -1226,6 +1230,10 @@ async def execute_read_tool(state: AgentState) -> dict[str, Any]:
             "error_code": result.error_code,
             "result": result.result,
             "tool_steps": steps,
+            # 读工具也能给图（`studio_workflow_draft` 就是）：起草出来的那张图要
+            # 能画在气泡里，才能「看着图改一句话」。不放到这里，用户看到的只有
+            # 「步骤：a → b」那行字，而他要核对的是形状。
+            **_result_graph(result),
         },
         "error_category": None if result.success else (result.error_code or "tool_failed"),
     }

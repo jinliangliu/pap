@@ -370,3 +370,26 @@ def test_graph_never_leaks_into_the_answer_text() -> None:
 
     assert "graph" not in _summarize_result(result)
     assert "已新建流程" in _summarize_result(result)
+
+
+def test_draft_result_does_not_dump_ok_flag() -> None:
+    """起草的 `message` 已经说了「这张图能存 / 差在哪」。
+
+    再铺一行「ok：True」和「writable_nodes：…」就是把报文原样贴给用户——
+    读者会以为那是他需要核对的东西，其实正文里已经用人话说过了。
+    """
+    result = _result(
+        message="这张图能存。\n步骤：check（field-ops） → report（汇总）",
+        result={
+            "ok": True,
+            "errors": [],
+            "writable_nodes": ["check"],
+            "graph": {"nodes": [{"id": "check"}]},
+        },
+    )
+
+    summary = _summarize_result(result)
+    assert "ok：True" not in summary
+    assert "writable_nodes" not in summary
+    # 正文与图都在，只是不再重复字段。
+    assert "这张图能存" in summary
