@@ -2075,7 +2075,7 @@ async def _preflight_workflow(
 async def _workflow_agent_facts(
     context: ToolExecutionContext,
     plan: Any,
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[Any, list[dict[str, Any]], list[str], list[tuple[str, str, str]]]:
     """起草时问库三件事：谁不在、谁不是启用中、哪几步允许写。
 
     与 `save_workflow` 里的 `_ensure_agents_available` 查的是同一份清单
@@ -2083,21 +2083,30 @@ async def _workflow_agent_facts(
     差别只在「一次说全」和「抛第一个」。起草阶段抛第一个没有意义：模型要的是
     「改哪里」，不是「被拒了」。
 
-    不在错误里列可用名单：`studio_describe resource=agent` 能列全，而这里是
-    「差一个名字」的场合，把八个名字塞进一句话只会挤掉真正的错误。
+    先把显示名换成标识（`resolve_plan_agents`，与保存共用一份）：用户说
+    「这一步用通用助手」，模型照写「通用助手」是完全正常的产物，不该被判错——
+    「名字对不上就重来」是这一层最没必要收的一轮成本。
+
+    返回里带上换过的名单：草稿要说得出「按 assistant 安排」，否则用户看到
+    图上是 `assistant`，会以为自己那句话没被听见。
     """
     from app.services import agent_service, workflow_service
     from app.tenancy.context import tenant_scope
-
-    wanted = workflow_service.plan_agents(plan)
-    if not wanted:
-        return [], []
 
     with tenant_scope(context.tenant_id):
         async with async_session_factory() as session:
             rows = await agent_service.list_agents(session)
 
+    plan, renames = workflow_service.resolve_plan_agents(plan, rows)
+    wanted = workflow_service.plan_agents(plan)
+    if not wanted:
+        return plan, [], [], renames
+
     available = {str(row.name): row for row in rows}
+    # 「差一个名字」时给几个候选，省掉一次 studio_describe 往返。
+    # 这里不再是当初那个「列全八个名字」的顾虑：只列 4 个，且带着显示名，
+    # 一句话读得完，而省下的是整整一轮对话。
+    sample = "、".join(f"{row.name}（{row.display_name}）" for row in rows[:4])
     problems: list[dict[str, Any]] = []
     writable: list[str] = []
 
@@ -2109,9 +2118,9 @@ async def _workflow_agent_facts(
                     "node": node_id,
                     "code": "WORKFLOW_UNKNOWN_AGENT",
                     "message": (
-                        f"第「{node_id}」步指定的智能体「{name}」不存在。"
-                        "先 studio_describe resource=agent 看有哪些可用标识；"
-                        "要用的角色还没建，就先建出来。"
+                        f"第「{node_id}」步指定的智能体「{name}」不在本租户里。"
+                        + (f"可用的有：{sample}。" if sample else "")
+                        + "填标识或显示名都可以；要用的角色还没建，就先建出来。"
                     ),
                 }
             )
@@ -2138,7 +2147,7 @@ async def _workflow_agent_facts(
         if bool(getattr(row, "can_write", True)):
             writable.append(node_id)
 
-    return problems, writable
+    return plan, problems, writable, renames
 
 
 async def studio_workflow_draft(
@@ -2180,7 +2189,7 @@ async def studio_workflow_draft(
             ),
         )
 
-    problems, writable = await _workflow_agent_facts(context, plan)
+    plan, problems, writable, renames = await _workflow_agent_facts(context, plan)
     graph = _workflow_graph(plan)
 
     # 名字冲突只在给了 name 时才查，且不算错误：同名意味着「保存要用 update」，
@@ -2193,6 +2202,14 @@ async def studio_workflow_draft(
         existing = await workflow_service.get_workflow(context.tenant_id, name)
 
     lines = ["这张图能存。", *_workflow_steps_text(plan)]
+    if renames:
+        # 说清「换成了谁」：图里从此显示 `assistant`，而用户说的是「通用助手」。
+        # 不说明的话，卡上那个人在他眼里就是凭空出现的。
+        lines.append(
+            "角色名已对到标识："
+            + "、".join(f"{given} → {target}" for _, given, target in renames)
+            + "（图里存标识，运行时按它取智能体）。"
+        )
     if writable:
         lines.append(
             "允许写的步骤："

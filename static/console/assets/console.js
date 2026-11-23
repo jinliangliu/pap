@@ -3041,6 +3041,13 @@
         studioAutoGrow();
         studioInput.focus();
       }
+      /* 预填之后要**自己**刷新一次按钮状态：`value = ...` 不触发 input 事件，
+         而面板刚打开时按钮是按空输入框算的（灰着）。不补这一行，用户看到
+         一句话已经填好了、发送键却是灰的，只能按回车——那不是他该发现的事。 */
+      updateStudioSend();
+      // 用户已经用命令说了「要建流程」，面板就别再问一遍「是建流程还是查现场」。
+      // 只标这一条：发出去之后在面板里接着聊的，都是普通消息。
+      studioUI.viaBuild = !!buildBrief;
       toast(
         buildBrief
           ? (dropped ? "已转到构建助手（附件没带过去，那里要重新选）" : "已转到构建助手：确认那句话再发送")
@@ -12093,7 +12100,10 @@
     historyTried: false,
     focus: "",
     agents: [],
-    agentName: ""
+    agentName: "",
+    /* 这一句是从对话台的 `/build` 转过来的：意图已经确定是建流程。
+       只对紧接着发出去的那一条生效，发完就清——在面板里接着聊的都是普通消息。 */
+    viaBuild: false
   };
 
   function studioThread() {
@@ -12365,6 +12375,36 @@
         richText(msg.text) + "</div>";
     }
 
+    /* 追问候选：模型问「这一步由谁做」时，答案本来是一份枚举。
+       点一下就是回答，不必把显示名打一遍——打一遍既有拼错的余地，
+       也让那一问显得比它该有的分量重。只渲染有候选的项：阈值、站点这类
+       只能手填的，照旧留给输入框。
+
+       **只给最后一条**：后面的用户消息一出现，这个问题的答案就定了。
+       刷新之后也照这条规则走（历史里带着同一份 clarify），所以不会出现
+       「当场能点、刷新只剩一句话」。 */
+    var answerable = msg.clarify && msg.clarify.length &&
+      index === studioUI.messages.length - 1;
+    if (answerable) {
+      out += '<div class="studio-cl">';
+      msg.clarify.forEach(function (item) {
+        var options = (item && item.options) || [];
+        if (!options.length) return;
+        if (item.question) {
+          out += '<div class="cl-q"><span class="cl-q-text">' +
+            esc(item.question) + "</span></div>";
+        }
+        options.forEach(function (opt) {
+          var label = String((opt && (opt.label || opt.value)) || "").trim();
+          if (!label) return;
+          var send = String((opt && (opt.value || opt.label)) || "").trim() || label;
+          out += '<button type="button" class="cl-pick" data-clpick="' +
+            esc(send) + '">' + esc(label) + "</button>";
+        });
+      });
+      out += "</div>";
+    }
+
     /* 结果里的结构图（编排流程存下来之后那张）。位置在正文之下：正文说的是
        「存成了什么」，图说的是「什么形状」，先读结论再核对形状。
 
@@ -12493,6 +12533,18 @@
         );
       });
     });
+
+    /* 追问候选＝一句话的答案：填进输入框再走一次正常发送，
+       而不是另开一条提交路径——那样面板就会有两套「怎么发出去」。 */
+    $$("[data-clpick]", log).forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var input = $("#studio-input");
+        if (!input || studioUI.busy) return;
+        input.value = btn.getAttribute("data-clpick") || "";
+        studioAutoGrow();
+        studioSend();
+      });
+    });
   }
 
   /* 输入框随内容长高，到上限后内部滚动。
@@ -12599,11 +12651,22 @@
     // 悄悄塞进去会让人看不出「它到底在改哪一个」。
     var outgoing = studioUI.focus ? "（当前对象：" + studioUI.focus + "）\n" + text : text;
 
+    /* 从 `/build` 转来的这一句，带上来源。
+       这是用户自己说过的话（他打的命令），写成可见前缀而不是隐藏字段：前端看得见、
+       历史里还在，不必猜「它为什么突然知道我要建流程」。 */
+    if (studioUI.viaBuild) {
+      outgoing = "[来自 /build：这次是要建编排流程]\n" + outgoing;
+      studioUI.viaBuild = false;
+    }
+
     // 发送就等于说完了：不收起麦克风的话，识别结果会继续往已清空的输入框里写。
     if (studioVoice.active) studioVoiceStop();
 
+    /* 本地回显用 `outgoing` 而不是 `text`：前缀（当前对象、来自 /build）是真发出去
+       的那份，也会随历史读回来。回显用 `text` 就成了「当场没有、刷新之后多一行」，
+       而这类前后不一致没人会当成 bug 报。 */
     studioUI.messages.push({
-      role: "user", text: text, attachments: files.slice(),
+      role: "user", text: outgoing, attachments: files.slice(),
       at: new Date().toISOString()
     });
     var placeholder = { role: "agent", text: "思考中…", at: null };
@@ -12638,9 +12701,24 @@
       placeholder.at = r.assistant_message_at || new Date().toISOString();
       // 结果里的结构图（目前只有编排流程给）。拿不到就不画，不影响这条消息。
       placeholder.graph = (r.metadata && r.metadata.graph) || null;
+      /* 追问项要留在消息上，否则下一屏重画就没有候选可点了。
+         规范化用对话台同一份（clarify.js）：条数、长度、去重在那里已经写死了，
+         这里再写一套，两边的上限迟早不一样。 */
+      placeholder.clarify = window.PAPClarify
+        ? window.PAPClarify.normalize((r.metadata || {}).clarify)
+        : null;
 
+      /* 面板上不摆内部状态码：`status=needs_input` 对用户没有意义，看着还像故障。
+         这里只翻三种会出现在面板里的；其余原样（宁可露出原文，也不要编一个说法）。 */
+      var STUDIO_STATUS_TEXT = {
+        needs_input: "等你回一句",
+        awaiting_approval: "待你确认",
+        rejected: "未受理"
+      };
       var meta = [];
-      if (r.status && r.status !== "completed") meta.push("status=" + r.status);
+      if (r.status && r.status !== "completed") {
+        meta.push(STUDIO_STATUS_TEXT[r.status] || r.status);
+      }
       if (r.error_category) meta.push("error=" + r.error_category);
       placeholder.meta = meta.join(" · ");
       placeholder.status = r.status === "error" ? "error" : "ok";
@@ -12757,6 +12835,11 @@
            但**带审批号的消息不画**：那张卡就在上面，卡里同一份图刷新后还在。
            当场不画、刷新后又画出来，是同一次操作在两种时机长成两个样子。 */
         if (role === "agent" && meta.graph && !meta.approval_id) item.graph = meta.graph;
+        /* 追问项也随消息入库。不回填的话，刷新之后最后那句「这一步由谁做」
+           就只剩一行字，而当场它下面是有候选的。 */
+        if (role === "agent" && meta.clarify && window.PAPClarify) {
+          item.clarify = window.PAPClarify.normalize(meta.clarify);
+        }
         if (role === "agent" && ownsApproval(meta)) {
           item.approval = await studioApprovalCard(meta.approval_id, m.content);
         }

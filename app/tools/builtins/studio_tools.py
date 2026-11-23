@@ -190,7 +190,38 @@ def _agent_lines(rows: list[Agent]) -> str:
     lines.extend(_agent_line(row) for row in rows[:MAX_LIST_ITEMS])
     if len(rows) > MAX_LIST_ITEMS:
         lines.append(f"…另有 {len(rows) - MAX_LIST_ITEMS} 个未列出")
+    lines.append(_node_agents_line(rows))
     return "\n".join(lines)
+
+
+def _node_agents_line(rows: list[Agent]) -> str:
+    """单独一行：**哪些智能体能填进编排图**。
+
+    为什么值得单占一行：自然语言建流程时，模型接下来要回答的是「每一步由谁做」，
+    而它手上只有这份清单。以前清单里没把「启用中」提炼出来，模型就转头去问用户
+    「这一步用谁」——而答案本来就在它自己刚读到的这份清单里。把枚举摆到面前，
+    那一问就没有发生的理由。
+
+    已经有人问过一次了（线上实测）：用户答「通用助手」，模型还是把同一个问题
+    再问一遍。它不是不认这个词，是不确定这个词能不能填进图里。
+    """
+    from app.services import workflow_service
+
+    ready = [row for row in rows if row.status == AgentStatus.ACTIVE]
+    if not ready:
+        return "能放进编排图的：没有——当前没有启用中的智能体，图里任何一步都填不进去。"
+
+    text = "能放进编排图的（启用中）：" + "、".join(
+        f"{row.name}（{row.display_name}）" for row in ready[:MAX_LIST_ITEMS]
+    )
+    idle = [row for row in rows if row.status != AgentStatus.ACTIVE]
+    if idle:
+        text += "。不能进图：" + "、".join(
+            f"{row.name}（"
+            f"{workflow_service.AGENT_STATUS_TEXT.get(str(row.status.value), str(row.status.value))}）"
+            for row in idle[:4]
+        )
+    return text
 
 
 # 一组工具名最多列几个。清单是给人扫一眼的，不是给人逐条读的：

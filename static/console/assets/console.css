@@ -1486,6 +1486,31 @@ pre.code {
 .cl-foot { display: flex; align-items: center; gap: 9px; margin-top: 10px; }
 .cl-foot .cl-hint { font-size: 11px; color: var(--faint); }
 
+/* ---------------- 构建助手面板里的追问候选 ----------------
+ *
+ * 面板与对话台不是同一套追问：那里是单选组 + 「提交」，这里点一下就把这句发出去
+ * （面板只有一条输入流，多一步确认只是多一步）。视觉语言保持一致——宽边框、
+ * 悬停转绿、不用主按钮色：它是候选，不是「确认」。
+ *
+ * 为什么要有这一块：模型问「这一步由谁做」时，答案本来就是一份枚举。让人把
+ * 「通用助手」四个字打一遍，既有拼错的可能，也让那一问显得比它实际该有的分量重。
+ */
+.studio-cl { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.studio-cl .cl-q { width: 100%; margin-bottom: 0; }
+.studio-cl .cl-pick {
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+}
+.studio-cl .cl-pick:hover { border-color: var(--green-line); background: var(--green-soft); }
+
 /* ---------------- 审批卡 ----------------
  *
  * 从「标题 + 一整段 JSON」拆成五段：抬头（谁要做什么 + 状态）→ 结论 → 单子本体

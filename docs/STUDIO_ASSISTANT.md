@@ -163,7 +163,7 @@ new.allowed_tools ⊆ 请求人当前可见的工具集
 | `studio_import` | `write` | 是 | 把会话里已上传的文件按用途建成知识库 / 技能 / 工具；判类靠内容与原始文件名 |
 | `studio_connector_save` | `write` | 是 | 建/改连接器定义，**不接受凭据** |
 | `studio_connector_delete` | `destructive` | 是 | 下面还挂着工具时会被后端拒绝 |
-| `studio_workflow_draft` | `read` | 否 | 起草：交一张图，只回答「能不能存、差在哪」，不落库、不涨 `revision` |
+| `studio_workflow_draft` | `read` | 否 | 起草：交一张图，只回答「能不能存、差在哪」，不落库、不涨 `revision`；角色填标识或显示名都认 |
 | `studio_workflow_save` | `write` | 是 | 建/改编排流程；`definition` 原样交给 `compile_definition` |
 | `studio_workflow_delete` | `destructive` | 是 + 输名字 | 只删配置；未完结的 run 按冻结的图继续 |
 
@@ -208,7 +208,16 @@ new.allowed_tools ⊆ 请求人当前可见的工具集
 函数。这条不是可有可无的完整性检查——自然语言建流程时模型不知道租户里有哪些
 智能体，凭语义编一个 `inspector` 是最自然的动作；不挡的话图存得进去，一直到有人
 `/workflow` 触发才失败，而那时配图的人早就不在屏幕前了。拒绝理由要带**可用标识**
-（`当前租户的智能体：cs、ops`），只说「不存在」下一轮它还会编。
+（`当前租户的智能体：cs（客服）、ops（运维）`），只说「不存在」下一轮它还会编。
+
+**「填什么名字」不该问用户。** 图里存标识（`assistant`），而人说的是显示名
+（「通用助手」）。这一层自己换（`workflow_service.resolve_plan_agents`，保存与
+起草共用）：图里两种写法都认，落库前统一成标识。换过谁要在草稿里说出来
+（「通用助手 → assistant」），否则卡上那个人在用户眼里就是凭空出现的。
+重名的显示名**不猜**——两个「运维」是两张边界，按名字挑一个等于替用户决定了权限。
+
+这也是为什么 `studio_describe resource=agent` 的清单末尾固定有一行
+「能放进编排图的（启用中）：…」：枚举在库里，读一次就有，不该让用户把它再打一遍。
 
 **起草不算第三个写工具。** `studio_workflow_draft` 是 `read`：它把同一份
 `compile_definition` 与同一份 `_ensure_agents_available` 的口径跑一遍，然后**不写库**。

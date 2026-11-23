@@ -178,16 +178,31 @@ async def save_workflow(
     except DefinitionError as exc:
         raise WorkflowError(exc.code, exc.message, node=exc.node) from exc
 
-    compiled = plan.as_json()
-
     with tenant_scope(tenant_id):
         async with async_session_factory() as session:
             async with session.begin():
+                # 编译之后、落库之前把显示名换成标识。放在这里而不是编译前，
+                # 是为了不改 `compile_definition`（纯函数，不认识库）。见
+                # `resolve_plan_agents`：用户说「通用助手」，图里就写「通用助手」，
+                # 存进去的必须还是 `assistant`。
+                agents = await agent_service.list_agents(session)
+                plan, renames = resolve_plan_agents(plan, agents)
+                compiled = plan.as_json()
+                if renames:
+                    logger.info(
+                        "流程里的显示名已换成标识。",
+                        extra={
+                            "event": "workflow_agent_renamed",
+                            "workflow": name,
+                            "renames": [f"{node}:{given}->{target}" for node, given, target in renames],
+                        },
+                    )
+
                 row = await session.scalar(select(Workflow).where(Workflow.name == name))
 
                 graph_changed = row is None or compiled != (row.definition or {})
                 if graph_changed:
-                    await _ensure_agents_available(session, plan)
+                    _ensure_agents_available(plan, agents)
 
                 if row is None:
                     row = Workflow(
@@ -584,7 +599,103 @@ def plan_agents(plan: WorkflowPlan) -> list[tuple[str, str]]:
     return out
 
 
-async def _ensure_agents_available(session, plan: WorkflowPlan) -> None:
+def agent_lookup(rows: Any) -> dict[str, str]:
+    """`写的名字 -> 租户里的标识`。标识与显示名都登记，显示名重名的不登记。
+
+    为什么需要它：图里存的是标识（`assistant`），而用户嘴里说的是显示名
+    （「通用助手」）。对话里建流程时，模型也就跟着用户说显示名——它没有理由
+    知道内部标识叫什么。以前这种图会被判「智能体不存在」，然后模型既不认识
+    那个名字也不敢猜，只能回头再问一遍「由谁做」；那一问对用户是纯损失。
+
+    两条边界：
+
+    - **标识优先**。某个显示名恰好等于另一个智能体的标识时，按标识走（否则
+      「填 ops」会随插入顺序变成两个人）；标识占住的键也不会被显示名覆盖。
+    - **重名的显示名不登记**。两个「运维」是两张不同的边界（工具、可写、转交
+      深度都不同），按显示名挑一个等于替用户决定了权限。宁可报「不存在」并
+      列出标识。
+    """
+    table: dict[str, str] = {}
+    for row in rows:
+        name = str(row.name)
+        table[name] = name
+        table.setdefault(name.casefold(), name)
+
+    occupied = set(table)
+
+    # 显示名按「有多少个智能体声称是这个显示名」分组，只有一个才登记。
+    claims: dict[str, list[str]] = {}
+    for row in rows:
+        display = str(getattr(row, "display_name", "") or "").strip().casefold()
+        if not display or display in occupied:
+            continue
+        owners = claims.setdefault(display, [])
+        name = str(row.name)
+        if name not in owners:
+            owners.append(name)
+
+    for display, owners in claims.items():
+        if len(owners) == 1:
+            table[display] = owners[0]
+
+    return table
+
+
+def resolve_agent_name(rows: Any, ref: str) -> str | None:
+    """一个名字对到标识；对不上返回 None（不猜）。
+
+    忽略大小写与前后空白——人和模型都会写 `Assistant`、` 通用助手 `。
+    """
+    text = str(ref or "").strip()
+    if not text:
+        return None
+    table = agent_lookup(rows)
+    return table.get(text) or table.get(text.casefold())
+
+
+def resolve_plan_agents(
+    plan: WorkflowPlan,
+    rows: Any,
+) -> tuple[WorkflowPlan, list[tuple[str, str, str]]]:
+    """把图里写的名字换成标识，返回 `(新图, [(节点, 原名, 标识)])`。
+
+    **换而不是拒**：用户说「这一步用通用助手」，图里就写 `通用助手` 是最自然的
+    产物；拒掉他只会换来一次「换个名字再试」，而平台的处境是「它明明知道
+    指的是哪一个」。
+
+    改写发生在**编译之后、落库之前**：`compiled = plan.as_json()` 里存的因此永远
+    是标识，运行期 `agent_invoker.invoke(target=...)` 按标识取 Agent 的那条路不用改。
+    """
+    lookup = agent_lookup(rows)
+    renames: list[tuple[str, str, str]] = []
+
+    def canon(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return value
+        return lookup.get(text) or lookup.get(text.casefold()) or value
+
+    nodes: dict[str, Any] = {}
+    for nid, node in plan.nodes.items():
+        agent = node.agent
+        target = canon(agent) if agent else agent
+        if agent and target != agent:
+            renames.append((nid, agent, target))
+        branches = node.branches
+        if branches:
+            mapped = []
+            for branch in branches:
+                chosen = canon(branch.agent)
+                if chosen != branch.agent:
+                    renames.append((nid, branch.agent, chosen))
+                mapped.append(replace(branch, agent=chosen))
+            branches = tuple(mapped)
+        nodes[nid] = replace(node, agent=target, branches=branches)
+
+    return replace(plan, nodes=nodes), renames
+
+
+def _ensure_agents_available(plan: WorkflowPlan, rows: Any) -> None:
     """图里的智能体必须存在且处于启用状态。
 
     这条校验不属于 `compile_definition`：那是纯函数，读不到库。可是「保存即编译，
@@ -595,18 +706,21 @@ async def _ensure_agents_available(session, plan: WorkflowPlan) -> None:
     用自然语言建流程时这不是边角情况：模型不知道租户里有哪些智能体，凭语义编一个
     `inspector` 是最自然的动作。所以拒绝理由必须把**可用的标识**一起给出来，
     下一轮它才能改对，而不是反复试名字。
+
+    进来之前已经过 `resolve_plan_agents`，所以这里的名字一定是标识或「真的不在」。
     """
     wanted = plan_agents(plan)
     if not wanted:
         return
 
-    rows = await agent_service.list_agents(session)
     available = {str(row.name): row for row in rows}
 
     for nid, name in wanted:
         row = available.get(name)
         if row is None:
-            names = [str(item.name) for item in rows[:_AGENT_HINTS]]
+            # 带显示名一起列：模型与用户都用显示名说话（「通用助手」），
+            # 只给标识等于让它再猜一轮。
+            names = [f"{item.name}（{item.display_name}）" for item in rows[:_AGENT_HINTS]]
             hint = (
                 f"当前租户的智能体：{'、'.join(names)}"
                 + ("…" if len(rows) > _AGENT_HINTS else "")
@@ -617,7 +731,8 @@ async def _ensure_agents_available(session, plan: WorkflowPlan) -> None:
             raise WorkflowError(
                 "WORKFLOW_UNKNOWN_AGENT",
                 f"第「{nid}」步指定的智能体「{name}」不存在。{hint}"
-                "要用别的智能体，先把它建出来并启用，再回来保存这张图。",
+                "填标识或显示名都可以。要用别的智能体，先把它建出来并启用，"
+                "再回来保存这张图。",
                 node=nid,
             )
 
