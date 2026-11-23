@@ -108,6 +108,36 @@ def is_clear_command(text: str) -> bool:
     return value[1:].strip().lower() == CLEAR_COMMAND[1:]
 
 
+# 「用一段话建流程」的界面快捷方式。**它不是平台命令**：写配置的手只在构建助手
+# 那里，服务端不替客户端做跳转，只负责说清「这条消息没有发给任何人」。
+#
+# 不复用 `/workflow` 的命名空间：它的第二个词一定是流程名，而 `new`、`build`
+# 恰好都是合法名字（`^[a-z][a-z0-9_-]{0,63}$`）——`/workflow new 建一个…`
+# 会被解析成「跑一条叫 new 的流程」，用户拿到的是一句「没有这个流程」。
+BUILD_COMMAND = "/build"
+
+BUILD_HANDOFF_MESSAGE = (
+    "「/build」是控制台里的快捷方式：它会打开右下角的构建助手，把这句话带过去。"
+    "写配置的手只在构建助手那里，所以这条消息没有发给任何智能体，也没有落库。"
+    "要在对话里建流程，开一条构建助手会话（agent=studio）再说这句话；"
+    "走接口则是 POST /api/v1/workflows。"
+)
+
+
+def is_build_command(text: str) -> bool:
+    """`/build` 是否出现在这条消息的开头（后面可以跟一整段描述）。
+
+    与 `/clear` 不同，它**允许**后面带正文——那段正文就是要带过去的那句话。
+    但必须「斜杠 + build + 空白或结尾」：`/builder`、`/buildall` 都该当作普通提问，
+    否则用户正常问一句就被一条 409 打断。
+    """
+    value = (text or "").strip()
+    if not value.lower().startswith(BUILD_COMMAND):
+        return False
+    rest = value[len(BUILD_COMMAND):]
+    return rest == "" or rest[0].isspace()
+
+
 def _clear_reply(cleared_turns: int) -> str:
     """`/clear` 的回复。
 

@@ -11,7 +11,11 @@ from app.db.session import async_session_factory
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services import agent_service
 from app.services.agent_service import AgentBoundary
-from app.services.chat_service import ChatService
+from app.services.chat_service import (
+    BUILD_HANDOFF_MESSAGE,
+    ChatService,
+    is_build_command,
+)
 from app.tenancy.context import tenant_scope
 
 logger = logging.getLogger(__name__)
@@ -62,6 +66,18 @@ async def chat(
     thread_id 由客户端提供以定位会话，但身份一律取自服务端认证结果。
     客户端传入的 user_id / tenant_id / 权限字段一律忽略。
     """
+    # `/build` 是界面的快捷方式，不是平台命令。放到最前面（连边界都不解析）：
+    # 这条消息不该创建默认 Agent、不该占配额、不该在会话里留一行。
+    #
+    # 为什么必须在这里拒、而不是放给模型：它不是 `/workflow`，会当成普通消息
+    # 发给模型，而模型会非常配合地回一句「已帮你把流程建好」——它没有那个工具，
+    # 只是在说一件听起来对的话。承诺了没做的事，用户要等到去编排页才发现。
+    if is_build_command(payload.message):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "CHAT_BUILD_HANDOFF", "message": BUILD_HANDOFF_MESSAGE},
+        )
+
     # 两个都传等于「这句话既交给这个人、又交给这条流程」：流程的每一步用的是
     # 节点自带的智能体，`agent` 在这里没有任何作用。与其静默丢掉一个，
     # 不如说清楚——「我选了它，它却换了一个人」是最难排查的那种。

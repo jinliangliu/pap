@@ -60,32 +60,33 @@
 
 ```
 studio_workflow_draft(name?, definition) -> {
-  ok: bool,
-  errors: [{node, code, message}],             # 编译期 + 保存期的两类错误合并
-  graph: {entry, nodes, edges},                # 与确认卡同一份形状
-  summary: "3 步：check（field-ops）→ check2（ops）→ report（汇总）",
-  preflight: {
-    agents_missing: ["ops"],                   # 图里填了清单里没有的角色
-    depth_hops: 2, max_nodes: 5,
-    approval_nodes: ["check2"],                # 这些节点的智能体带写工具，跑到会停
-    unreachable: ["check2"]                    # 模板引用了非必经路径上的节点
-  },
-  next: "把 errors[0] 改掉再交回来，不用重发整张图"
+  ok: bool,                        # 图能存、且图里的角色都在库里启用中
+  errors: [{node, code, message}], # 差在哪；空数组 = 没问题
+  graph: {entry, nodes, edges},    # 与确认卡同一份形状；ok 时才给
+  writable_nodes: ["advise"],      # 这几步的智能体允许写，动手时会停审批
+  message: "这张图能存。\n步骤：…\n分流：…\n角色：…\n允许写的步骤：…\n下一步：…"
 }
 ```
 
+`message` 是给人看的那一段（步骤 / 分流 / 角色与确认卡同一份拼接）；结构化字段是给
+气泡画图和给下一轮引用用的。**下一步的提示写在 `message` 尾部**，因为模型对工具
+返回末尾那句话的服从度高于系统提示。
+
 四条设计约束：
 
-1. **`errors` 必须带 `node`**。`DefinitionError` 已经带（能定位时），保存期那两类
-   （角色不存在、深度超限）在这里补齐。没有 `node` 的问题，模型只能整份重写。
-2. **`preflight` 查库，但只读**。`studio_describe resource=agent` 那一趟省不掉，
-   否则「图里写了 ops，而 ops 不存在」要等到保存时才暴露。
-3. **`next` 写在返回尾部**。模型对「工具刚告诉它的下一步」的服从度高于系统提示
-   （已在附件场景实测过），把「不要重发整张图」放在这里，比写进提示词三遍有用。
+1. **`errors` 必须带 `node`**。`DefinitionError` 已经带（能定位时），库校验那两类
+   （角色不存在、不是启用中）由 `_workflow_agent_facts` 补齐。没有 `node` 的问题，
+   模型只能整份重写。
+2. **库校验只读、且与保存同一份口径**。用的是 `save_workflow` 里那两个函数改名后的
+   公开版（`plan_agents` / `AGENT_STATUS_TEXT`），不另写一套「大概一样的遍历」——
+   口径分叉的表现是「起草说能存、保存被拒」，比不校验更让人不信任。
+3. **报「允许写」，不报「会审批」**。停不停审批取决于模型在那一轮决定调什么工具，
+   图上答不出来；能回答的只有「这一步的智能体允许写（`can_write`）」。
 4. **不落库的代价**：跨轮只剩摘要。所以 `definition` 要**原样回显**在结果里，
    并且 `chat_service` 落库时那份显式字段清单（`add_message(metadata={...})`，
    在 `persist.assistant_message` 那一段）要加上 `workflow_draft`——
    节点写进 `response_metadata` 不等于落库，漏加这一行就是「当场有、刷新没有」。
+   （P0 尚未做，见 §14。）
 
 工具名带 `studio_` 前缀，会由 `_studio_tool_names()` 自动进构建助手的边界，
 **不要**加进 `STUDIO_BUSINESS_READ_TOOLS`（那是业务读工具名单，有单测钉形状）。
@@ -216,14 +217,14 @@ A 的代价是可见的、C 的代价是长期的，B 的代价是治理上的�
 
 ## 11. 分期
 
-| 期 | 范围 | 出口条件 |
-|---|---|---|
-| P0 | `studio_workflow_draft` + 提示词收口 | 模型在一轮里至少调用 2 次 draft，且第 2 次只改出错的那个节点 |
-| P0 | `/build`（前端截住 + 后端 409 兜底） | 对话页输入 `/build ...` 能到面板；直接打 API 得到 409 而不是一段编出来的话 |
-| P1 | `save` 的 `patch` | 「把第 2 步换成 X」不改动其余节点（节点集合与边逐条对比） |
-| P1 | 草稿跨轮（`response_metadata.workflow_draft`） | 刷新后第二轮仍能引用上一轮的图，且 `messages` 行里真有这个字段 |
-| P2 | 备份取回（回滚） | 从 `write_backups` 取回第 N 份，`revision` 继续涨而不是回退 |
-| P2 | 对话里回显 run 的节点流水 | 跑完在会话里看得到每步耗时与输出前 N 字 |
+| 期 | 范围 | 出口条件 | 状态 |
+|---|---|---|---|
+| P0 | `studio_workflow_draft` + 提示词收口 | 模型在一轮里至少调用 2 次 draft，且第 2 次只改出错的那个节点 | **已完成**（2026-11-23） |
+| P0 | `/build`（前端截住 + 后端 409 兜底） | 对话页输入 `/build ...` 能到面板；直接打 API 得到 409 而不是一段编出来的话 | **已完成** |
+| P1 | `save` 的 `patch` | 「把第 2 步换成 X」不改动其余节点（节点集合与边逐条对比） | 未开始 |
+| P1 | 草稿跨轮（`response_metadata.workflow_draft`） | 刷新后第二轮仍能引用上一轮的图，且 `messages` 行里真有这个字段 | 未开始 |
+| P2 | 备份取回（回滚） | 从 `write_backups` 取回第 N 份，`revision` 继续涨而不是回退 | 未开始 |
+| P2 | 对话里回显 run 的节点流水 | 跑完在会话里看得到每步耗时与输出前 N 字 | 未开始 |
 
 ## 12. 验收用例
 
@@ -249,11 +250,41 @@ A 的代价是可见的、C 的代价是长期的，B 的代价是治理上的�
 ## 13. 相关文件
 
 - `app/orchestration/definition.py`：`compile_definition`、`DefinitionError.node`、`WorkflowPlan`
-- `app/services/workflow_service.py`：`save_workflow`（加 `patch` 参数，编译挪进事务）
-- `app/tools/builtins/studio_admin_tools.py`：`studio_workflow_save` / `_preflight_workflow` /
-  `_summarize_workflow_call` / `verify_workflow_saved` / `_backup_workflow`
-- `app/tools/builtins/studio_tools.py`：新工具 `studio_workflow_draft` 的注册位置
+- `app/services/workflow_service.py`：`save_workflow`（加 `patch` 参数，编译挪进事务）、
+  `plan_agents` / `AGENT_STATUS_TEXT`（起草与保存共用的判定）
+- `app/tools/builtins/studio_admin_tools.py`：`studio_workflow_draft` / `studio_workflow_save` /
+  `_workflow_agent_facts` / `_preflight_workflow` / `_summarize_workflow_call` /
+  `verify_workflow_saved` / `_backup_workflow` / `_workflow_steps_text`
 - `app/services/agent_service.py`：`STUDIO_INSTRUCTION` 的编排段（draft 先行的措辞）
-- `app/services/chat_service.py`：`/build` 的 409 兜底、`persist.assistant_message`
-  那段元数据清单（加 `workflow_draft`）
-- `static/console/assets/console.js`：`sendChat()` 的前缀截获、`setStudioOpen(true)` 与预填
+- `app/services/chat_service.py`：`is_build_command` / `BUILD_HANDOFF_MESSAGE`、
+  `persist.assistant_message` 那段元数据清单（加 `workflow_draft`）
+- `app/api/routes/chat.py`：`/build` 的 409（在解析智能体边界之前）
+- `app/agents/prompts.py`：`CHAT_SYSTEM_PROMPT` 第 6 条（编排类需求不替用户排步骤）
+- `static/console/assets/chatcmd.js` + `console.js`：`buildBrief` 与 `sendChat` 的前缀截获
+- `scripts/check_build_handoff.mjs`：前端判据自检（与后端用例同一份清单）
+
+## 14. 实现回写（P0，2026-11-23）
+
+做的是 §4（draft）与 §8（`/build`）。与设计稿不一样的四处，都记在这里，避免
+「文档写着 `preflight.approval_nodes`、代码里没有」这种下次一定查不出来的坑。
+
+| 设计稿 | 实现 | 为什么 |
+|---|---|---|
+| 返回里带 `preflight{agents_missing, unreachable, depth_hops}` | 只有 `ok` / `errors` / `graph` / `writable_nodes` + 一段 `message` | `_render_payload` 的渲染口径是「给人看的结果」，多一层嵌套对象在对话里只是噪音；「差什么」本来就是一串要逐条改的话 |
+| `approval_nodes`（跑到会停审批） | `writable_nodes`（这一步允许写） | 停不停审批取决于那一轮模型决定调什么工具，图上答不出来。说成「会审批」等于在图上编了一个审批点 |
+| 一次给出所有错误 | 只报第一处（`compile_definition` 是 fail-fast） | 要收集全部错误得改核心校验器，风险大于收益；配合「改一处再交一次」的话术，多轮成本可接受 |
+| `/build` 由 `sendChat` 内联正则识别 | 抽成 `chatcmd.js` 的纯函数 + `scripts/check_build_handoff.mjs` | console.js 是整页 IIFE（要 DOM 才能加载），内联的正则没法自检；抽出来后能与后端的用例逐条对照 |
+
+两处「写进去了但没做」的，别当成已完成：
+
+- **草稿跨轮**（§4 第 4 条）：`metadata.workflow_draft` 还没加，所以下一轮引用
+  上一版的图要靠历史里的工具结果；
+- **`patch` 与回滚**：`save_workflow` 还没有 `patch` 参数，回滚也还没接
+  `write_backups`——这两个是 P1/P2，今天只落地了起草那一半。
+
+顺带改的两处（不是新功能，是不改就会自相矛盾）：
+
+- `workflow_service` 的 `_plan_agents` / `_STATUS_TEXT` 改成公开的
+  `plan_agents` / `AGENT_STATUS_TEXT`：起草工具要用同一份判定；
+- `_summarize_workflow` 里「步骤 / 分流 / 角色」三行抽成 `_workflow_steps_text`，
+  确认卡与起草共用一份拼接。

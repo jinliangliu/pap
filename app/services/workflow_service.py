@@ -548,18 +548,24 @@ async def get_run(tenant_id: str, run_id: str) -> WorkflowRun | None:
 # ---------------------------------------------------------------- 内部
 
 
-_STATUS_TEXT = {"draft": "草稿", "disabled": "停用", "active": "启用"}
+# 智能体状态的界面说法。起草工具也要用（它不抛异常，只把「这一步停了」说给人听），
+# 所以是公开的：两份文案各写一遍，会出现「保存说你停用了、起草说你启用了」。
+AGENT_STATUS_TEXT = {"draft": "草稿", "disabled": "停用", "active": "启用"}
 
 # 拒绝时列几个可用标识。列全一屏没有意义，列三个又能让人看出「我该填什么」——
 # 取 8 是本层自己定的上限，与界面无关。
 _AGENT_HINTS = 8
 
 
-def _plan_agents(plan: WorkflowPlan) -> list[tuple[str, str]]:
+def plan_agents(plan: WorkflowPlan) -> list[tuple[str, str]]:
     """图里用到的智能体，`(第一次出现的节点 id, 标识)`。
 
     同一个智能体出现在多个节点上只校验一次，但**保留第一次出现的位置**：
     拒绝理由要说「第几步」，说「图里有错」等于没说。
+
+    公开（`_plan_agents` 改名）：起草工具要拿同一份清单去查「谁不在、谁停用了」，
+    另写一份「大概一样的遍历」迟早与保存时的判定分叉——而分叉的表现是
+    「起草说没问题、保存被拒」，比不校验更让人不信任。
     """
     seen: set[str] = set()
     out: list[tuple[str, str]] = []
@@ -590,7 +596,7 @@ async def _ensure_agents_available(session, plan: WorkflowPlan) -> None:
     `inspector` 是最自然的动作。所以拒绝理由必须把**可用的标识**一起给出来，
     下一轮它才能改对，而不是反复试名字。
     """
-    wanted = _plan_agents(plan)
+    wanted = plan_agents(plan)
     if not wanted:
         return
 
@@ -620,7 +626,7 @@ async def _ensure_agents_available(session, plan: WorkflowPlan) -> None:
             raise WorkflowError(
                 "WORKFLOW_INACTIVE_AGENT",
                 f"第「{nid}」步指定的智能体「{name}」当前是"
-                f"{_STATUS_TEXT.get(status, status)}状态，流程跑到那一步会被拒。"
+                f"{AGENT_STATUS_TEXT.get(status, status)}状态，流程跑到那一步会被拒。"
                 "先启用它，或换一个启用中的智能体。",
                 node=nid,
             )

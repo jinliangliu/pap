@@ -1971,11 +1971,23 @@ def _summarize_workflow(
     把它留在卡上，读者要在两处读同一份顺序。
     """
     lines = [f"{mode}流程「{name}」{f'（{display_name}）' if display_name and display_name != name else ''}"]
+    lines.extend(_workflow_steps_text(plan, with_steps=with_steps))
+    return "\n".join(lines)
+
+
+def _workflow_steps_text(plan: Any, *, with_steps: bool = True) -> list[str]:
+    """「步骤 / 分流 / 角色」这三行，起草与确认卡共用一份。
+
+    起草工具也要把这三行说给模型听（它据此判断「是不是用户要的那个过程」），
+    而它在字段名上拿不到一张「流程」——另写一份拼接，两边的措辞迟早不一致，
+    那时同一张图在卡上和在起草里读起来像两个流程。
+    """
+    lines: list[str] = []
     if with_steps:
         steps = " → ".join(_step_label(plan.node(node_id)) for node_id in plan.order)
         lines.append(f"步骤：{steps}")
 
-    # 分流只列「有条​件的边」：兜底边写出来只是噪音，人要看的是「什么情况下
+    # 分流只列「有条件的边」：兜底边写出来只是噪音，人要看的是「什么情况下
     # 走另一条路」。一个分流都没有的图不用这一行。
     decision: list[str] = []
     for node_id in plan.order:
@@ -1996,7 +2008,7 @@ def _summarize_workflow(
     if roles_line:
         lines.append(roles_line)
 
-    return "\n".join(lines)
+    return lines
 
 
 async def _summarize_workflow_call(
@@ -2058,6 +2070,161 @@ async def _preflight_workflow(
         where = f"节点「{exc.node}」" if getattr(exc, "node", None) else "整张图"
         return f"{where}没过校验（{exc.code}）：{exc.message}"
     return None
+
+
+async def _workflow_agent_facts(
+    context: ToolExecutionContext,
+    plan: Any,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """起草时问库三件事：谁不在、谁不是启用中、哪几步允许写。
+
+    与 `save_workflow` 里的 `_ensure_agents_available` 查的是同一份清单
+    （`workflow_service.plan_agents`）与同一份状态文案（`AGENT_STATUS_TEXT`），
+    差别只在「一次说全」和「抛第一个」。起草阶段抛第一个没有意义：模型要的是
+    「改哪里」，不是「被拒了」。
+
+    不在错误里列可用名单：`studio_describe resource=agent` 能列全，而这里是
+    「差一个名字」的场合，把八个名字塞进一句话只会挤掉真正的错误。
+    """
+    from app.services import agent_service, workflow_service
+    from app.tenancy.context import tenant_scope
+
+    wanted = workflow_service.plan_agents(plan)
+    if not wanted:
+        return [], []
+
+    with tenant_scope(context.tenant_id):
+        async with async_session_factory() as session:
+            rows = await agent_service.list_agents(session)
+
+    available = {str(row.name): row for row in rows}
+    problems: list[dict[str, Any]] = []
+    writable: list[str] = []
+
+    for node_id, name in wanted:
+        row = available.get(name)
+        if row is None:
+            problems.append(
+                {
+                    "node": node_id,
+                    "code": "WORKFLOW_UNKNOWN_AGENT",
+                    "message": (
+                        f"第「{node_id}」步指定的智能体「{name}」不存在。"
+                        "先 studio_describe resource=agent 看有哪些可用标识；"
+                        "要用的角色还没建，就先建出来。"
+                    ),
+                }
+            )
+            continue
+
+        status = str(getattr(row.status, "value", row.status))
+        if status != "active":
+            problems.append(
+                {
+                    "node": node_id,
+                    "code": "WORKFLOW_INACTIVE_AGENT",
+                    "message": (
+                        f"第「{node_id}」步指定的智能体「{name}」现在是"
+                        f"{workflow_service.AGENT_STATUS_TEXT.get(status, status)}状态，"
+                        "流程跑到那一步会被拒。"
+                    ),
+                }
+            )
+            continue
+
+        # 允许写不等于一定会停：停不停取决于模型在那一轮决定调什么工具。
+        # 所以这里说「这一步允许写」，不说「这一步会审批」——后者是我们
+        # 预判不出来的事，说错了会让人以为图上写着审批点。
+        if bool(getattr(row, "can_write", True)):
+            writable.append(node_id)
+
+    return problems, writable
+
+
+async def studio_workflow_draft(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """交一张图，只回答「能不能存、差在哪、存下来长什么样」。
+
+    **不写库、不建审批单、不涨 revision。** 这是把「起草」与「保存」拆开之后
+    免费的那一半：保存要过确认卡、进库、冻结版本，所以模型每试一次都得赌一把
+    写完整张图；起草可以一版一版改，而改一处比重写整份便宜得多。
+
+    校验仍然是 `compile_definition` 加保存时那两项库校验，不另写一套：
+    起草说「能存」而保存被拒，比不校验更让人不信任这个工具。
+    """
+    definition = arguments.get("definition")
+    if not isinstance(definition, dict):
+        return _fail('definition 必须是一个对象：{"entry": "起点id", "nodes": [...]}。')
+
+    from app.orchestration.definition import DefinitionError, compile_definition
+
+    try:
+        plan = compile_definition(definition)
+    except DefinitionError as exc:
+        node = getattr(exc, "node", None)
+        where = f"节点「{node}」" if node else "整张图"
+        return ToolExecutionResult(
+            success=True,
+            result={
+                "ok": False,
+                "errors": [
+                    {"node": node, "code": exc.code, "message": exc.message}
+                ],
+            },
+            message=(
+                f"这张图现在存不进去：{where}没过校验（{exc.code}）——{exc.message}\n"
+                "只改这一处再交回来，不用重发整张图。一次改一处、多交几版，"
+                "比一次写完整张再指望它通过更省时间。"
+            ),
+        )
+
+    problems, writable = await _workflow_agent_facts(context, plan)
+    graph = _workflow_graph(plan)
+
+    # 名字冲突只在给了 name 时才查，且不算错误：同名意味着「保存要用 update」，
+    # 而不是「这张图错了」。放进 errors 会让模型去改图，改一整圈才发现是模式选错。
+    existing = None
+    name = str(arguments.get("name") or "").strip()
+    if name:
+        from app.services import workflow_service
+
+        existing = await workflow_service.get_workflow(context.tenant_id, name)
+
+    lines = ["这张图能存。", *_workflow_steps_text(plan)]
+    if writable:
+        lines.append(
+            "允许写的步骤："
+            + "、".join(writable)
+            + "——这些步骤如果决定动手，会停下来等审批（图上不标审批点，"
+            "停不停取决于那一轮它调什么工具）。"
+        )
+    if problems:
+        # 形状过了、库里的东西不行：这是起草最有价值的一种输出——它在
+        # 模型准备保存（也就准备弹确认卡）之前就说清了还差什么。
+        lines = ["这张图的形状没问题，但还不能保存："]
+        lines.extend(f"- 节点「{item['node']}」：{item['message']}" for item in problems)
+
+    lines.append("下一步：改好之后用 studio_workflow_save 保存（mode=create/update）。")
+    if existing is not None:
+        lines.append(
+            f"注意：标识「{name}」下已经有一张流程（v{int(existing.revision or 0)}），"
+            "保存时要用 mode=update；要新建一张请换个标识。"
+        )
+    if not problems:
+        lines.append("要调顺序或换人，改对应的那个节点再交回来，不必重写整张图。")
+
+    return ToolExecutionResult(
+        success=True,
+        result={
+            "ok": not problems,
+            "errors": problems,
+            **({"graph": graph} if graph.get("nodes") else {}),
+            **({"writable_nodes": writable} if writable else {}),
+        },
+        message="\n".join(lines),
+    )
 
 
 async def verify_workflow_saved(
@@ -3707,10 +3874,47 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             verification_hint="删除后按 id 回读查不到，且有 connector_deleted 审计。",
         ),
         ToolDefinition(
+            name="studio_workflow_draft",
+            display_name="起草编排流程（只校验，不保存）",
+            description=(
+                "把一张图交上来校验：不写库、不弹确认卡、不涨版本号，可以反复交。"
+                "**新建或修改流程之前先走这一步**——确认它能存了再调 studio_workflow_save，"
+                "否则那张确认卡是在「图可能存不进去」的时候让人点的。"
+                "改一版交一版：它把第一处问题连节点一起指出来，改好那一处再交回来，"
+                "不要因为一处错误就重写整张图（重写最容易漏节点，漏掉等于删掉）。"
+                "它回答：图能不能存（errors 带节点与错误码）、步骤是否就是用户描述的那个过程、"
+                "图里的智能体在库里在不在/是否启用、哪几步允许写（允许写的步骤动手时会停审批）。"
+                "definition 的写法（占位符、next、条件键必须有 emit 来源）见 studio_workflow_save。"
+            ),
+            kind="python",
+            risk_level=RiskLevel.READ,
+            # 与 studio_describe 同一条口径：读配置不卡 workflow 权限，否则普通成员
+            # 连「我这样说能不能建出来」都问不出来。它不落库，也不扩大信息面——
+            # 查的仍是这个人本来就看得见的智能体与流程清单。
+            required_scopes=(),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                    },
+                    "definition": {"type": "object"},
+                },
+                "required": ["definition"],
+                "additionalProperties": False,
+            },
+            handler=studio_workflow_draft,
+        ),
+        ToolDefinition(
             name="studio_workflow_save",
             display_name="新建或修改编排流程",
             description=(
-                "新建或修改一张编排流程（workflow）。mode=create 新建（必须给 definition），"
+                "新建或修改一张编排流程（workflow）。**先 studio_workflow_draft 确认这张图能存**，"
+                "再调这个——保存会弹确认卡，图不成立时那张卡是白点一次。"
+                "mode=create 新建（必须给 definition），"
                 "mode=update 只改传入的字段（不给 definition 就只改说明与启停）。"
                 "name 建好之后不能改（它出现在「/workflow」后面与审计里），换名字只能新建一张；"
                 "只换显示名改 display_name。"

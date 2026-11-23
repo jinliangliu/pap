@@ -163,6 +163,7 @@ new.allowed_tools ⊆ 请求人当前可见的工具集
 | `studio_import` | `write` | 是 | 把会话里已上传的文件按用途建成知识库 / 技能 / 工具；判类靠内容与原始文件名 |
 | `studio_connector_save` | `write` | 是 | 建/改连接器定义，**不接受凭据** |
 | `studio_connector_delete` | `destructive` | 是 | 下面还挂着工具时会被后端拒绝 |
+| `studio_workflow_draft` | `read` | 否 | 起草：交一张图，只回答「能不能存、差在哪」，不落库、不涨 `revision` |
 | `studio_workflow_save` | `write` | 是 | 建/改编排流程；`definition` 原样交给 `compile_definition` |
 | `studio_workflow_delete` | `destructive` | 是 + 输名字 | 只删配置；未完结的 run 按冻结的图继续 |
 
@@ -208,6 +209,12 @@ new.allowed_tools ⊆ 请求人当前可见的工具集
 智能体，凭语义编一个 `inspector` 是最自然的动作；不挡的话图存得进去，一直到有人
 `/workflow` 触发才失败，而那时配图的人早就不在屏幕前了。拒绝理由要带**可用标识**
 （`当前租户的智能体：cs、ops`），只说「不存在」下一轮它还会编。
+
+**起草不算第三个写工具。** `studio_workflow_draft` 是 `read`：它把同一份
+`compile_definition` 与同一份 `_ensure_agents_available` 的口径跑一遍，然后**不写库**。
+放在写工具之前是为了别让人对着一张「注定被拒」的确认卡点确认——那张卡一旦成为
+常态，确认就退化成装饰。判定口径与保存共用（`plan_agents` / `AGENT_STATUS_TEXT`
+都是公开的），不另写一套「大概一样」的遍历。
 
 ### 4.2.2 为什么这个工具额外挂了 `preflight` / `summarize` / `verifier`
 

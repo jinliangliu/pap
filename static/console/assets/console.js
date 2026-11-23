@@ -12,6 +12,10 @@
   /* 审批卡的判断在 approval.js（纯逻辑，可脱离浏览器自检）。
      拿不到就说明脚本没加载上——当场报错，比静默丢掉卡片好排查。 */
   var PAPApproval = window.PAPApproval;
+  /* 斜杠命令的识别在 chatcmd.js（纯函数，可脱离浏览器自检）。
+     拿不到就退回「不发出去」：宁可让它被服务端 409 拒一次，也不要在本地
+     猜一个宽窄不一的判据。 */
+  var PAPChatCommand = window.PAPChatCommand;
 
   /* ================= 基础工具 ================= */
 
@@ -409,7 +413,7 @@
     },
     workflows: {
       eyebrow: "WORKFLOWS", title: "编排",
-      desc: "把「谁在第几步做什么」写成版本化的图，在对话输入框里选它就能触发（也可以打 /workflow）。图只排顺序，不分配能力——每次节点调用仍然逐跳判定边界。",
+      desc: "把「谁在第几步做什么」写成版本化的图，在对话输入框里选它就能触发（也可以打 /workflow）。图只排顺序，不分配能力——每次节点调用仍然逐跳判定边界。要新建，在对话台发一句 /build 加描述，会转到构建助手边校验边建。",
       mount: mountWorkflows
     },
     permissions: {
@@ -2878,7 +2882,7 @@
       '<div class="composer">' +
       '<div class="chat-target-hint" id="chat-target-hint" hidden></div>' +
       '<div class="attach-tray" id="attach-tray" hidden></div>' +
-      '<textarea id="chat-input" rows="2" placeholder="例如：查一下 station-001 最近一天的压力趋势"></textarea>' +
+      '<textarea id="chat-input" rows="2" placeholder="例如：查一下 station-001 最近一天的压力趋势；要建流程就发 /build 一句话描述"></textarea>' +
       '<div class="composer-bar">' +
       '<label class="add-btn" for="chat-file" id="chat-add" title="添加图片或 PDF（可多选）" ' +
       'role="button" tabindex="0" aria-label="添加附件">' + ico("plus") + "</label>" +
@@ -3014,6 +3018,38 @@
     var text = input.value.trim();
     var outgoing = (state.chat.attachments || []).slice();
     if (!text && !outgoing.length) return;
+
+    /* `/build 一段描述` 是界面的快捷方式，不是平台命令：写配置的手只在构建助手
+       那里，服务端会对这条消息回 409。在本地就把它带过去——让用户先看着这句话
+       发出去、被拒、再复制一遍，是最没道理的一段路；面板就在同一页，成本是一次开关。
+
+       判据在 chatcmd.js，与服务端 `is_build_command` 同一份口径（那里有对照用例）。
+       附件直接丢掉：/build 后面那句话是要带过去重新说的，带一份附件过去会变成
+       「这句话 + 一个它读不到的句柄」，而构建助手要到下一轮才看得见它。 */
+    var buildBrief = PAPChatCommand ? PAPChatCommand.buildBrief(text) : null;
+    if (buildBrief !== null) {
+      input.value = "";
+      var dropped = outgoing.length;
+      if (dropped) {
+        state.chat.attachments = [];
+        renderAttachTray();
+      }
+      setStudioOpen(true);
+      var studioInput = $("#studio-input");
+      if (studioInput) {
+        studioInput.value = buildBrief;
+        studioAutoGrow();
+        studioInput.focus();
+      }
+      toast(
+        buildBrief
+          ? (dropped ? "已转到构建助手（附件没带过去，那里要重新选）" : "已转到构建助手：确认那句话再发送")
+          : "已打开构建助手：说说要建什么样的流程",
+        "ok"
+      );
+      return;
+    }
+
     // 流程只吃这一句正文：节点里没有「读附件」这一步，附件带进去也不会被看。
     // 与其让它静悄悄失效，不如当场拦住——用户去掉附件即可，或者改回直接对话。
     if (state.chat.flow && outgoing.length) {
@@ -12536,6 +12572,16 @@
 
     var text = input.value.trim();
     var files = (studioUI.attachments || []).slice();
+
+    /* 面板里也认 `/build` 前缀：用户记不住「这句话该在哪个框里打」，而服务端对
+       `/build` 一律 409（它是界面快捷方式，不是平台命令）。剥掉前缀就好，
+       不要让他看着自己那句话被打回来。剥完为空时走下面的「只有文件才提示」分支。 */
+    var buildBrief = PAPChatCommand ? PAPChatCommand.buildBrief(text) : null;
+    if (buildBrief !== null) {
+      text = buildBrief;
+      input.value = text;
+      studioAutoGrow();
+    }
 
     /* 只有文件、没有一句话，就不发。
        这里以前补一句「请看附件。」好让请求过校验，但那等于让模型自己猜
