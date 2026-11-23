@@ -15,8 +15,11 @@ from sqlalchemy import delete, func, select
 from app.core.config import settings
 from app.db.session import async_session_factory
 from app.integrations.mcp_client import McpToolDescriptor
+from app.models.approval import RiskLevel
 from app.models.mcp_registered import McpRegisteredTool
+from app.tools import mcp_tools
 from app.tools.dependencies import get_tool_gateway, reset_tool_gateway
+from app.tools.mcp_tools import McpToolSpec
 
 pytestmark = pytest.mark.anyio
 
@@ -110,7 +113,25 @@ async def test_register_then_visible_and_removable(admin_client, monkeypatch):
 
 
 async def test_register_rejects_name_from_code_whitelist(admin_client, monkeypatch):
+    """代码登记的名字不许被配置覆盖。
+
+    白名单现在是空的（prv_ 那批下线），所以这里临时塞一条假的进去——
+    要验的是**闸门**还在，不是「现在恰好有哪些名字」。
+    """
     _mock_remote(monkeypatch)
+    monkeypatch.setattr(
+        mcp_tools,
+        "MCP_TOOL_SPECS",
+        (
+            McpToolSpec(
+                local_name="prv_query_pressure",
+                display_name="代码登记的读取工具",
+                description="",
+                risk_level=RiskLevel.READ,
+                remote_name="queryPressure",
+            ),
+        ),
+    )
 
     response = await admin_client.post(
         f"{BASE}/tools",
@@ -162,7 +183,21 @@ async def test_register_rejects_duplicate_local_name(admin_client, monkeypatch):
 
 
 async def test_unregister_refuses_code_tool(admin_client, monkeypatch):
+    """代码登记的工具不能在控制台取消接入——否则审批路径上的实现会被绕过。"""
     _mock_remote(monkeypatch)
+    monkeypatch.setattr(
+        mcp_tools,
+        "MCP_TOOL_SPECS",
+        (
+            McpToolSpec(
+                local_name="prv_query_pressure",
+                display_name="代码登记的读取工具",
+                description="",
+                risk_level=RiskLevel.READ,
+                remote_name="queryPressure",
+            ),
+        ),
+    )
 
     response = await admin_client.delete(f"{BASE}/tools/prv_query_pressure")
 
@@ -272,3 +307,138 @@ async def test_unregistered_tool_is_not_marked_removable(admin_client, monkeypat
 
     assert item["local_name"] is None
     assert item["removable"] is False
+
+
+# ---------------- 改接入项的风险等级 ----------------
+
+
+async def test_update_lowers_risk_and_drops_approval(admin_client, monkeypatch):
+    """把 write 降到 read，网关里那份定义必须当场跟着变。
+
+    接入是批量做的（连接器「发现工具」一次接几十个），只能给一个统一的保守值；
+    之后不让人按工具逐个降回来，「查一次压力」也要弹审批单，平台等于不可用。
+    这里盯的是**两处一致**：只改库不改注册表，界面写着「读取」而实际照样
+    弹审批单——两边不一致时人只会相信自己看到的那份。
+    """
+    _mock_remote(monkeypatch)
+    created = await admin_client.post(f"{BASE}/tools", json=_payload(risk_level="write"))
+    assert created.status_code == 201
+    assert created.json()["requires_approval"] is True
+
+    gateway = get_tool_gateway()
+    assert gateway.get_tool(LOCAL).risk_level is RiskLevel.WRITE
+
+    response = await admin_client.patch(f"{BASE}/tools/{LOCAL}", json={"risk_level": "read"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["risk_level"] == "read"
+    assert body["requires_approval"] is False
+
+    definition = get_tool_gateway().get_tool(LOCAL)
+    assert definition.risk_level is RiskLevel.READ
+    assert definition.requires_approval is False, "只换 risk_level 会被旧的 requires_approval 顶回来"
+
+
+async def test_update_requires_platform_admin(client, seeded_identity):
+    response = await client.patch(f"{BASE}/tools/{LOCAL}", json={"risk_level": "read"})
+
+    assert response.status_code == 403
+
+
+async def test_update_rejects_code_registered_tool(admin_client, monkeypatch):
+    """代码白名单里的风险级写在代码里，不经由配置面改。"""
+    from app.api.routes import admin as admin_routes
+
+    monkeypatch.setattr(admin_routes, "code_local_names", lambda: {"fc_querypressure"})
+
+    response = await admin_client.patch(
+        f"{BASE}/tools/fc_querypressure", json={"risk_level": "read"}
+    )
+
+    assert response.status_code == 400
+    assert "代码" in response.json()["detail"]
+
+
+async def test_update_rejects_empty_payload_and_missing_row(admin_client, monkeypatch):
+    _mock_remote(monkeypatch)
+    await admin_client.post(f"{BASE}/tools", json=_payload())
+
+    empty = await admin_client.patch(f"{BASE}/tools/{LOCAL}", json={})
+    assert empty.status_code == 400
+
+    missing = await admin_client.patch(
+        f"{BASE}/tools/not_registered_at_all", json={"risk_level": "read"}
+    )
+    assert missing.status_code == 404
+
+
+async def test_list_reports_where_the_token_comes_from(admin_client):
+    """列表要回答「令牌从哪来」，不能只说有没有。
+
+    经连接器接入的行上 `token` 永远是空的（端点取 `connectors.base_url`、
+    凭据按租户现取）。只回 `token_set=False` 时界面只能写「未配置」——而管理员
+    在连接器页明明看到「已配置」，于是来问「为什么不一致」。这两种状态必须分开：
+    前者是设计如此，后者是真的调不通。
+
+    顺带盯住一处容易写错的地方：`require_platform_admin` 会把上下文租户改成
+    平台租户，凭据查询要靠 `identity.tenant_id` + 显式租户条件（`INCLUDE_ALL_TENANTS`），
+    不能读上下文——否则结论是「每个租户都没配凭据」。
+    """
+    from app.models.connector import (
+        Connector,
+        ConnectorAuthType,
+        ConnectorCredential,
+        ConnectorKind,
+    )
+    connector_id = None
+    try:
+        async with async_session_factory() as session:
+            async with session.begin():
+                connector = Connector(
+                    name=f"t_list_{LOCAL}",
+                    display_name="列表令牌来源",
+                    kind=ConnectorKind.MCP,
+                    base_url="http://127.0.0.1:8765/mcp",
+                    auth_type=ConnectorAuthType.BEARER,
+                )
+                session.add(connector)
+                await session.flush()
+                connector_id = connector.id
+
+                # 凭据是租户级的：admin_client 用的就是平台租户。
+                # 显式给 tenant_id，不依赖上下文——它只在这段代码里有意义。
+                session.add(
+                    ConnectorCredential(
+                        connector_id=connector.id, secret="tok", tenant_id="platform"
+                    )
+                )
+
+                session.add(
+                    McpRegisteredTool(
+                        local_name=LOCAL,
+                        remote_name=REMOTE,
+                        display_name="查询日程",
+                        description="按日期查日程安排。",
+                        connector_id=connector.id,
+                        risk_level=RiskLevel.READ,
+                    )
+                )
+
+        items = (await admin_client.get(f"{BASE}/tools")).json()["items"]
+        item = next(row for row in items if row["local_name"] == LOCAL)
+
+        assert item["token_set"] is False
+        assert item["token_source"] == "connector"
+        assert item["connector_name"] == f"t_list_{LOCAL}"
+        assert item["connector_credential_set"] is True
+    finally:
+        if connector_id is not None:
+            from app.models.connector import ConnectorCredential as Credential
+
+            async with async_session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        delete(Credential).where(Credential.connector_id == connector_id)
+                    )
+                    await session.execute(delete(Connector).where(Connector.id == connector_id))

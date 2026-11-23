@@ -66,6 +66,10 @@ logger = logging.getLogger(__name__)
 # 转义的事。
 _NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
+# 审计里替代敏感旧值的占位符。只用于 `auth_header_name` 的历史值：
+# 这个字段本该是头名（`X-Api-Key` 之类），历史行里却可能躺着一枚令牌。
+_REDACTED = "«已脱敏»"
+
 # 运行时缓存：工具调用是热路径，每轮对话可能要取好几次。
 # 30 秒足够挡住同一轮里的重复查询，又短到「配完凭据立刻生效」不会被拖太久
 # （设置凭据时还会主动失效，所以实际是立即生效）。
@@ -273,8 +277,11 @@ def validate_auth(
             )
         return ""
 
-    # bearer
-    return header or ""
+    # bearer：只发 `Authorization`，头名不参与请求（见 `ConnectorRuntime.auth_headers`）。
+    # 原来这里原样保留它，于是「把令牌贴进请求头名」被静默接受：令牌明文躺在
+    # `connectors.auth_header_name` 里（该表是平台级、没有行级安全），
+    # 又被列表接口原样回显，而出站请求一次都没用到它——既没起作用，又漏了。
+    return ""
 
 
 # ---------------- 写 ----------------
@@ -365,6 +372,12 @@ async def update_connector(
         )
         _set("auth_type", auth_type)
         _set("auth_header_name", header)
+
+    # 历史行里的 `auth_header_name` 可能是被误贴进来的令牌（bearer 那几年没有拦，
+    # 见 `validate_auth`）。清掉它时一并从审计快照里抹掉旧值——审计表长期保留、
+    # 会被整个备份导出，「字段被改过」这件事要留，「旧值长什么样」不能留。
+    if "auth_header_name" in before:
+        before["auth_header_name"] = _REDACTED
 
     if before:
         connector.updated_at = _now()
@@ -471,6 +484,7 @@ async def check_connector(
     *,
     connector: Connector,
     secret: str | None,
+    timeout_seconds: float | None = None,
 ) -> tuple[str, str]:
     """连通性检查。返回 `(status, message)`。
 
@@ -479,18 +493,35 @@ async def check_connector(
     - 连不上/超时 → 服务问题，去看对端；
     - 其它 4xx → 端点可达（路径要求参数很正常，尤其是 API 根路径）；
     - 5xx → 对端故障。
+
+    `timeout_seconds` 用于「顺带复查」的场景（例如刚保存凭据，见
+    `routes/connectors.set_credential`）：那里不能按连接器的 30 秒上限等，
+    端点配错时用户会以为保存按钮卡住了。人主动点「检查」时留空，按连接器配置走。
     """
     if connector.kind == ConnectorKind.MCP:
-        return await _check_mcp(connector=connector, secret=secret)
-    return await _check_http(connector=connector, secret=secret)
+        return await _check_mcp(
+            connector=connector, secret=secret, timeout_seconds=timeout_seconds
+        )
+    return await _check_http(
+        connector=connector, secret=secret, timeout_seconds=timeout_seconds
+    )
 
 
-async def _check_mcp(*, connector: Connector, secret: str | None) -> tuple[str, str]:
+async def _check_mcp(
+    *,
+    connector: Connector,
+    secret: str | None,
+    timeout_seconds: float | None = None,
+) -> tuple[str, str]:
     if connector.auth_type != ConnectorAuthType.NONE and not secret:
         return HEALTH_ERROR, "尚未配置凭据，无法校验。"
 
     try:
-        tools = await fetch_remote_tools(url=connector.base_url, token=secret or "")
+        tools = await fetch_remote_tools(
+            url=connector.base_url,
+            token=secret or "",
+            timeout_seconds=timeout_seconds,
+        )
     except McpAuthError as exc:
         return HEALTH_ERROR, f"凭据被拒绝：{exc}"
     except McpUnavailableError as exc:
@@ -501,7 +532,12 @@ async def _check_mcp(*, connector: Connector, secret: str | None) -> tuple[str, 
     return HEALTH_OK, f"连接正常，远端提供 {len(tools)} 个工具。"
 
 
-async def _check_http(*, connector: Connector, secret: str | None) -> tuple[str, str]:
+async def _check_http(
+    *,
+    connector: Connector,
+    secret: str | None,
+    timeout_seconds: float | None = None,
+) -> tuple[str, str]:
     if not connector.base_url:
         return HEALTH_UNKNOWN, "这个连接器没有设置地址前缀，无需检查。"
 
@@ -518,11 +554,12 @@ async def _check_http(*, connector: Connector, secret: str | None) -> tuple[str,
     if runtime.requires_secret() and not secret:
         return HEALTH_ERROR, "尚未配置凭据，无法校验。"
 
+    limit = float(timeout_seconds or connector.timeout_seconds)
     timeout = httpx.Timeout(
-        connect=min(5.0, float(connector.timeout_seconds)),
-        read=float(connector.timeout_seconds),
-        write=float(connector.timeout_seconds),
-        pool=3.0,
+        connect=min(5.0, limit),
+        read=limit,
+        write=limit,
+        pool=min(3.0, limit),
     )
 
     try:
@@ -634,6 +671,15 @@ async def bind_mcp_tools(
 
         ensure_name_allowed(local_name, gateway=gateway)
 
+        # 说明先取调用方给的，没有就取远端 schema 里那句。批量接入时前端只提交
+        # 三个字段（远端名、本地名、风险级），远端说明就在手边却没用上——结果是
+        # 工具页一片「（无描述）」，模型也只能靠名字猜这个工具干什么。
+        descriptor = remote[remote_name]
+        description = (
+            str(item.get("description") or "").strip()
+            or (descriptor.description or "").strip()
+        )
+
         existing = await session.scalar(
             select(McpRegisteredTool).where(McpRegisteredTool.local_name == local_name)
         )
@@ -645,9 +691,13 @@ async def bind_mcp_tools(
                 )
             existing.remote_name = remote_name
             existing.display_name = (
-                str(item.get("display_name") or "").strip() or existing.display_name
+                str(item.get("display_name") or "").strip()
+                or existing.display_name
+                or remote_name
             )
-            existing.description = str(item.get("description") or "").strip()
+            # 空串表示「这次没带说明」，不是「把说明清空」：重新接入一次就抹掉
+            # 人工写好的说明，比留旧值麻烦得多。
+            existing.description = description or existing.description
             existing.risk_level = _bind_risk(item)
             existing.enabled = True
         else:
@@ -659,7 +709,7 @@ async def bind_mcp_tools(
                     token=None,
                     connector_id=connector.id,
                     display_name=str(item.get("display_name") or "").strip() or remote_name,
-                    description=str(item.get("description") or "").strip(),
+                    description=description,
                     risk_level=_bind_risk(item),
                     timeout_seconds=connector.timeout_seconds,
                     enabled=True,

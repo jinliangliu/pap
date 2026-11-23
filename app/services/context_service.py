@@ -1,7 +1,7 @@
 # app/services/context_service.py
 """长对话上下文：注入窗口 + 压缩。
 
-设计见 `docs/CONTEXT.md`。四条边界先写在文件头上，改代码前先读：
+四条边界先写在文件头上，改代码前先读：
 
 1. **历史每轮从 `messages` 表重新取，不读写 checkpoint。** checkpoint 是审批中断的
    现场，裁过就对不上审批预览里的参数；注入式历史才可重放。
@@ -11,7 +11,7 @@
 4. **摘要不是记忆。** 不写 `memories`，也不从记忆库取——一个是本次对话的叙事，
    一个是跨会话的事实，互相写入只会互相污染。
 
-一处与设计稿的偏离（`CONTEXT.md` §6 已同步）：压缩失败时**不落库**。
+一处刻意的偏离：压缩失败时**不落库**。
 落一行「覆盖了 N 轮」却只有占位文字的摘要，等于把那 N 轮永久丢掉；
 不落库则水位不动，下一轮还能重试，本轮只是窗口变短。
 
@@ -24,11 +24,12 @@ from __future__ import annotations
 import logging
 import math
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -44,7 +45,12 @@ logger = logging.getLogger(__name__)
 # （与 memory_service 同一口径）。运维可调的三项在 settings 里。
 KEEP_TURNS = 6
 KEEP_TOKENS = 6000
-SUMMARY_MAX_CHARS = 1200
+# 摘要要同时装下【当前目标】【已定结论】【未完成】【指代绑定】【被否决】五节。
+# 1200 字时线上是一份「刚好顶格、最后一句断在『…要求直』」的摘要，而且条目
+# 从最早的写起，越新的事越写不进去——一周的会话摘要里查不到最近两天的任何一件事。
+SUMMARY_MAX_CHARS = 2400
+# 唯一会长到超限的那一节。截断时保其余四节、只从这一节里丢最旧的条目。
+SUMMARY_CONCLUSION_HEAD = "【已定结论】"
 REBUILD_EVERY = 3
 # 故意取小：把每个字符都算得更贵 → 估出的 token 偏多 → 偏早压缩。
 # 早压只损失几轮原文，压晚了是撞上限整轮失败。
@@ -121,12 +127,81 @@ def estimate_tokens(text: str) -> int:
 
 
 def clean_summary(text: str) -> str:
-    """压掉多余空行并按上限截断。截断处留标记，免得模型以为摘要就这么短。"""
+    """压掉多余空行；超限时按条目丢最旧的，不切半句、不整节丢。
+
+    摘要固定五节（见 `SUMMARY_SYSTEM`），【已定结论】通常占九成篇幅。超限时先把
+    「其他四节」完整留住，剩下的预算全给【已定结论】：那四节短，且
+    【未完成】【被否决】恰恰是「用户明确说过别做什么」，丢掉比少记几条结论更糟。
+
+    从前是整体 `body[:1200]`，线上真的切出过「…access_scope=internal，要求直」，
+    并且最新的条目因为排在最后而被整段吃掉——模型看到的「记忆」永远停在几天前。
+    """
     lines = [line.rstrip() for line in str(text or "").splitlines()]
-    body = "\n".join(line for line in lines if line.strip())
-    if len(body) > SUMMARY_MAX_CHARS:
-        body = body[:SUMMARY_MAX_CHARS] + "…"
-    return body
+    body_lines = [line for line in lines if line.strip()]
+    body = "\n".join(body_lines)
+    if len(body) <= SUMMARY_MAX_CHARS:
+        return body
+
+    sections = _split_summary_sections(body_lines)
+    fixed = [(head, rows) for head, rows in sections if head != SUMMARY_CONCLUSION_HEAD]
+    fixed_chars = sum(
+        (len(head) + 1 if head else 0) + sum(len(row) + 1 for row in rows)
+        for head, rows in fixed
+    )
+    if fixed_chars >= SUMMARY_MAX_CHARS:
+        # 少见：连结论以外的四节都写超了。退回整体按行截，至少不切半句。
+        return _truncate_summary_lines(body_lines, SUMMARY_MAX_CHARS)
+
+    budget = SUMMARY_MAX_CHARS - fixed_chars - 1
+    out: list[str] = []
+    for head, rows in sections:
+        if head:
+            out.append(head)
+        if head != SUMMARY_CONCLUSION_HEAD:
+            out.extend(rows)
+            continue
+
+        kept: list[str] = []
+        used = 0
+        for row in rows:
+            if used + len(row) + 1 > budget:
+                break
+            kept.append(row)
+            used += len(row) + 1
+        out.extend(kept)
+        if len(kept) < len(rows):
+            out.append(f"（另有 {len(rows) - len(kept)} 条更早结论已省略）")
+
+    return "\n".join(out)
+
+
+def _split_summary_sections(
+    lines: Sequence[str],
+) -> list[tuple[str | None, list[str]]]:
+    """按【小标题】切节。没有小标题的旧摘要整段归到 (None, …)。"""
+    sections: list[tuple[str | None, list[str]]] = []
+    for line in lines:
+        if line.startswith("【"):
+            sections.append((line, []))
+        elif sections:
+            sections[-1][1].append(line)
+        else:
+            sections.append((None, [line]))
+    return sections
+
+
+def _truncate_summary_lines(lines: Sequence[str], limit: int) -> str:
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        if kept and used + len(line) + 1 > limit:
+            break
+        if not kept and len(line) > limit:
+            # 单行就超限（旧摘要没有小标题、一整段下来）。只能硬切，但留标记。
+            return line[:limit] + "…"
+        kept.append(line)
+        used += len(line) + 1
+    return "\n".join(kept) + "（其余条目已省略）"
 
 
 def transcript_of(turns: Sequence[Turn], *, limit: int = TRANSCRIPT_MAX_CHARS) -> str:
@@ -200,11 +275,13 @@ SUMMARY_SYSTEM = """你在压缩一段对话的历史，产物会作为「更早
 3. 只写结论，不抄原始数据。工具返回的 JSON、表格正文一律不写。
 4. 指代必须绑死。「它 / 那个 / 上次那个」要还原成具体对象（名字、单号或 id）。
 5. 不知道就写「无」。缺哪一节就写「无」，不要省略小标题。
+6. 写不下时删【已定结论】里**最旧**的条目。不许把一条写成半句，也不许为了塞进
+   更早的事而把最近发生的事挪到后面或省掉——越新的事越不能丢。
 
 输出格式（五节，顺序固定，总长不超过 {limit} 字）：
 
 【当前目标】一句话
-【已定结论】逐条，标出处
+【已定结论】逐条，最新的写在最前，标出处
 【未完成】答应了还没做的、等用户补的信息
 【指代绑定】原词 → 具体对象
 【被否决】用户明确拒绝的方案，一条一句
@@ -276,20 +353,25 @@ async def _load_turns(
     *,
     conversation_id: uuid.UUID,
     exclude_message_id: uuid.UUID | None,
+    cleared_at: datetime | None = None,
 ) -> list[Turn]:
     """把消息表折成轮次。
 
     以 user 消息起头、到下一个 user 之前为界。尾部没有助手回复的不成轮
     （当前这条就是这种情况），直接丢掉——只剩提问的历史会让模型重答一遍。
+
+    `cleared_at` 是 `/clear` 的水位：只取它之后的消息。**过滤放在这里而不是
+    调用点**，因为折叠轮次、算待压量、判摘要水位全都从这一份 rows 派出去，
+    漏一处就会出现「界面说清了、压缩时又把旧事写回摘要」。
     """
+    stmt = select(Message).where(Message.conversation_id == conversation_id)
+
+    if cleared_at is not None:
+        # 严格大于：水位取的是 `/clear` 那条回复的时刻，它自己必须被排除。
+        stmt = stmt.where(Message.created_at > cleared_at)
+
     rows = list(
-        (
-            await session.scalars(
-                select(Message)
-                .where(Message.conversation_id == conversation_id)
-                .order_by(Message.created_at, Message.id)
-            )
-        ).all()
+        (await session.scalars(stmt.order_by(Message.created_at, Message.id))).all()
     )
 
     turns: list[Turn] = []
@@ -340,22 +422,64 @@ async def _load_turns(
 
 
 async def _latest_summary(
-    session: AsyncSession, *, conversation_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    cleared_at: datetime | None = None,
 ) -> ConversationSummary | None:
+    """最新一份**仍然生效**的摘要。
+
+    `/clear` 之后，清空之前生成的那几份摘要一并失效：它们叙述的正是用户
+    刚说「别再提了」的那段。摘要表是 append-only 的，不能删行——留着才能复盘
+    「清空前它记得什么」，所以按生成时刻过滤。
+
+    `created_at IS NULL` 也收进来：那是刚 flush、还没从库里取回默认值的行，
+    必然属于「之后」；把它当成旧的会让清空后的摘要永远不生效。
+    """
+    stmt = select(ConversationSummary).where(
+        ConversationSummary.conversation_id == conversation_id
+    )
+
+    if cleared_at is not None:
+        stmt = stmt.where(
+            or_(
+                ConversationSummary.created_at > cleared_at,
+                ConversationSummary.created_at.is_(None),
+            )
+        )
+
     return await session.scalar(
-        select(ConversationSummary)
-        .where(ConversationSummary.conversation_id == conversation_id)
-        .order_by(ConversationSummary.created_at.desc())
-        .limit(1)
+        stmt.order_by(ConversationSummary.created_at.desc()).limit(1)
     )
 
 
-async def _summary_count(session: AsyncSession, *, conversation_id: uuid.UUID) -> int:
-    value = await session.scalar(
+async def _summary_count(
+    session: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    cleared_at: datetime | None = None,
+) -> int:
+    """当前生效的摘要份数。
+
+    与 `_latest_summary` 同口径：清空前的摘要不算数。这个数决定下一次
+    是否走「全量重建」（`count % REBUILD_EVERY`），拿旧摘要凑数会让
+    刚清空就触发一次重建，而重建的输入只有清空后的那两轮。
+    """
+    stmt = (
         select(func.count())
         .select_from(ConversationSummary)
         .where(ConversationSummary.conversation_id == conversation_id)
     )
+
+    if cleared_at is not None:
+        stmt = stmt.where(
+            or_(
+                ConversationSummary.created_at > cleared_at,
+                ConversationSummary.created_at.is_(None),
+            )
+        )
+
+    value = await session.scalar(stmt)
     return int(value or 0)
 
 
@@ -376,10 +500,17 @@ async def _summarize(
     source: Sequence[Turn],
     previous: str,
     rebuilt: bool,
+    baseline_tokens: int | None = None,
 ) -> SummaryDraft | None:
-    """问模型写摘要。失败返回 None——不落库、水位不动，下一轮还能重试。"""
+    """问模型写摘要。失败返回 None——不落库、水位不动，下一轮还能重试。
+
+    `baseline_tokens` 是收益口径的分母：这份摘要替代的是**全部**窗口外轮次，
+    而不是本次并进去的那几轮。增量压缩的输入可能只有两轮（几百 token），
+    拿它当分母会算出负收益，然后被 `MIN_GAIN_RATIO` 判成无效——
+    表现是摘要从此不再更新，模型永远停在几天前。
+    """
     transcript = transcript_of(source)
-    tokens_before = sum(turn.tokens for turn in source)
+    tokens_before = baseline_tokens or sum(turn.tokens for turn in source)
 
     async with span(
         "context.compact",
@@ -462,7 +593,11 @@ async def _persist(
             if conversation is None:
                 return None
 
-            latest = await _latest_summary(session, conversation_id=conversation_id)
+            latest = await _latest_summary(
+                session,
+                conversation_id=conversation_id,
+                cleared_at=conversation.context_cleared_at,
+            )
             if (latest.id if latest else None) != base_summary_id:
                 logger.info(
                     "另一轮已完成压缩，本次结果丢弃。",
@@ -520,6 +655,7 @@ async def prepare(
     user_message: str,
     measured_tokens: int,
     exclude_message_id: uuid.UUID | None = None,
+    cleared_at: datetime | None = None,
 ) -> Block:
     """每轮对话开工前调用：算窗口、必要时压缩、返回要注入的内容。
 
@@ -528,6 +664,10 @@ async def prepare(
 
     租户上下文由调用方（`chat_service`）的 `tenant_scope` 提供，这里不重复接收
     tenant_id：接收了却只用于日志，会让人误以为它是隔离手段。
+
+    `cleared_at` 是 `/clear` 的水位。它必须**一路传到 `_load_turns` / 摘要查询**，
+    只在这一层截断是不够的：压缩读的是同一份 rows，截在哪一层决定了
+    「旧事会不会被写进新摘要再带回来」。
     """
     if not settings.context_enabled:
         return Block(meta={"enabled": False})
@@ -547,6 +687,8 @@ async def prepare(
             "source": "measured" if measured_tokens > 0 else "none",
             "action": action,
             "user_chars": len(user_message or ""),
+            # 清空点要能在观测里看到：答错时先确认「这一轮到底带了多少历史」。
+            "cleared": cleared_at is not None,
         },
     ) as measure_span:
         try:
@@ -556,6 +698,7 @@ async def prepare(
                 exclude_message_id=exclude_message_id,
                 measured_tokens=measured_tokens,
                 user_message=user_message,
+                cleared_at=cleared_at,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -585,42 +728,83 @@ async def _prepare(
     exclude_message_id: uuid.UUID | None,
     measured_tokens: int,
     user_message: str,
+    cleared_at: datetime | None = None,
 ) -> Block:
     async with async_session_factory() as session:
+        # 水位不传就自己去库里读一次，不要当成「没清过」。
+        #
+        # `cleared_at=None` 有两个来源：这个会话确实没清过，以及**调用方忘了传**。
+        # 两者在签名上长得一样，后果却相反——后者会把用户明确要求忘掉的那几轮
+        # 原样注入回去，而且不报错、不留痕迹。多一次 SELECT 换掉这个静默分支：
+        # 有水位就读出来，没有才是真的没有。
+        if cleared_at is None:
+            cleared_at = await session.scalar(
+                select(Conversation.context_cleared_at).where(
+                    Conversation.id == conversation_id
+                )
+            )
         turns = await _load_turns(
             session,
             conversation_id=conversation_id,
             exclude_message_id=exclude_message_id,
+            cleared_at=cleared_at,
         )
-        summary_row = await _latest_summary(session, conversation_id=conversation_id)
+        summary_row = await _latest_summary(
+            session, conversation_id=conversation_id, cleared_at=cleared_at
+        )
 
-        pending = [t for t in turns if _is_after(t.last_message_at, t.last_message_id, summary_row)]
-        if action in {"compact", "hard"} and len(pending) < MIN_COMPACT_INTERVAL_TURNS:
-            # 刚压过一轮，待压轮次还不够。此时压缩只会把同一段再压一遍。
-            action = "none"
+        # 待压 = 会被挤出窗口、且还没进摘要的轮次。判断「该不该压」必须用它：
+        # 从前用的是「水位之后的全部轮次」，把窗口内的也算进来，间隔检查于是
+        # 永远通过——线上表现为每轮都重压一遍（三分钟五次），每次都重写全量，
+        # 上限再大也写不完，摘要只好永远停在几天前。
+        _, evicted_preview = plan_window(turns, budget_tokens=KEEP_TOKENS, min_turns=KEEP_TURNS)
+        pending = [
+            turn
+            for turn in evicted_preview
+            if _is_after(turn.last_message_at, turn.last_message_id, summary_row)
+        ]
 
-        if action == "none":
+        if len(pending) < MIN_COMPACT_INTERVAL_TURNS:
+            # 刚压过一轮（或这一轮没挤出什么），待压轮次还不够，此时压缩只会把同一段再压一遍。
+            # 但硬截断不能降级：它是「窗口必须缩」，跟压不压无关，降了会直接撞上限。
+            if action != "hard":
+                action = "none"
+        elif action == "none" and sum(turn.tokens for turn in pending) >= MIN_EVICT_TOKENS:
             # 第二个触发条件：这一轮会挤出窗口的东西已经够多。
             # 只看「整体接近上限」会漏掉一种常见情形——基线 prompt 本身很大
             # （工具目录九十多项时约 12.4k），窗口又只装得下 6000 的历史，
             # 两者相加到不了压缩线，于是旧轮次每轮都被悄悄挤掉、摘要永不生成。
-            _, about_to_drop = plan_window(
-                turns, budget_tokens=KEEP_TOKENS, min_turns=KEEP_TURNS
-            )
-            if sum(turn.tokens for turn in about_to_drop) >= MIN_EVICT_TOKENS:
-                action = "compact"
-
+            action = "compact"
     compact_failed = False
     if action == "compact":
         kept, evicted = plan_window(turns, budget_tokens=KEEP_TOKENS, min_turns=KEEP_TURNS)
         if evicted:
             async with async_session_factory() as session:
-                count = await _summary_count(session, conversation_id=conversation_id)
+                count = await _summary_count(
+                    session, conversation_id=conversation_id, cleared_at=cleared_at
+                )
             rebuilt = count > 0 and count % REBUILD_EVERY == 0
-            draft = await _summarize(
-                source=evicted,
-                previous=summary_row.summary if summary_row is not None else "",
-                rebuilt=rebuilt,
+            # 增量只喂「还没进摘要」的轮次：全量重喂会让同一段被反复改写，而且摘要
+            # 每次从头写，越早的事越占篇幅。重建时反过来必须给全量——
+            # 「不要参考旧版本」+ 只给刚挤出的两轮 = 此前所有历史被一笔勾销。
+            incoming = [
+                turn
+                for turn in evicted
+                if _is_after(turn.last_message_at, turn.last_message_id, summary_row)
+            ]
+            source = evicted if rebuilt else incoming
+            # 没有待压内容时按「不用压」处理（pending 已挡住，这里只是兜底）。
+            # 不能落进 compact_failed——那会把窗口砍半，等于白丢一半历史。
+            skipped = not source
+            draft = (
+                await _summarize(
+                    source=source,
+                    previous=summary_row.summary if summary_row is not None else "",
+                    rebuilt=rebuilt,
+                    baseline_tokens=sum(turn.tokens for turn in evicted),
+                )
+                if source
+                else None
             )
             saved = None
             if draft is not None:
@@ -631,7 +815,7 @@ async def _prepare(
                 )
             if saved is None:
                 # 摘要没写成就少看点原文：这一轮照常作答，水位不动，下一轮还能重试。
-                compact_failed = True
+                compact_failed = not skipped
             else:
                 summary_row = saved
                 async with async_session_factory() as session:
@@ -639,6 +823,7 @@ async def _prepare(
                         session,
                         conversation_id=conversation_id,
                         exclude_message_id=exclude_message_id,
+                        cleared_at=cleared_at,
                     )
 
     if action == "hard" or compact_failed:

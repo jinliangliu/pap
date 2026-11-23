@@ -172,7 +172,7 @@ journalctl -u personal-agent-platform-studio -n 50 --no-pager | grep studio_mcp_
 ## 6. 调用链看哪里
 
 LangSmith 已于 2026-11 退役。调用链改由控制台「**观测**」页提供（自研埋点，
-数据留在自己的库里、按租户隔离，方案见 `docs/OBSERVABILITY.md`）。
+数据留在自己的库里、按租户隔离）。
 Studio 现在只负责**图形调试**：看节点进出的输入/输出、状态增量、interrupt 与恢复。
 
 ### 不要再把 LangSmith 加回去

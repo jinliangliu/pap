@@ -62,6 +62,7 @@ from app.models.memory import (
 from app.models.model_provider import ModelProvider
 from app.models.observability import ObsSpan, ObsTrace
 from app.models.platform_setting import PlatformSetting
+from app.models.policy_snapshot import PolicySnapshot
 from app.models.rbac import (
     Role,
     RolePermission,
@@ -82,6 +83,7 @@ from app.models.workflow import (
     WorkflowRun,
     WorkflowRunStatus,
 )
+from app.models.write_backup import WriteBackup
 
 __all__ = [
     "Agent",
@@ -142,10 +144,12 @@ __all__ = [
     "ObsSpan",
     "ObsTrace",
     "PlatformSetting",
+    "PolicySnapshot",
     "Skill",
     "SkillHit",
     "Workflow",
     "WorkflowRun",
     "WorkflowRunStatus",
     "OPEN_RUN_STATUSES",
+    "WriteBackup",
 ]

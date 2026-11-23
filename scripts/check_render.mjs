@@ -754,6 +754,17 @@ const TABLE = [
   check("非工单：流程用通用说法",
     generic.includes("执行操作") && !generic.includes("写入工单"), generic);
 
+  /* 对象参数折起来：编排流程的 definition 摊开是几百行，卡片会被它压垮。
+     以前只在构建助手那边折，对话台直接把 JSON 铺在卡上——有卡之后正文不再
+     铺一遍，这一坨就成了整张卡的主体。 */
+  const folded = R.approvalBody({
+    status: "PENDING",
+    open: true,
+    preview: { tool_name: "studio_workflow_save", parameters: { name: "x", definition: { entry: "a", nodes: [{ id: "a" }, { id: "b" }], edges: [] } } },
+  });
+  check("对象参数折进 details", folded.includes('<details class="tk-fold">') && folded.includes("2 个节点，展开看结构"), folded);
+  check("折叠后默认不展开", !folded.includes("<details class=\"tk-fold\" open"), "");
+
   // 参数与标题都来自租户输入，转义漏一个就是注入口子。
   const nasty = R.approvalBody({
     preview: { parameters: { title: "【较大】<img src=x onerror=alert(1)>", description: "<script>x</script>" } },
@@ -764,6 +775,80 @@ const TABLE = [
   check("没有参数时不出卡", R.approvalBody({ preview: {} }) === "", R.approvalBody({ preview: {} }));
   check("状态标：待确认", R.statusChip({ status: "PENDING" }).includes("待确认"), R.statusChip({ status: "PENDING" }));
   check("状态标：没有状态就不编", R.statusChip({}) === "", R.statusChip({}));
+
+  /* ---- 摘要进卡：正文不再铺一遍 ---- */
+  const withSummary = R.approvalBody({
+    status: "PENDING",
+    open: true,
+    preview: { tool_name: "studio_workflow_save", summary: "新建流程「field-cs-reply」\n角色：field-ops（field）", parameters: { name: "field-cs-reply" } },
+  });
+  check("摘要渲染进卡", withSummary.includes('class="a-summary"') && withSummary.includes("field-cs-reply"), withSummary);
+  check("摘要的换行被还原", withSummary.includes("新建流程「field-cs-reply」<br>角色"), withSummary);
+  // 顺序：摘要 → 参数 → 流程条。摘要是「读法」，参数是「证据」。
+  check(
+    "摘要排在参数之前",
+    withSummary.indexOf("a-summary") < withSummary.indexOf("tk-rows"),
+    withSummary
+  );
+  check("摘要里的尖括号被转义", !R.approvalBody({ preview: { summary: "<img src=x>", parameters: { a: 1 } } }).includes("<img"), "");
+
+  /* 有卡就不铺正文的判据。判错的方向只有两个：卡在、正文也在（重复），
+     或卡其实是空的、正文被吞了（丢信息）。 */
+  check("有参数 → 正文可以省", R.approvalCoversMessage({ preview: { parameters: { a: 1 } } }) === true, "");
+  check("只有图 → 正文可以省", R.approvalCoversMessage({ preview: { graph: { entry: "a", nodes: [{ id: "a" }], edges: [] } } }) === true, "");
+  check("卡是空的 → 正文必须留着", R.approvalCoversMessage({ preview: {} }) === false, "");
+  check("没有卡 → 不判省正文", R.approvalCoversMessage(null) === false, "");
+}
+
+// ---- 编排流程图（确认卡 / 结果气泡）----
+{
+  const graph = {
+    entry: "check",
+    nodes: [
+      { id: "check", kind: "agent", agent: "field-ops" },
+      { id: "shutdown", kind: "agent", agent: "field-ops" },
+      { id: "report", kind: "compose", sub: "汇总" },
+    ],
+    edges: [
+      { from: "check", to: "shutdown", when: { key: "alarm_level", op: "eq", value: "严重" }, label: "严重" },
+      { from: "check", to: "report", when: null, label: "其余" },
+      { from: "shutdown", to: "report", when: null, label: "其余" },
+    ],
+  };
+
+  const svg = R.flowDiagram(graph);
+  check("流程图：三个节点都画了", (svg.match(/class="wf-node/g) || []).length === 3, svg);
+  // 兜底边是虚线、条件边是实线：两类边混在一起时，「其余」那两条会被当成主链。
+  check("流程图：兜底边是虚线", (svg.match(/wf-edge fallback/g) || []).length === 2, svg);
+  check("流程图：条件值写在边上", svg.includes(">严重<") && svg.includes(">其余<"), svg);
+  check("流程图：汇总节点有标注", svg.includes(">汇总<"), svg);
+  check("流程图：入口单独标出来", svg.includes("wf-node agent entry"), svg);
+
+  check("流程图：没有图就不出空壳", R.flowDiagram(null) === "" && R.flowDiagram({ nodes: [] }) === "", "");
+  // 走不到的节点也要画（手改过的旧图）：图上少一个节点，比多一层危险。
+  const orphan = R.flowDiagram({ entry: "a", nodes: [{ id: "a" }, { id: "b" }], edges: [] });
+  check("流程图：孤立节点不丢", (orphan.match(/class="wf-node/g) || []).length === 2, orphan);
+
+  // 节点名、Agent 名都来自租户输入，转义漏一个就是注入口子。
+  const nastyGraph = R.flowDiagram({
+    entry: "a",
+    nodes: [{ id: '<img src=x onerror=alert(1)>', agent: "<script>x</script>" }],
+    edges: [],
+  });
+  check("流程图：转义节点名与角色", !nastyGraph.includes("<img") && !nastyGraph.includes("<script"), nastyGraph);
+
+  // 卡片上要有图，且排在参数之前：审批人先看形状，再核对 JSON。
+  const withGraph = R.approvalBody({
+    status: "PENDING",
+    open: true,
+    preview: { tool_name: "studio_workflow_save", parameters: { name: "morning-patrol" }, graph },
+  });
+  check("确认卡：画了结构图", withGraph.includes("wf-diagram"), withGraph);
+  check("确认卡：图在参数之前", withGraph.indexOf("wf-diagram") < withGraph.indexOf("morning-patrol"), withGraph);
+
+  // 没有参数、但有图（保存成功后刷新回来的卡）：图要留着，不能因为没参数就整张卡消失。
+  const graphOnly = R.approvalBody({ preview: { tool_name: "studio_workflow_save", graph } });
+  check("确认卡：只有图也画", graphOnly.includes("wf-diagram"), graphOnly);
 }
 
 if (failures) {

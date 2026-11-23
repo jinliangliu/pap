@@ -130,6 +130,72 @@ async def test_remembers_unsupported_reasoning_effort(monkeypatch):
     assert seen == [False]
 
 
+class _OutputParserError(Exception):
+    """与 LangChain 的 `OutputParserException` 同类名特征（分类器按名字认「parse」）。"""
+
+
+async def test_retries_once_when_the_model_calls_a_real_tool(monkeypatch):
+    """模型直接调了清单里的工具（而不是回 ActionPlan）时，纠正一次再试。
+
+    线上「帮我建个流程」有一半概率落在这里：解析器只认 `ActionPlan` 这个函数名，
+    模型回了 `studio_describe` 的 tool_call，整轮请求就变成
+    「模型返回内容无法解析」——用户看到的是一句与他说的无关的报错。
+    规划没有副作用，重试是安全的；不重试则等于把一次掷硬币的结果当结论。
+    """
+    turns = {"n": 0}
+    seen: list[list] = []
+
+    def behavior():
+        turns["n"] += 1
+        if turns["n"] == 1:
+            raise _OutputParserError(
+                "Unknown tool type: 'studio_describe'. Available tools: ActionPlan"
+            )
+        return "plan"
+
+    _patch(monkeypatch, behavior)
+
+    plan = await planner_mod.create_action_plan(user_message="帮我建个流程", available_tools=[])
+
+    assert plan == "plan"
+    assert turns["n"] == 2
+
+
+async def test_corrective_retry_happens_only_once(monkeypatch):
+    """两次都不守约定就如实报错，不要在这个分支里循环。"""
+    turns = {"n": 0}
+
+    def behavior():
+        turns["n"] += 1
+        raise _OutputParserError(
+            "Unknown tool type: 'studio_describe'. Available tools: ActionPlan"
+        )
+
+    _patch(monkeypatch, behavior)
+
+    with pytest.raises(planner_mod.ModelInvocationError) as excinfo:
+        await planner_mod.create_action_plan(user_message="帮我建个流程", available_tools=[])
+
+    assert turns["n"] == 2
+    assert excinfo.value.category == "model_invalid_response"
+
+
+async def test_other_parse_failures_are_not_retried(monkeypatch):
+    """别的解析失败（输出截断、字段写错）重试也是白重试，还会拖长整轮。"""
+    turns = {"n": 0}
+
+    def behavior():
+        turns["n"] += 1
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    _patch(monkeypatch, behavior)
+
+    with pytest.raises(planner_mod.ModelInvocationError):
+        await planner_mod.create_action_plan(user_message="你好", available_tools=[])
+
+    assert turns["n"] == 1
+
+
 async def test_thinking_tool_choice_conflict_gives_actionable_error(monkeypatch):
     """无法关闭思考模式时，给出能照着改的提示，而不是笼统的「暂时不可用」。"""
 

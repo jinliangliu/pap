@@ -12,7 +12,7 @@
 |---|---|---|
 | 结构 | 没有兜底边 / 有环 / 指向不存在的节点 | 图不完整，指出哪个节点 |
 | 可达 | `{{nodes.diagnose}}` 出现在一条不经过 diagnose 的路径上 | 模板引用了走不到的节点 |
-| 取值 | 条件算子不认识 / `in` 的值不是数组 | 条件写法不对 |
+| 取值 | 条件算子不认识 / `in` 的值不是数组 / 条件键没有任何 `emit` 产出 | 条件写法不对 |
 
 刻意不做的事（`docs/ORCHESTRATION.md` §8）：表达式语言、循环边、运行时改图、
 节点内联提示词或临时授权。图能决定的只有「什么时候轮到谁」。
@@ -299,6 +299,11 @@ def compile_definition(raw: Any) -> WorkflowPlan:
             _check_input_ref(node, name, ref, must[nid])
         for branch in node.branches:
             _check_template(node, must[nid], branch.task)
+
+    # ---- 条件键必须有来源 ----
+    _check_condition_keys(nodes, order)
+    # ---- 条件值必须落在 emit.values 里（能枚举的那些） ----
+    _check_condition_values(nodes, order)
 
     return WorkflowPlan(
         entry=entry,
@@ -775,6 +780,156 @@ def _check_input_ref(node: Node, name: str, ref: str, reachable: set[str]) -> No
             "但它不在这条路径的必经节点上。",
             node=node.id,
         )
+
+
+def _emitted_fields(nodes: dict[str, Node]) -> set[str]:
+    """图里所有会被写进黑板的键。
+
+    只有三处会产出键：节点的 `emit.field`、并行分支的 `emit`、并行节点自己的
+    `emit.field`（它从合并文本里再抽一次）。第三种包含在第一种里。
+    """
+    fields = {node.emit_field for node in nodes.values() if node.emit_field}
+    for node in nodes.values():
+        for branch in node.branches:
+            if branch.emit_field:
+                fields.add(branch.emit_field)
+    return fields
+
+
+def _emit_value_domains(nodes: dict[str, Node]) -> dict[str, set[str] | None]:
+    """每个 `emit.field` 可能产出哪些值。`None` 表示静态上不可枚举。
+
+    只有声明了 `emit.values` 才枚举得出：纯截断与 `emit.pattern` 抽出来的是
+    任意文本。同一个键被多处产出时取并集——只要有一处不可枚举，整条链上就
+    什么值都可能出现，后面的判断一律跳过（负向判断不会误伤，见
+    `_check_condition_keys` 的同一条理由）。
+    """
+    domains: dict[str, set[str] | None] = {}
+
+    def add(field: str, values: tuple[str, ...]) -> None:
+        if not field:
+            return
+        if not values:
+            domains[field] = None
+            return
+        existing = domains.get(field)
+        if existing is None and field in domains:
+            return
+        domains.setdefault(field, set()).update(values)
+
+    for node in nodes.values():
+        add(node.emit_field, node.emit_values)
+        for branch in node.branches:
+            # 并行分支的 `emit` 只有 field（纯截断），抽不出枚举值。
+            add(branch.emit_field, ())
+
+    return domains
+
+
+def _looks_numeric(text: str) -> bool:
+    try:
+        float(text)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _check_condition_values(nodes: dict[str, Node], order: tuple[str, ...]) -> None:
+    """条件里的值必须落在 `emit.values` 枚举得出的那一组里。
+
+    这是「键有来源」之后的下一步。`condition_holds` 对 `gt/lt` 的处理是
+    `float(value)` 失败就 `return False`——于是一条 `level gt 5` 落在
+    字符串枚举（严重 / 轻微）上时，它**永远不成立、也不报错**：分流节点看着
+    在跑，实际每次都走兜底边。`eq` 写错一个词（「高危」而枚举里是「严重」）
+    同样是一条死分支。
+
+    只判断声明了 `emit.values` 的键：纯截断与正则抽出来的是任意文本，静态上
+    说不出能取什么值，硬判会误拒合法的图。
+    """
+    domains = _emit_value_domains(nodes)
+
+    for nid in order:
+        node = nodes[nid]
+        for edge in node.next:
+            when = edge.when
+            if when is None:
+                continue
+
+            domain = domains.get(when.key)
+            if not domain:
+                continue
+
+            allowed = "、".join(sorted(domain))
+            if when.op in ("gt", "lt") and not any(_looks_numeric(item) for item in domain):
+                raise DefinitionError(
+                    "WORKFLOW_CONDITION_NEVER_TRUE",
+                    f"节点「{node.id}」的分支条件「{when.key} {when.op} {when.value}」"
+                    f"几乎不会成立：能产出「{when.key}」的 emit.values 是「{allowed}」，"
+                    "里面没有数字。抽不到枚举值时虽然会退回原文，但那要求整段回答恰好"
+                    "就是一个数字。要按数值分流，就别在这一步用 emit.values（直接输出数字）；"
+                    "要按类别分流，用 eq。",
+                    node=node.id,
+                )
+
+            if when.op == "eq" and str(when.value) not in domain:
+                raise DefinitionError(
+                    "WORKFLOW_CONDITION_NEVER_TRUE",
+                    f"节点「{node.id}」的分支条件「{when.key} eq {when.value}」"
+                    f"几乎不会成立：能产出「{when.key}」的值只有「{allowed}」，"
+                    f"抽取时只会退回原文，除非整段回答恰好就是「{when.value}」。"
+                    "把条件值改成其中之一，或把这个词补进那一步的 emit.values。",
+                    node=node.id,
+                )
+
+            if when.op == "in":
+                wanted = {str(item) for item in (when.value or [])}
+                if not (wanted & domain):
+                    raise DefinitionError(
+                        "WORKFLOW_CONDITION_NEVER_TRUE",
+                        f"节点「{node.id}」的分支条件「{when.key} in {sorted(wanted)}」"
+                        f"几乎不会成立：能产出「{when.key}」的值只有「{allowed}」，"
+                        "两组一个都不重合。",
+                        node=node.id,
+                    )
+
+
+def _check_condition_keys(nodes: dict[str, Node], order: tuple[str, ...]) -> None:
+    """条件里的 `key` 必须能由某个节点的 `emit.field` 产出。
+
+    `resolve_key` 只在黑板的 `keys` 里找，而 `keys` 全部来自声明过的 `emit`。
+    所以「图里没有任何节点产出这个字段」等价于「这条条件永远不成立」——流程会
+    一路走兜底边。它不报错、也没有日志：分流那个节点看起来在跑，实际每次都走
+    另一条路，直到有人对着运行记录数一遍才发现「分级从来没生效过」。
+
+    这里只做**负向**判断（整个图都没人产出这个键），不做路径级判断：并行分支
+    的产出会并进并行节点，静态图上算不出「这条路径上一定有哪些键」，硬算会
+    误拒合法的图。负向判断不会误伤——没声明过的键，运行期确实取不到。
+
+    自然语言写图的场景里这类错最常见：模型把 `level` 记成 `severity`，
+    于是「严重就转人工」这条分支永远不命中。
+    """
+    known = _emitted_fields(nodes)
+
+    for nid in order:
+        node = nodes[nid]
+        for edge in node.next:
+            if edge.when is None or edge.when.key in known:
+                continue
+
+            hint = (
+                "图里没有任何节点产出这个字段。"
+                + (
+                    f"当前可用的键：{'、'.join(sorted(known))}。"
+                    if known
+                    else "图里也没有任何 emit——要分流，先给判断那一步写上 emit.field。"
+                )
+            )
+            raise DefinitionError(
+                "WORKFLOW_UNKNOWN_CONDITION_KEY",
+                f"节点「{node.id}」的分支条件要判断「{edge.when.key}」，{hint}"
+                "条件取不到值时这条分支永远不会命中，流程只会走兜底边。",
+                node=node.id,
+            )
 
 
 def _predecessors(nodes: dict[str, Node]) -> dict[str, set[str]]:

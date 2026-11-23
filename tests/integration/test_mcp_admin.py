@@ -63,8 +63,14 @@ async def test_discover_marks_registered_tools(admin_client, monkeypatch):
     monkeypatch.setattr(settings, "mcp_server_url", "http://127.0.0.1:8765/mcp")
     monkeypatch.setattr(settings, "mcp_tenant_tokens", {"default": "tok"})
 
-    # 取一个真实登记过的远端名，再加一个没登记的。
-    registered_remote = next(iter(admin_routes._registered_remote_map()))
+    # 代码白名单已空（prv_ 那批下线），映射只能来自接入表；这里直接给一条，
+    # 验的是「已登记的带本地名、未登记的不带」这条语义，不是映射从哪来。
+    registered_remote = "queryPressure"
+    monkeypatch.setattr(
+        admin_routes,
+        "_registered_remote_map",
+        lambda: {registered_remote: "fc_querypressure"},
+    )
 
     async def fake_list_tools(self):
         return [

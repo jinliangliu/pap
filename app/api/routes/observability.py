@@ -77,7 +77,7 @@ from app.tenancy.context import tenant_scope
 router = APIRouter(prefix="/observability", tags=["observability"])
 
 # 能看整个租户的权限点。生产环境给某个角色加这个权限只需要往
-# role_permissions 里插一行（见 docs/OBSERVABILITY.md §17）。
+# role_permissions 里插一行。
 READ_PERMISSION = "observability:read"
 
 MAX_WINDOW_HOURS = 24 * 14
@@ -95,7 +95,7 @@ def _scope_of(identity: Identity) -> str:
 #   「刚发一句话就看见系统变差」是最容易让人不再相信这个数字的方式。
 # - `awaiting_approval`：停在等人确认。这是**设计好的暂停**，不是事故：
 #   单子挂在审批页上，确认之后由**另一条** trace 接着执行（同一个
-#   operation_id，见 RUNTIME_VIEW.md §4.2）。把它算成错误，等于给每一次
+#   operation_id）。把它算成错误，等于给每一次
 #   正常的写操作记一笔失败——实测（2026-11-12）让错误率长期虚高到三成以上。
 CONCLUSIONLESS_STATUSES = frozenset({"running", "awaiting_approval"})
 
@@ -114,7 +114,7 @@ def _is_error(status: str | None) -> bool:
       数字应该往上跳一下引起注意，而不是被静默忽略。
 
     改口径的代价写在脸上：新旧截图上的数字对不上。原始分布 `by_status`
-    一直在返回，按老口径复算随时可以；分界日记在 `OBSERVABILITY.md` §8.1。
+    一直在返回，按老口径复算随时可以。
     """
     value = status or "ok"
     return value != "ok" and value not in CONCLUSIONLESS_STATUSES
@@ -849,7 +849,7 @@ async def get_topology(
 
     ## 边来自审计，不是 span
 
-    原方案（`RUNTIME_VIEW.md` §6.1）打算从 `kind="agent"` 的 span 推边，
+    原方案打算从 `kind="agent"` 的 span 推边，
     实现时发现两处硬伤：
 
     1. **被拒的转交根本没有 span。** 深度 / 环 / 预算 / 边界 / 引用五种拒绝

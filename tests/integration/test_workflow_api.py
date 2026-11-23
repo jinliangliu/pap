@@ -96,8 +96,8 @@ async def _seed_agent(**kwargs) -> str:
 def _work_plan(answer: str) -> list[ActionPlan]:
     """一个节点的两次规划：先查一次（留下依据），再作答。
 
-    为什么必须有第一步：`invoke` 会拦「没有任何依据的结论」
-    （`AGENT_CONNECT.md` §4 第 7 条），一段凭空生成的答复过不了桥。
+    为什么必须有第一步：`invoke` 会拦「没有任何依据的结论」，
+    一段凭空生成的答复过不了桥。
     """
     return [
         ActionPlan(action="read_tool", tool_name="get_platform_time", reason="对齐时间窗"),
@@ -307,6 +307,9 @@ async def test_five_nodes_finish_despite_a_tiny_per_turn_budget(
 
 async def test_unknown_workflow_lists_what_exists(client, seeded_identity):
     await _seed_agent(name="cs", allowed_skills=None)
+    # 图里两个步骤分别用 cs 与 ops：保存时逐个核对智能体是否存在（见
+    # `workflow_service._ensure_agents_available`），少一个就存不进去。
+    await _seed_agent(name="ops")
     await _save(client, TWO_STEP)
 
     response = await _chat(client, "wf-list", "/workflow")

@@ -29,7 +29,7 @@ from app.api.dependencies import get_current_identity
 from app.auth.dependencies import Identity
 from app.core.config import settings
 from app.db.session import async_session_factory
-from app.models.connector import Connector
+from app.models.connector import HEALTH_UNKNOWN, Connector, ConnectorAuthType
 from app.models.mcp_registered import McpRegisteredTool
 from app.schemas.connector import (
     ConnectorBindRequest,
@@ -326,6 +326,13 @@ async def delete_connector(
 
 # ---------------- 凭据 ----------------
 
+# 保存凭据后顺带复查的超时（秒）。
+#
+# 为什么要有上限：这一步最常见的场景恰恰是**端点配错了**，按连接器配置的
+# 30 秒去等，用户会以为「保存」按钮卡住，然后去刷新页面——凭据其实早存进去了。
+# 3 秒足够覆盖同机/同内网的正常往返，超时也只是把状态记成 error，不影响保存。
+_CREDENTIAL_RECHECK_SECONDS = 3.0
+
 
 @router.put("/{ref}/credential", response_model=ConnectorCredentialResponse)
 async def set_credential(
@@ -333,7 +340,12 @@ async def set_credential(
     payload: ConnectorCredentialRequest,
     identity: Identity = Depends(get_current_identity),
 ) -> ConnectorCredentialResponse:
-    """写入本租户的凭据。**接口永不回显凭据**，只回「已设置」。"""
+    """写入本租户的凭据。**接口永不回显凭据**，只回「已设置」。
+
+    写完立刻复查一次连通性：健康状态是**上一次检查**的结论，凭据换了它就不成立了。
+    不复查的表现是一个自相矛盾的卡片——「已配置凭据」配着「尚未配置凭据，无法校验」，
+    而那句话是十几分钟前留下的。真去查日志的人才知道凭据已经存好了。
+    """
     _require_credential_manage(identity)
 
     with tenant_scope(identity.tenant_id):
@@ -363,12 +375,43 @@ async def set_credential(
                 # 只记动作，不记值。审计表长期保留，一个令牌写进去就等于永久泄露。
                 metadata={"connector": row.name, "created": created},
             )
+
+            # 复查失败不能连累保存：凭据已经在事务里，报「保存失败」会让人重填一遍。
+            try:
+                health_status, health_message = await connector_service.check_connector(
+                    connector=row,
+                    secret=payload.secret.strip(),
+                    timeout_seconds=_CREDENTIAL_RECHECK_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - 复查是附加信息，不是保存的前置条件
+                logger.exception(
+                    "保存凭据后自动复查失败。",
+                    extra={"event": "connector_credential_recheck_failed", "connector": row.name},
+                )
+                health_status = HEALTH_UNKNOWN
+                health_message = "凭据已保存，但自动复查未完成，请手动点「检查」。"
+
+            await connector_service.record_health(
+                session, connector=row, status=health_status, message=health_message
+            )
+            await write_audit_event(
+                session,
+                event_type="connector_health_checked",
+                tenant_id=identity.tenant_id,
+                actor_id=identity.user_id,
+                resource_type="connector",
+                resource_id=str(row.id),
+                message=f"检查连接器 {row.name}：{health_status}",
+                metadata={"connector": row.name, "status": health_status, "auto": True},
+                success=health_status != "error",
+            )
             await session.commit()
 
             return ConnectorCredentialResponse(
                 connector=row.name,
                 credential_set=True,
-                message="凭据已保存。下一次调用即生效。",
+                health_status=health_status,
+                message=f"凭据已保存；{health_message}",
             )
 
 
@@ -396,6 +439,13 @@ async def clear_credential(
                     resource_id=str(row.id),
                     message=f"清除连接器 {row.name} 的凭据",
                     metadata={"connector": row.name},
+                )
+                # 上一次「连接正常」是用刚被清掉的那枚令牌测出来的，留着就是假信息。
+                await connector_service.record_health(
+                    session,
+                    connector=row,
+                    status=HEALTH_UNKNOWN,
+                    message="凭据已清除，尚未复查。",
                 )
 
             await session.commit()
@@ -480,6 +530,17 @@ async def discover_tools(
                 session, tenant_id=identity.tenant_id
             )
             secret = credentials[row.id].secret if row.id in credentials else None
+
+            # 没有凭据就别发请求。发出去必然是 401，而 401 到这里已经变成
+            # 502「网关或反向代理拦下了请求」——人照着这句话去查隧道，真实原因
+            # 却是自己刚把凭据清空了。宁可在这里直说「先配凭据」。
+            if row.auth_type != ConnectorAuthType.NONE and not secret:
+                raise _bad_request(
+                    connector_service.ConnectorConfigError(
+                        "尚未配置凭据，无法发现工具。"
+                        "请先在连接器上「配置凭据」，再点「发现工具」。"
+                    )
+                )
 
             try:
                 tools = await connector_service.discover_remote(connector=row, secret=secret)

@@ -321,3 +321,87 @@ async def test_verifier_marks_failed_run_as_verified(sandbox_configured, monkeyp
     assert result.verified is True
     assert result.success is False
     assert result.result["stderr"] == "ZeroDivisionError"
+
+
+# ---------------- 策略快照推送 ----------------
+
+
+async def test_policy_snapshot_is_pushed_with_every_execution(
+    sandbox_configured, monkeypatch
+):
+    """每次执行都把**自包含**的一份策略推过去。
+
+    沙箱不该在执行中途回头问平台「现在是什么策略」——那次读取与这次提交
+    之间管理员可能刚按了开关，而代码已经按旧规则跑起来了。
+    """
+    fake = FakeSandbox(
+        result=SandboxResult(
+            execution_id="exec-20",
+            status="succeeded",
+            exit_code=0,
+            stdout="ok",
+            stderr="",
+            policy_revision=0,
+        )
+    )
+    monkeypatch.setattr(sandbox_tools, "_resolve_client", lambda: fake)
+
+    await execute_code(_context(), {"language": "python", "code": "print(1)"})
+
+    call = fake.calls[0]
+    assert call["policy_revision"] == 0
+    # 推的是点分键的完整值，不是「你自己去查」。
+    assert call["policy"]["permissions.default_action"] == "allow"
+    assert "tool.backup_threshold_mb" in call["policy"]
+
+
+async def test_a_different_revision_coming_back_is_flagged(
+    sandbox_configured, monkeypatch
+):
+    """沙箱回报另一个版本 = 它按别的规则跑的。
+
+    这时不能把结果当成这次调用的结论：数字可能对，但「按什么规则算出来的」
+    答不上来。原始输出仍然保留，人要能看到它到底干了什么。
+    """
+    fake = FakeSandbox(
+        result=SandboxResult(
+            execution_id="exec-21",
+            status="succeeded",
+            exit_code=0,
+            stdout="42",
+            stderr="",
+            policy_revision=3,
+        )
+    )
+    monkeypatch.setattr(sandbox_tools, "_resolve_client", lambda: fake)
+
+    result = await execute_code(_context(), {"language": "python", "code": "print(42)"})
+
+    assert result.success is False
+    assert result.error_code == "POLICY_SNAPSHOT_MISMATCH"
+    assert result.result["stdout"] == "42"
+    assert "第 3 版" in (result.message or "")
+
+
+async def test_a_missing_echo_is_not_treated_as_a_mismatch(
+    sandbox_configured, monkeypatch
+):
+    """老版本沙箱不回这个字段。缺字段说明协议还没实现，不是它用了别的版本——
+    把它判成失败，升级平台就会让所有执行一夜之间变红。
+    """
+    fake = FakeSandbox(
+        result=SandboxResult(
+            execution_id="exec-22",
+            status="succeeded",
+            exit_code=0,
+            stdout="42",
+            stderr="",
+            policy_revision=None,
+        )
+    )
+    monkeypatch.setattr(sandbox_tools, "_resolve_client", lambda: fake)
+
+    result = await execute_code(_context(), {"language": "python", "code": "print(42)"})
+
+    assert result.success is True
+    assert result.error_code is None

@@ -29,6 +29,7 @@ from app.models.context import ConversationSummary as ContextSummaryRow
 from app.models.conversation import AgentRun, Conversation, Message
 from app.schemas.conversation import (
     ConversationAttachment,
+    ConversationContextCleared,
     ConversationContextSummary,
     ConversationDetailResponse,
     ConversationListResponse,
@@ -223,6 +224,17 @@ async def get_conversation(
             )
             for item in summaries
         ],
+        # 两列必须同时有值才叫「清过」：只有时间没有 id，前端插不了分隔条；
+        # 只有 id 没有时间，后端自己也判断不了从哪儿开始算。
+        context_cleared=(
+            ConversationContextCleared(
+                at=row.context_cleared_at,
+                through_message_id=row.context_cleared_through_id,
+            )
+            if row.context_cleared_at is not None
+            and row.context_cleared_through_id is not None
+            else None
+        ),
     )
 
 

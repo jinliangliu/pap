@@ -170,17 +170,17 @@ async def test_completed_turn_schedules_memory_extraction(
         "app.services.memory_extract.schedule_extraction",
         lambda **kwargs: calls.append(kwargs),
     )
-    planner([ActionPlan(action="chat", response="好的 dylan。")])
+    planner([ActionPlan(action="chat", response="好的 alex。")])
 
     response = await client.post(
         "/api/v1/chat",
-        json={"thread_id": "thread-mem", "message": "以后叫我 dylan 就行"},
+        json={"thread_id": "thread-mem", "message": "以后叫我 alex 就行"},
     )
 
     assert response.json()["status"] == "completed"
     assert len(calls) == 1
-    assert calls[0]["user_message"] == "以后叫我 dylan 就行"
-    assert calls[0]["answer"] == "好的 dylan。"
+    assert calls[0]["user_message"] == "以后叫我 alex 就行"
+    assert calls[0]["answer"] == "好的 alex。"
     assert calls[0]["thread_id"]
 
 
@@ -194,7 +194,7 @@ async def test_failed_turn_does_not_schedule_extraction(client, monkeypatch):
 
     response = await client.post(
         "/api/v1/chat",
-        json={"thread_id": "thread-mem-err", "message": "以后叫我 dylan 就行"},
+        json={"thread_id": "thread-mem-err", "message": "以后叫我 alex 就行"},
     )
 
     assert response.json()["status"] == "error"

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -189,6 +190,110 @@ def _agent_lines(rows: list[Agent]) -> str:
     lines.extend(_agent_line(row) for row in rows[:MAX_LIST_ITEMS])
     if len(rows) > MAX_LIST_ITEMS:
         lines.append(f"…另有 {len(rows) - MAX_LIST_ITEMS} 个未列出")
+    return "\n".join(lines)
+
+
+# 一组工具名最多列几个。清单是给人扫一眼的，不是给人逐条读的：
+# 之前每个工具独占一行（名称 + 显示名 + 风险级 + 来源），77 个工具就是七十多行，
+# 而读工具的结果**不经过模型**、直接当答复呈现给用户——于是「查一下 0 库存物料」
+# 得到的回答是一屏工具目录，用户以为助手听不懂话。
+TOOL_NAMES_PER_GROUP = 12
+
+
+def _tool_prefix(name: str) -> str:
+    """工具名的前缀（截到第一个下划线）：`fc_querypressure` → `fc_`。
+
+    前缀就是用户嘴里的「哪套接口」。他说「fc_ 那些」，指的不是来源（来源都是 mcp），
+    而是前缀；按来源分组时后接入的那批排在前面那批后面，被每组上限整段截掉，
+    模型手上根本没有那几个名字，只好把前一批的清单交出去。
+
+    这条教训来自 prv_ 时代：用户说「删除 prv_ 前缀的所有接口」，清单里 20 个
+    全是 fc_，模型只能交清单。prv_ 那批下线之后例子换成了 fc_ / pk_，
+    但分组维度没变——按用户描述事物的方式分，不是按内部字段分。
+    """
+    head, sep, _ = str(name).partition("_")
+    return f"{head}_" if sep else str(name)
+
+
+def _tool_line(label: str, rows: list[dict[str, Any]]) -> str:
+    """一组工具压成一行。写工具排组首，截断碰不到它们。"""
+    ordered = sorted(
+        rows,
+        key=lambda row: (0 if row["risk_level"] != RiskLevel.READ.value else 1, row["name"]),
+    )
+    names = [
+        f"{row['name']}〔写〕" if row["risk_level"] != RiskLevel.READ.value else row["name"]
+        for row in ordered
+    ]
+    shown = "、".join(names[:TOOL_NAMES_PER_GROUP])
+    rest = f" 等 {len(names)} 个" if len(names) > TOOL_NAMES_PER_GROUP else ""
+    return f"- {label}：{shown}{rest}"
+
+
+def _tool_inventory(
+    items: list[dict[str, Any]],
+    *,
+    code_local: set[str] | None = None,
+) -> str:
+    """把工具清单压成分组的一行一句。
+
+    `code_local` 是「服务端代码注册的 MCP 工具」（远端白名单）：它们删不掉，
+    控制台也改不了。这类前缀直接标在组标签上——用户问「删掉某一批接口」时，
+    答案在清单里就写着，不必让模型逐个去撞拒绝再转述。
+    当前代码白名单为空（prv_ 那批下线），所以这个标注暂时不会出现，
+    参数与判定都保留：以后再把工具登记回代码时需要它。
+
+    这段文本有两个读者：模型（据此判断某个工具在不在、能不能删）和用户
+    （读工具直出时直接看到它）。
+    """
+    registered_in_code = set(code_local or ())
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(item["source"], []).append(item)
+
+    counts = "、".join(
+        f"{source} {len(rows)} 个（可写 {sum(1 for row in rows if row['risk_level'] != RiskLevel.READ.value)}）"
+        for source, rows in sorted(groups.items())
+    )
+    lines = [f"当前可调用 {len(items)} 个工具：{counts}。"]
+
+    for source, rows in sorted(groups.items()):
+        if source == "builtin":
+            lines.append(_tool_line("builtin", rows))
+            continue
+
+        # 接入类工具（mcp / http）再按前缀分一层：前缀才是用户口中的那批接口。
+        by_prefix: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_prefix.setdefault(_tool_prefix(row["name"]), []).append(row)
+        for prefix, part in sorted(by_prefix.items()):
+            label = f"{source}/{prefix}"
+            locked = [row["name"] for row in part if row["name"] in registered_in_code]
+            if prefix and locked:
+                if len(locked) == len(part):
+                    label += "（代码注册，删不掉：要下线只能改代码里的登记再重新部署）"
+                else:
+                    # 同一前缀下混着两类：代码注册的删不掉，接入项可以取消接入。
+                    # 只说「有删不掉的」不够——模型还得知道到底哪几个能删。
+                    removable = [
+                        row["name"] for row in part if row["name"] not in registered_in_code
+                    ]
+                    label += (
+                        f"（{len(locked)} 个代码注册、删不掉；"
+                        f"可删：{'、'.join(removable)}）"
+                    )
+            lines.append(_tool_line(label, part))
+
+    # 这句是写给模型的，不是写给用户的：线上反复出现「用户让删一批工具，
+    # 模型调了本工具、然后把清单当答复交差」。模型对「工具刚告诉它的下一步」
+    # 比系统提示词更服从，所以把动作写在它刚拿到的结果里。
+    lines.append(
+        "以上是清单，不是操作结果。删除/下线 MCP 或自定义 HTTP 工具用 studio_tool_delete"
+        "（kind 传 http 或 mcp，name 传工具名，逐个来；它会要求用户确认名称，"
+        "先把待删的名字列给用户）；标着「代码注册」的删不掉，直接说明要改哪里，"
+        "不要只把清单交出去。"
+    )
+
     return "\n".join(lines)
 
 
@@ -703,7 +808,9 @@ async def _describe_workflows(
             verified=True,
             result={"resource": "workflow", "items": [], "total": 0, "truncated": False},
             message=(
-                "当前租户还没有任何编排流程。新建用 studio_workflow_save mode=create，"
+                "当前租户还没有任何编排流程。"
+                "新建用 studio_workflow_save mode=create，但要先 studio_describe resource=agent "
+                "看有哪些智能体——图里的 agent 只能填清单里启用中的标识。"
                 "触发方式是在对话里发「/workflow <标识> <要做的事>」。"
             ),
             verification={"source": "workflows_table", "count": 0},
@@ -720,6 +827,10 @@ async def _describe_workflows(
             + (f" · {item['description']}" if item["description"] else "")
         )
     lines.append("要看某一张的图，用 ref 传它的标识；改/删分别用 studio_workflow_save / studio_workflow_delete。")
+    lines.append(
+        "新建之前先 studio_describe resource=agent：图里每一步填的 agent 必须是那份清单里"
+        "启用中的标识，保存时会逐个核对。"
+    )
 
     return ToolExecutionResult(
         success=True,
@@ -870,6 +981,9 @@ async def studio_describe(
     if resource == "tool":
         from app.tools.dependencies import get_tool_gateway
 
+        # 函数内 import：`mcp_tools` 依赖 gateway，顶层 import 会绕成环。
+        from app.tools.mcp_tools import code_local_names
+
         gateway = get_tool_gateway()
         visible = set(_person_visible_tools(context))
         items = [
@@ -884,21 +998,13 @@ async def studio_describe(
             if tool.name in visible
         ]
         items.sort(key=lambda item: (item["source"], item["name"]))
-        tool_lines = [f"你有权使用 {len(items)} 个工具："]
-        tool_lines.extend(
-            f"- {item['name']}（{item['display_name']}）· {item['risk_level']} · {item['source']}"
-            for item in items[:MAX_LIST_ITEMS]
-        )
+        # result 里不放 items：`_render_payload` 会把列表再排一遍（最多 20 条），
+        # 与 message 重复，等于把刚压下去的目录又贴回来。要看完整清单去控制台工具页。
         return ToolExecutionResult(
             success=True,
             verified=True,
-            result={
-                "resource": "tool",
-                "items": items[:MAX_LIST_ITEMS],
-                "total": len(items),
-                "truncated": len(items) > MAX_LIST_ITEMS,
-            },
-            message="\n".join(tool_lines),
+            result={"resource": "tool", "total": len(items)},
+            message=_tool_inventory(items, code_local=code_local_names()),
             verification={"source": "tool_registry", "count": len(items)},
         )
 
@@ -1042,10 +1148,12 @@ async def studio_agent_save(
                 # 一次成功的创建就会被报成失败。
                 result = ToolExecutionResult(
                     success=True,
-                    verified=True,
                     result={"agent": view},
                     message=f"已新建智能体「{row.display_name}」：{_state_text(row)}。",
                     verification={"source": "agents_table", "ref": view["name"], "revision": view["revision"]},
+                    # 不写 verified=True：读回与写入在同一个事务里，提交失败也读得到。
+                    # 审批卡上的 VERIFIED 只能由 `verify_agent_saved` 另起会话给。
+                    external_operation_id=view["name"],
                 )
 
                 await _audit_mutation(
@@ -1125,7 +1233,6 @@ async def studio_agent_save(
             agent_id = str((fresh or row).id)
             result = ToolExecutionResult(
                 success=True,
-                verified=True,
                 result={"agent": view},
                 message=(
                     f"已更新智能体「{view['display_name']}」：{_state_text(fresh or row)}"
@@ -1136,6 +1243,7 @@ async def studio_agent_save(
                     "ref": view["name"],
                     "revision": view["revision"],
                 },
+                external_operation_id=view["name"],
             )
 
             if view["revision"] != before["revision"]:
@@ -1207,10 +1315,10 @@ async def studio_agent_set_status(
             view = _agent_view(row)
             result = ToolExecutionResult(
                 success=True,
-                verified=True,
                 result={"agent": view},
                 message=f"已把「{view['display_name']}」设为 {view['status']}。",
                 verification={"source": "agents_table", "ref": view["name"], "status": view["status"]},
+                external_operation_id=view["name"],
             )
 
             if view["status"] != previous:
@@ -1334,10 +1442,12 @@ async def studio_agent_delete(
             )
             result = ToolExecutionResult(
                 success=True,
-                verified=True,
                 result={"deleted": name, "display_name": display},
                 message=f"已删除智能体「{display}」。",
                 verification={"source": "agents_table", "absent": name},
+                # 交出去的是 id：删掉之后这一行就没了，按名字回读分不清
+                # 「删掉了」与「本来就没这个名」。
+                external_operation_id=agent_id,
             )
 
             # 只有回读确认「真的没了」才记删除审计：写出去了但还在的记录，
@@ -1474,7 +1584,6 @@ async def studio_agent_restore(
             restored = _boundary_text(snapshot)
             result = ToolExecutionResult(
                 success=True,
-                verified=True,
                 result={"agent": view, "restored_from": revision},
                 message=(
                     f"已把「{view['display_name']}」的边界恢复到第 {revision} 版：{restored}。"
@@ -1486,6 +1595,7 @@ async def studio_agent_restore(
                     "revision": view["revision"],
                     "restored_from": revision,
                 },
+                external_operation_id=view["name"],
             )
 
             await _audit_mutation(
@@ -1512,6 +1622,338 @@ async def studio_agent_restore(
                 },
             )
             return result
+
+
+# ---------------- 回读核验 ----------------
+#
+# 审批卡上的 VERIFIED 只能由这里给。handler 里那几次读回都与写入同一个事务：
+# 提交失败也照样读得到，而 `agents` 挂 RLS，租户上下文没绑上时是空集、不报错。
+# 所以要另起一个会话，按 `external_operation_id` 重新读一遍再说。
+
+
+async def _read_agent(context: ToolExecutionContext, ref: str) -> Agent | None:
+    """另起会话按 id 或名字读一行（id 优先，名字可能被复用）。"""
+    text = str(ref or "").strip()
+    if not text:
+        return None
+
+    with tenant_scope(context.tenant_id):
+        async with async_session_factory() as session:
+            try:
+                return await session.get(Agent, uuid.UUID(text))
+            except (ValueError, AttributeError, TypeError):
+                return await session.scalar(select(Agent).where(Agent.name == text))
+
+
+def _norm_list(value: Any) -> list[str] | None:
+    """`None`（不额外收窄）与 `[]`（一个都不给）是两回事，不能归一成同一个。
+
+    去空、去重、排序——与 `agent_service._clean_list` 落库时做的同样处理。
+    不这么做的话，提交 `["a","a"]` 而库里存成 `["a"]` 会被判成「不一致」，
+    一次成功的保存被报成失败。
+    """
+    if value is None:
+        return None
+    return sorted({str(item).strip() for item in value if str(item).strip()})
+
+
+def _boundary_mismatch(row: Agent, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """提交了哪些边界字段就比哪些。没传的不比——「没改」不该被判成不一致。"""
+    checks: dict[str, tuple[Any, Any]] = {
+        "allowed_tools": (
+            _norm_list(row.allowed_tools),
+            _norm_list(arguments.get("allowed_tools")),
+        ),
+        "allowed_skills": (
+            _norm_list(row.allowed_skills),
+            _norm_list(arguments.get("allowed_skills")),
+        ),
+        "allowed_connectors": (
+            _norm_list(row.allowed_connectors),
+            _norm_list(arguments.get("allowed_connectors")),
+        ),
+        "can_write": (bool(row.can_write), bool(arguments.get("can_write"))),
+        "status": (row.status.value, str(arguments.get("status"))),
+    }
+
+    diff = {
+        field: {"expected": expected, "actual": actual}
+        for field, (actual, expected) in checks.items()
+        if field in arguments and expected != actual
+    }
+    return diff or None
+
+
+async def verify_agent_saved(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """保存回读：另起会话按标识再查一遍，边界与提交的对得上才算数。
+
+    为什么要比边界而不是只核「行在」：`allowed_tools` 是写进库的 JSON，序列化、
+    归一化、上一次并发保存都可能让它和提交的不是一份。落在库里的才是以后真会
+    生效的那份，而审批批的是提交的那份。
+    """
+    name = str(context.external_operation_id or arguments.get("name") or "").strip()
+
+    if not name:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次保存没有留下可回读的智能体标识。",
+            verification={"verified": False, "reason": "no_ref"},
+        )
+
+    row = await _read_agent(context, name)
+
+    if row is None:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message="回读不到刚保存的智能体，不能视为已保存。",
+            error_code="VERIFY_AGENT_MISSING",
+            verification={"verified": False, "reason": "missing", "ref": name},
+        )
+
+    diff = _boundary_mismatch(row, arguments)
+    if diff:
+        fields = "、".join(sorted(diff))
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"库里这个智能体的边界与这次提交的不一致（{fields}），不能视为已保存。",
+            error_code="VERIFY_AGENT_MISMATCH",
+            verification={"verified": False, "reason": "mismatch", "ref": name, "diff": diff},
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"agent": _agent_view(row)},
+        message=(
+            f"回读确认：「{row.display_name}」在库里，状态 {row.status.value}，"
+            f"第 {int(row.revision or 0)} 版边界。"
+        ),
+        verification={
+            "source": "agents_table",
+            "ref": name,
+            "revision": int(row.revision or 0),
+        },
+    )
+
+
+async def verify_agent_status(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """启停回读。只核一件事：库里的状态就是请求的那个。
+
+    这条最容易出现假通过的地方是「状态没变但调用成功」——比如目标本来就已经是
+    active，返回 200 却什么都没发生。这里同样算通过（结果确实对），但会说明是
+    「本来就是」，免得人以为这次改动生效了。
+    """
+    name = str(context.external_operation_id or arguments.get("name") or "").strip()
+    wanted = str(arguments.get("status") or "").strip()
+
+    if not name or not wanted:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次启停没有留下可回读的标识或目标状态。",
+            verification={"verified": False, "reason": "no_ref"},
+        )
+
+    row = await _read_agent(context, name)
+
+    if row is None:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"回读不到智能体「{name}」，不能视为已启停。",
+            error_code="VERIFY_AGENT_MISSING",
+            verification={"verified": False, "reason": "missing", "ref": name},
+        )
+
+    if row.status.value != wanted:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=(
+                f"库里「{row.display_name}」的状态是 {row.status.value}，"
+                f"不是这次提交的 {wanted}。"
+            ),
+            error_code="VERIFY_AGENT_STATE",
+            verification={
+                "verified": False,
+                "reason": "status",
+                "ref": name,
+                "expected": wanted,
+                "actual": row.status.value,
+            },
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"agent": _agent_view(row)},
+        message=f"回读确认：「{row.display_name}」当前状态是 {row.status.value}。",
+        verification={"source": "agents_table", "ref": name, "status": row.status.value},
+    )
+
+
+async def verify_agent_deleted(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """删除回读：按 **id** 查不到，且找得到那条删除审计。
+
+    与流程删除同一条理由：查不到本身什么都不说明（名字不对、租户上下文没绑上、
+    库被人换过，都是空集且不报错）。删成功之后才写的那条 `agent_deleted` 审计
+    是正向证据；只剩空集时如实说「核不出结论」，别标 VERIFIED。
+    """
+    agent_id = str(context.external_operation_id or "").strip()
+    name = str(arguments.get("name") or "").strip()
+
+    if not agent_id:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次删除没有留下可回读的智能体标识。",
+            verification={"verified": False, "reason": "no_ref", "ref": name},
+        )
+
+    row = await _read_agent(context, agent_id)
+
+    if row is not None:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"智能体「{row.name}」在库里还在，不能视为已删除。",
+            error_code="VERIFY_AGENT_PRESENT",
+            verification={"verified": False, "reason": "present", "ref": agent_id},
+        )
+
+    with tenant_scope(context.tenant_id):
+        async with async_session_factory() as session:
+            audited = await session.scalar(
+                select(AuditLog.id)
+                .where(
+                    AuditLog.tenant_id == context.tenant_id,
+                    AuditLog.resource_id == agent_id,
+                    AuditLog.event_type == AuditEventType.AGENT_DELETED,
+                )
+                .limit(1)
+            )
+
+    if audited is None:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message=(
+                f"库里已经查不到智能体「{name}」，但也没找到这次删除的记录，核不出结论。"
+            ),
+            verification={"verified": False, "reason": "no_evidence", "ref": agent_id},
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"deleted": name, "agent_id": agent_id},
+        message=f"回读确认：智能体「{name}」已不在库里，删除记录对得上。",
+        verification={
+            "source": "agents_table+audit_logs",
+            "ref": agent_id,
+            "check": "absent",
+        },
+    )
+
+
+async def verify_agent_restored(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """恢复回读：当前边界是否真的等于第 N 版。
+
+    不能只核「版本号变了」：恢复本身也是一次修改，版本号每次都会变。要比的是
+    边界字段与审计里第 N 版的快照是否一致——那才是「恢复到了那一版」。
+    """
+    name = str(context.external_operation_id or arguments.get("name") or "").strip()
+
+    try:
+        target = int(arguments.get("revision"))
+    except (TypeError, ValueError):
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次恢复没有留下目标版本号，无法回读比对。",
+            verification={"verified": False, "reason": "no_ref", "ref": name},
+        )
+
+    row = await _read_agent(context, name)
+
+    if row is None:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"回读不到智能体「{name}」，不能视为已恢复。",
+            error_code="VERIFY_AGENT_MISSING",
+            verification={"verified": False, "reason": "missing", "ref": name},
+        )
+
+    with tenant_scope(context.tenant_id):
+        async with async_session_factory() as session:
+            history = await _boundary_history(session, context.tenant_id, str(row.id))
+
+    snapshot = next((item for item in history if item["revision"] == target), None)
+
+    if snapshot is None:
+        # 审计被清理过：这一版已经无从对比。不拿「看起来差不多」凑一个通过。
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message=f"审计里已经没有第 {target} 版的边界快照，核不出这次恢复的结果。",
+            verification={"verified": False, "reason": "no_snapshot", "ref": name},
+        )
+
+    diff = _boundary_mismatch(
+        row,
+        {
+            "allowed_tools": snapshot.get("allowed_tools"),
+            "allowed_skills": snapshot.get("allowed_skills"),
+            "can_write": snapshot.get("can_write"),
+        },
+    )
+    if diff:
+        fields = "、".join(sorted(diff))
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"当前边界与第 {target} 版不一致（{fields}），不能视为已恢复。",
+            error_code="VERIFY_AGENT_RESTORE_MISMATCH",
+            verification={
+                "verified": False,
+                "reason": "mismatch",
+                "ref": name,
+                "from": target,
+                "diff": diff,
+            },
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"agent": _agent_view(row), "restored_from": target},
+        message=(
+            f"回读确认：「{row.display_name}」的边界与第 {target} 版一致，"
+            f"当前是第 {int(row.revision or 0)} 版。"
+        ),
+        verification={
+            "source": "agents_table+audit_logs",
+            "ref": name,
+            "revision": int(row.revision or 0),
+            "restored_from": target,
+        },
+    )
 
 
 _PLATFORM_GUIDE = {
@@ -1542,6 +1984,11 @@ _PLATFORM_GUIDE = {
     ),
     "workflow": (
         "编排流程是一张有向无环图，保存时编译，存进库的一定是能跑的图。"
+        "**把一段话变成图的做法**：①先 studio_describe resource=agent 看有哪些智能体，"
+        "图里只能填清单里启用中（active）的标识（保存时逐个核对，编一个名字会被拒）；"
+        "②把过程切成 3–5 步，一步一个节点，每步写清「谁、在什么输入下、做什么、产出什么」；"
+        "③要按条件分流的步骤加 emit.field，下一步的 next 就按这个键分边，"
+        "并**务必留一条 when=null 的兜底边**；④最后通常一个 compose 节点把前面的结论汇成一段。"
         "形状：{entry: 起点节点id, nodes: [{id, kind?, agent?, task, emit?, inputs?, next}]}。"
         "kind 省略即 agent 节点（调 agent 指定的智能体）；kind=compose 只汇总不调人；"
         "kind=parallel 用 branches[{id, agent, task}] 并行再汇总。"
@@ -1549,10 +1996,13 @@ _PLATFORM_GUIDE = {
         "{{nodes.<id>.<field>}}、{{inputs.<name>}}、{{upstream}}（已跑过的汇总）。"
         "next = [{when: null | {key, op, value}, to}]，op 取 eq/neq/in/gt/lt；"
         "除终点（next: []）外每条分支都必须有一条 when=null 的兜底边，否则命中不了就静默死掉。"
-        "条件里的 key 必须是上游 emit 出来的（emit.field 决定键名，emit.values/pattern 可把"
-        "自由文本收敛成一个值）。节点数上限 20，id 用小写字母开头。"
+        "条件里的 key 必须是某个节点的 emit.field 产出的名字（保存时会核对），"
+        "value 要原样取自那个节点的 emit.values——写错不会报错，那条分支只会永远不命中，"
+        "流程每次都走兜底边，看起来在工作其实没分流。"
+        "节点数上限 20，id 用小写字母开头。"
         "触发只有一种：对话里发「/workflow <标识> <要做的事>」，或在对话窗口下拉里选它；"
         "没有「立即运行」接口，因为结论必须落在会话里。"
+        "发起它的智能体要允许转交（最大转交深度 ≥ 1），否则开跑前就会被拒。"
     ),
     "runtime": (
         "运行状态与日志来自观测（obs_traces / obs_spans），默认只看近 7 天；"
@@ -1563,6 +2013,125 @@ _PLATFORM_GUIDE = {
         "这些走部署与运维流程。"
     ),
 }
+
+
+# ---------------- 确认卡正文 ----------------
+#
+# 与 `studio_admin_tools` 那一节同一条理由：正文只能由 `interrupt(message=…)`
+# 给，同轮助手那段文字会被整段顶掉。这里只陈述参数——不查库、不校验，查库的
+# 活归 `preflight`（出卡前）与 `verifier`（执行后）。
+#
+# 智能体这张卡最容易漏的是 `allowed_tools` 的三种写法：不传 = 不额外限制、
+# `null` = 取消已有收窄、`[]` = 一个都不给。三者行为完全不同，摘要必须分开说，
+# 否则人看着「工具：无」会以为是把工具全撤了。
+
+_STATUS_LABEL = {"draft": "草稿", "active": "启用", "disabled": "停用"}
+
+
+def _list_head(items: Any, limit: int = 5) -> str:
+    values = [str(item) for item in items]
+    head = "、".join(values[:limit])
+    return head if len(values) <= limit else f"{head} 等 {len(values)} 个"
+
+
+async def _summarize_agent_save(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    creating = str(arguments.get("mode") or "") == "create"
+    name = _clip(str(arguments.get("name") or ""), 64) or "（未命名）"
+    display = _clip(str(arguments.get("display_name") or ""), 64)
+    lines = [
+        f"新建智能体「{display or name}」（{name}）"
+        if creating
+        else f"修改智能体「{display or name}」（{name}）"
+    ]
+
+    facts: list[str] = []
+    if "allowed_tools" in arguments:
+        tools = arguments.get("allowed_tools")
+        if tools is None:
+            facts.append("工具：取消收窄（按平台基线可用）")
+        elif not tools:
+            facts.append("工具：一个都不给（纯对话）")
+        else:
+            facts.append(f"工具 {len(tools)} 个（{_list_head(tools)}）")
+    for key, label in (("allowed_skills", "技能"), ("allowed_connectors", "连接器")):
+        if key in arguments:
+            value = arguments.get(key)
+            if value is None:
+                facts.append(f"{label}：取消收窄")
+            elif not value:
+                facts.append(f"{label}：一个都不给")
+            else:
+                facts.append(f"{label} {len(value)} 个（{_list_head(value, 4)}）")
+    if "can_write" in arguments:
+        facts.append("可写（能执行写操作）" if arguments.get("can_write") else "只读")
+    for key, label in (("max_delegation_depth", "转交深度"), ("delegation_budget", "转交预算")):
+        if key in arguments:
+            value = arguments.get(key)
+            facts.append(f"{label} {'默认' if value is None else value}")
+    if "status" in arguments:
+        status = str(arguments.get("status") or "")
+        facts.append(f"状态 {_STATUS_LABEL.get(status, status)}（{status}）")
+    if "instruction" in arguments:
+        text = str(arguments.get("instruction") or "")
+        facts.append(f"补充指令 {len(text)} 字" if text else "补充指令清空")
+    if arguments.get("description"):
+        facts.append(f"职责：{_clip(str(arguments.get('description')), 60)}")
+
+    if facts:
+        lines.append(("本次改动：" if not creating else "") + " · ".join(facts))
+    else:
+        lines.append("本次改动：无（只传了标识，没有任何字段会变）")
+    if creating and "status" not in arguments and "can_write" not in arguments:
+        lines.append("新建的智能体默认是草稿且只读；要上线还得再改状态或开可写。")
+    return "\n".join(lines)
+
+
+async def _summarize_agent_status(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    name = _clip(str(arguments.get("name") or ""), 64) or "（未指定）"
+    status = str(arguments.get("status") or "")
+    label = _STATUS_LABEL.get(status, status or "未指定")
+    return "\n".join(
+        [
+            f"把智能体「{name}」的状态设为 {label}（{status}）。",
+            "只改状态，不动边界字段，也不改版本号。",
+        ]
+    )
+
+
+async def _summarize_agent_delete(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    name = _clip(str(arguments.get("name") or ""), 64) or "（未指定）"
+    return "\n".join(
+        [
+            f"删除智能体「{name}」。",
+            "只有已停用的智能体能删；没停用会被拒绝，先停用再删。",
+            "它的会话历史与审计保留，删的是这个智能体本身。",
+        ]
+    )
+
+
+async def _summarize_agent_restore(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    name = _clip(str(arguments.get("name") or ""), 64) or "（未指定）"
+    revision = arguments.get("revision")
+    return "\n".join(
+        [
+            f"把智能体「{name}」的边界恢复到第 {revision} 版。",
+            "边界 = 可用工具 / 技能 / 连接器 / 是否可写 / 转交深度与预算；"
+            "显示名、职责、补充指令与启停状态不动。",
+            "恢复本身是一次新修改，会产生新版本号，原版本号不会变回去。",
+        ]
+    )
 
 
 def build_studio_tools() -> list[ToolDefinition]:
@@ -1667,7 +2236,9 @@ def build_studio_tools() -> list[ToolDefinition]:
             },
             handler=studio_agent_save,
             preflight=_preflight_mutation,
-            verification_hint="保存后回读并给出新的边界版本号。",
+            summarize=_summarize_agent_save,
+            verifier=verify_agent_saved,
+            verification_hint="保存后另起会话回读，边界与提交的一致才算数。",
         ),
         ToolDefinition(
             name="studio_agent_set_status",
@@ -1688,7 +2259,9 @@ def build_studio_tools() -> list[ToolDefinition]:
             },
             handler=studio_agent_set_status,
             preflight=_preflight_mutation,
-            verification_hint="返回目标智能体的实际状态。",
+            summarize=_summarize_agent_status,
+            verifier=verify_agent_status,
+            verification_hint="回读目标智能体的实际状态，必须就是提交的那个。",
         ),
         ToolDefinition(
             name="studio_agent_delete",
@@ -1712,7 +2285,9 @@ def build_studio_tools() -> list[ToolDefinition]:
             },
             handler=studio_agent_delete,
             preflight=_preflight_delete,
-            verification_hint="删除后回读，确认已不存在。",
+            summarize=_summarize_agent_delete,
+            verifier=verify_agent_deleted,
+            verification_hint="按 id 回读确认已不存在，且删除审计对得上。",
         ),
         ToolDefinition(
             name="studio_agent_restore",
@@ -1738,6 +2313,8 @@ def build_studio_tools() -> list[ToolDefinition]:
             },
             handler=studio_agent_restore,
             preflight=_preflight_restore,
-            verification_hint="恢复后回读版本号与边界，确认与目标版本一致。",
+            summarize=_summarize_agent_restore,
+            verifier=verify_agent_restored,
+            verification_hint="回读当前边界，与第 N 版快照逐字段比对。",
         ),
     ]

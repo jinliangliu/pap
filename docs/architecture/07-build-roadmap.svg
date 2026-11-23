@@ -91,5 +91,5 @@
 <text x="56" y="478" font-size="10.5" fill="#A32D2D">eval 评分层（与「在干什么」混在一起，两件事的可信度会双双下降）· 配置侧拓扑</text>
 <text x="56" y="496" font-size="10.5" fill="#A32D2D">（平台没有编排配置，画出来就是编造）· 实时推送（时效要求是「一分钟内知道」，不是「实时」）</text>
 
-<text x="40" y="540" font-size="10" fill="#B4B2A9">来源：docs/ARCHITECTURE.md、docs/RUNTIME_VIEW.md §10、docs/SANDBOX_ROADMAP.md</text>
+<text x="40" y="540" font-size="10" fill="#B4B2A9">来源：docs/ARCHITECTURE.md</text>
 </svg>

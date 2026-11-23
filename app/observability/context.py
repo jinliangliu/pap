@@ -4,7 +4,7 @@
 一轮对话 = 一个 trace；节点/模型/工具 = span。父子关系靠 span 栈，
 跨 async 边界靠 contextvar（LangGraph 节点都是协程，天然随 task 传播）。
 
-三条设计约束（源自 docs/OBSERVABILITY.md §6.1）：
+三条设计约束：
 
 1. **关掉就是空转**：`OBS_ENABLED=false` 时 `span()` 不进栈、不分配 ID、
    不写队列，只产出一个哑对象。业务侧只多一次布尔判断。
@@ -212,7 +212,7 @@ class SpanRecord:
     status: str = "ok"
     error_category: str | None = None
     content: str | None = None
-    # 归属的智能体。委派子图里的节点要靠它认领，见 docs/RUNTIME_VIEW.md §4.1。
+    # 归属的智能体。委派子图里的节点要靠它认领。
     agent_name: str | None = None
     attrs: dict[str, Any] = field(default_factory=dict)
 
@@ -309,8 +309,8 @@ class TraceState:
     def begin(self) -> dict[str, Any]:
         """进入时先落的那一行：`status="running"`，汇总全零。
 
-        与 `finish()` 成对：一个 INSERT，一个 UPDATE。为什么要提前落库，
-        见 docs/RUNTIME_VIEW.md §5.1——不落这一行，「现在谁在跑」永远答不上来，
+        与 `finish()` 成对：一个 INSERT，一个 UPDATE。为什么要提前落库：
+        不落这一行，「现在谁在跑」永远答不上来，
         因为整棵树要到收尾才提交。
 
         `operation_id` 在这里就写死（没有可继承的值时等于自己的 trace_id），
@@ -557,7 +557,7 @@ async def trace_run(
     token = _trace_var.set(state)
     agent_token = _agent_var.set(agent_name or None)
     # 先落「在跑」这一行，再进业务：不这么做，跑 40 秒的一轮前 40 秒在库里不存在，
-    # 运行视图只能看到已经结束的事——那正是它没用的地方（RUNTIME_VIEW.md §5.1）。
+    # 运行视图只能看到已经结束的事——那正是它没用的地方。
     _submit_begin(state)
     try:
         yield state

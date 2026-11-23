@@ -4,7 +4,7 @@ Revision ID: b3c9d7e15a42
 Revises: d4e9a1c27b58
 Create Date: 2026-11-13 13:10:00.000000
 
-长对话上下文（docs/CONTEXT.md）：
+长对话上下文：
 
 1. `conversation_summaries`：append-only 的压缩产物，最新一行生效；
    保留旧行是为了复盘「这次压缩前后各多少 token」「重建后差在哪」。

@@ -84,12 +84,14 @@ async def ready(response: Response) -> HealthResponse:
         except Exception:
             checks["sandbox"] = False
 
-    # 远端 MCP 同理：对端挂了只影响 prv_* 工具，不该让整个服务判为不可用。
+    # 远端 MCP 同理：对端挂了只影响它那批工具，不该让整个服务判为不可用。
     # 但必须在这里可见，否则「模型突然看不到调压工具」只能靠翻日志才发现。
+    # 判定用 source 而不是名字前缀：代码白名单已经空了（prv_ 那批下线，
+    # 改由 FioCloud 连接器提供 fc_*），按前缀判会永远返回 false。
     if settings.mcp_enabled:
         try:
             checks["mcp_tools"] = any(
-                tool.name.startswith("prv_") for tool in get_tool_gateway().list_tools()
+                tool.source == "mcp" for tool in get_tool_gateway().list_tools()
             )
         except Exception:
             checks["mcp_tools"] = False

@@ -766,7 +766,14 @@
         return '<span class="tk-tag">' + esc(text) + "</span>";
       }).join("");
     }
-    return '<pre class="tk-json">' + esc(safeJson(value)) + "</pre>";
+    // 对象（编排流程的 definition 就是整张图）折起来：摊开是几百行 JSON，
+    // 卡片会被它压垮，而确认卡首先要能读。规模写在 summary 上，要核对再点开。
+    var nodes = value && value.nodes;
+    var hint = Array.isArray(nodes)
+      ? nodes.length + " 个节点，展开看结构"
+      : "展开看内容";
+    return '<details class="tk-fold"><summary>' + esc(hint) +
+      '</summary><pre class="tk-json">' + esc(safeJson(value)) + "</pre></details>";
   }
 
   function paramRow(key, value) {
@@ -920,21 +927,325 @@
     return '<span class="chip ' + meta.tone + '">' + esc(meta.text) + "</span>";
   }
 
+  /* ---------------- 编排流程图 ----------------
+
+     为什么要有这张图：确认卡正文里那行 `check → shutdown → ticket → report`
+     丢掉的不是箭头，而是**分叉**——「严重走 shutdown，其余直接到 report」这句
+     话在文字里只能靠「；」读出来，而人读卡片时是扫一遍就点确认的。
+
+     布局是**一行一个节点、从上往下**，不是拓扑页那种从左往右：这张图主要出现在
+     300px 宽的助手面板里，横向几列会被压成看不清的字号。竖排的宽度只跟节点宽度
+     有关（200px 上下），高度随节点数长——滚动比缩字便宜。
+
+     坐标不算进数据：服务端只给节点、边和边上那个条件，画多大是这一层的事。
+     存了坐标就等于把「几列、多宽」写进库，换个屏幕就得重算一遍。 */
+  var WF_NODE_W = 148;
+  var WF_NODE_H = 44;
+  var WF_COL_GAP = 14;
+  // 同一层里堆第二行时的间距：这里不放标签，贴着就行。
+  var WF_ROW_GAP = 14;
+  // 层间距要大过一行标签：边上那行「严重」就写在两层之间的空白带里。
+  var WF_LAYER_GAP = 34;
+  var WF_MAX_COLS = 3;
+  var WF_PAD = 12;
+
+  function wfClip(text, limit) {
+    var value = String(text == null ? "" : text);
+    return value.length > limit ? value.slice(0, limit - 1) + "…" : value;
+  }
+
+  /* 层与层之间的折线：下 → 横 → 下，拐角留个小圆角。
+     用折线不用曲线，是因为标签要落在**层与层之间的空白带**上：曲线在分叉时
+     最靠外的位置恰好贴着下一层卡片的顶边，标签放上去就像压在框上。 */
+  function wfElbow(x1, y1, x2, y2) {
+    if (x1 === x2) return "M" + x1 + " " + y1 + " L" + x2 + " " + y2;
+
+    var mid = y1 + (y2 - y1) / 2;
+    var r = Math.min(8, Math.abs(x2 - x1) / 2, Math.max(2, (y2 - y1) / 4));
+    var dir = x2 > x1 ? 1 : -1;
+
+    return "M" + x1 + " " + y1 +
+      " L" + x1 + " " + (mid - r) +
+      " Q" + x1 + " " + mid + " " + (x1 + dir * r) + " " + mid +
+      " L" + (x2 - dir * r) + " " + mid +
+      " Q" + x2 + " " + mid + " " + x2 + " " + (mid + r) +
+      " L" + x2 + " " + y2;
+  }
+
+  function flowDiagram(graph) {
+    if (!graph || !Array.isArray(graph.nodes)) return "";
+
+    var nodes = graph.nodes.filter(function (node) {
+      return node && node.id;
+    });
+    if (!nodes.length) return "";
+
+    var byId = {};
+    nodes.forEach(function (node) { byId[node.id] = node; });
+
+    var edges = (Array.isArray(graph.edges) ? graph.edges : []).filter(function (edge) {
+      return edge && byId[edge.from] && byId[edge.to];
+    });
+
+    var entry = graph.entry && byId[graph.entry] ? graph.entry : nodes[0].id;
+
+    /* 分层：入口定在 0，每走一条边推深一层，取「所有前驱里最深的那条 +1」。
+       迭代封顶——编译器不许成环，但手改过的 definition 会进来（历史数据），
+       这里不能死循环。 */
+    var depth = {};
+    depth[entry] = 0;
+    for (var pass = 0; pass < nodes.length + 1; pass += 1) {
+      var moved = false;
+      edges.forEach(function (edge) {
+        if (typeof depth[edge.from] !== "number") return;
+        var want = depth[edge.from] + 1;
+        if (typeof depth[edge.to] !== "number" || depth[edge.to] < want) {
+          depth[edge.to] = want;
+          moved = true;
+        }
+      });
+      if (!moved) break;
+    }
+
+    // 走不到的节点不丢，沉到最后一层：图上少一个节点，比多一层危险。
+    var deepest = 0;
+    Object.keys(depth).forEach(function (id) { deepest = Math.max(deepest, depth[id]); });
+    nodes.forEach(function (node) {
+      if (typeof depth[node.id] !== "number") depth[node.id] = deepest;
+    });
+
+    var layers = [];
+    nodes.forEach(function (node) {
+      var at = depth[node.id];
+      (layers[at] = layers[at] || []).push(node.id);
+    });
+    for (var index = 0; index < layers.length; index += 1) {
+      if (!layers[index]) layers[index] = [];
+    }
+
+    /* 排版：按深度分层、自上而下；同一层的并排（最多三列）。
+
+       为什么不干脆一行一个节点：分叉的两支竖着排时，读起来像「先做 A 再做 B」，
+       而它们是**二选一**。并排能让「同一层的几个点」一眼看清，这正是这张图
+       存在的理由。
+
+       为什么最多三列：300px 的面板里四列会让字缩到读不清。四支以上的层把多出来
+       的放到下一行——少见（编译期侧边数本来就有上限），且画不出来时宁可挤，
+       也不能像早先那样把边悄悄丢掉。 */
+    // 最宽的那一层决定节点宽度：并排三列时收窄，否则整张图会被 max-width 缩，
+    // 缩的是**所有**字号（包括一列时那张大字）。
+    var maxCols = 1;
+    layers.forEach(function (layer) {
+      maxCols = Math.max(maxCols, Math.min(WF_MAX_COLS, layer.length || 1));
+    });
+
+    var nodeW = maxCols >= 3 ? 90 : (maxCols === 2 ? 140 : WF_NODE_W);
+    var geometry = layers.map(function (layer) {
+      var cols = Math.max(1, Math.min(WF_MAX_COLS, layer.length || 1));
+      var rows = Math.max(1, Math.ceil((layer.length || 1) / cols));
+      return { cols: cols, rows: rows, width: cols * nodeW + (cols - 1) * WF_COL_GAP };
+    });
+    var maxWidth = 0;
+    geometry.forEach(function (geo) { maxWidth = Math.max(maxWidth, geo.width); });
+
+    var pos = {};
+    var y = WF_PAD;
+    geometry.forEach(function (geo, index) {
+      var startX = WF_PAD + (maxWidth - geo.width) / 2;
+      layers[index].forEach(function (id, order) {
+        var col = order % geo.cols;
+        var row = Math.floor(order / geo.cols);
+        pos[id] = {
+          x: startX + col * (nodeW + WF_COL_GAP),
+          y: y + row * (WF_NODE_H + WF_ROW_GAP)
+        };
+      });
+      y += geo.rows * WF_NODE_H + (geo.rows - 1) * WF_ROW_GAP + WF_LAYER_GAP;
+    });
+
+    var nodeRight = WF_PAD + maxWidth;
+    var height = y - WF_LAYER_GAP + WF_PAD;
+
+    /* 什么时候走绕行通道：这条边直着往下会从**别的卡片背后**穿过去——最常见的是
+       「其余 → report」跳过中间那一步，看着像连到了中间那个节点上。绕行的线从
+       右侧过去，绕开这件事在图上直接看得见。 */
+    function crossesBox(edge) {
+      var from = pos[edge.from];
+      var to = pos[edge.to];
+      if (!from || !to) return false;
+
+      var x = to.x + nodeW / 2;
+      var top = from.y + WF_NODE_H;
+      var bottom = to.y;
+      // 目标不比源低：没有竖直空间，只能绕。
+      if (bottom <= top + 2) return true;
+
+      /* 横向留 12px：边从两张卡片中间那条缝里过时，线本身确实不压框，但它
+         身上那行标签（「其余」两个字）会压到两边的框上。缝太窄就绕行。 */
+      for (var id in pos) {
+        if (id === edge.from || id === edge.to) continue;
+        var at = pos[id];
+        if (x > at.x - 12 && x < at.x + nodeW + 12 && at.y < bottom && at.y + WF_NODE_H > top) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    var hasBypass = edges.some(crossesBox);
+    var bypassX = nodeRight + 14;
+
+    /* 绕行标签压在通道线上、左右各占一半，所以只留**一半字宽**：一律留 80px
+       会让只有「其余」两个字的图凭空多出一大片空白，而宽度决定它在窄面板里
+       会不会被缩——缩的是整张图的字号。6 个字是上限，再长就只剩缩写，
+       反正正文那行「分流：」里有全文。 */
+    var bypassChars = 0;
+    var bypassLanes = 0;
+    edges.forEach(function (edge) {
+      if (!crossesBox(edge)) return;
+      bypassLanes += 1;
+      bypassChars = Math.max(bypassChars, Math.min(6, String(edge.label || "").length));
+    });
+
+    // 每条绕行边各占一条通道（9px），否则两条会画成一条：图上少一条边，
+    // 比多一条线难发现得多。
+    var laneSpan = Math.max(0, bypassLanes - 1) * 9;
+    var width = (hasBypass
+      ? bypassX + laneSpan + (bypassChars ? Math.ceil(bypassChars * 5.5) + 4 : 4)
+      : nodeRight) + WF_PAD;
+
+    // 边画在节点之前：从卡片底下穿过去，比压在字上干净。
+    var paths = [];
+    var labels = [];
+    var bypassIndex = 0;
+
+    edges.forEach(function (edge) {
+      var from = pos[edge.from];
+      var to = pos[edge.to];
+      if (!from || !to) return;
+
+      var cls = "wf-edge" + (edge.when ? "" : " fallback");
+      var label = String(edge.label || "");
+
+      if (crossesBox(edge)) {
+        // 从右边缘出去、绕到目标右边缘：绕行的线永远不会压在卡片上。
+        var sx = from.x + nodeW;
+        var sy = from.y + WF_NODE_H / 2;
+        var ex = to.x + nodeW;
+        var ey = to.y + WF_NODE_H / 2;
+        var bx = bypassX + bypassIndex * 9;
+
+        paths.push('<path class="' + cls + '" d="M' + sx + " " + sy +
+          " C" + bx + " " + sy + " " + bx + " " + ey + " " + ex + " " + ey + '"/>');
+
+        if (label) {
+          // 标签压在绕行线中段，靠描边托住（通道右边没有别的东西）。
+          labels.push('<text class="wf-edge-label" x="' + Math.round(bx) + '" y="' +
+            Math.round((sy + ey) / 2 + 3) + '" text-anchor="middle">' +
+            esc(wfClip(label, 6)) + "</text>");
+        }
+        bypassIndex += 1;
+        return;
+      }
+
+      var x1 = from.x + nodeW / 2;
+      var y1 = from.y + WF_NODE_H;
+      var x2 = to.x + nodeW / 2;
+      var y2 = to.y;
+
+      /* 折线：下 → 横 → 下。同层并排时两条边是斜的，标签落在斜线上正好贴着
+         下一层卡片的顶边，看着像压在框上；折线把它们收进层间的空白带。 */
+      paths.push('<path class="' + cls + '" d="' + wfElbow(x1, y1, x2, y2) + '"/>');
+
+      if (!label) return;
+      var midY = y1 + (y2 - y1) / 2;
+      // 直边标签压在线中间（描边托住）；斜边标签抬到水平段上方一点，避开折角。
+      labels.push('<text class="wf-edge-label" x="' + Math.round((x1 + x2) / 2) + '" y="' +
+        Math.round(midY + (x1 === x2 ? 4 : -4)) + '" text-anchor="middle">' +
+        esc(wfClip(label, 12)) + "</text>");
+    });
+
+    var boxes = Object.keys(pos).map(function (id) {
+      var node = byId[id];
+      var at = pos[id];
+      if (!node || !at) return "";
+
+      var kind = String(node.kind || "agent");
+      var sub = String(node.sub || node.agent || "");
+      var title = id + (node.agent ? "（" + node.agent + "）" : (sub ? "（" + sub + "）" : ""));
+
+      return '<g class="wf-node ' + esc(kind) + (id === entry ? " entry" : "") + '">' +
+        '<title>' + esc(title) + "</title>" +
+        '<rect x="' + at.x + '" y="' + at.y + '" width="' + nodeW +
+        '" height="' + WF_NODE_H + '" rx="7"/>' +
+        '<text class="wf-id" x="' + (at.x + 10) + '" y="' + (at.y + 19) + '">' +
+        esc(wfClip(id, 16)) + "</text>" +
+        (sub
+          ? '<text class="wf-sub" x="' + (at.x + 10) + '" y="' + (at.y + 34) + '">' +
+            esc(wfClip(sub, 18)) + "</text>"
+          : "") +
+        "</g>";
+    });
+
+    // 显式写像素宽高，再由 CSS 的 max-width:100% 兜住窄面板：只给 viewBox
+    // 会把整张图拉到容器宽度，字跟着放大，与卡片其余文字对不上。
+    return '<div class="wf-diagram"><svg viewBox="0 0 ' + width + " " + height +
+      '" width="' + width + '" height="' + height +
+      '" role="img" aria-label="流程结构图">' +
+      paths.join("") + boxes.join("") + labels.join("") + "</svg></div>";
+  }
+
+  /* 这张卡是否已经把那条消息的内容说全了。
+   *
+   * 审批轮的那条助手消息，正文是平台生成的「待确认操作：X／步骤／角色／
+   * 尚未执行」，卡片把同一批事实画成抬头 + 图 + 参数 + 流程条。两份并排出现，
+   * 读的人得先分辨哪一份是新的，而且这行字与卡里的图**永远**同源——它们本来就
+   * 是从同一个 `preview` 生成的。
+   *
+   * 所以有卡就不铺正文，只留卡。唯一的例外是卡没取到（审批单被清理、状态未知，
+   * `preview` 是空的）：那时正文是唯一线索，必须留着，否则界面上只剩一个审批号。
+   */
+  function approvalCoversMessage(a) {
+    var preview = (a && a.preview) || {};
+    var params = preview.parameters;
+    if (preview.graph) return true;
+    return Boolean(params && typeof params === "object" && Object.keys(params).length);
+  }
+
+  /* 摘要块：审批单里的 `preview.summary`，也就是平台为这张卡写的那段话。
+   *
+   * 它以前只出现在助手消息的正文里，卡上没有——所以「不铺正文」这件事必须先
+   * 把它收进卡里，否则信息是净损失。两个渲染入口（对话台 / 构建助手）共用
+   * 这一份，否则同一张单子在两处会长得不一样。 */
+  function approvalSummary(preview) {
+    var summary = String((preview && preview.summary) || "").trim();
+    if (!summary) return "";
+    return '<div class="a-summary">' + esc(summary).replace(/\n/g, "<br>") + "</div>";
+  }
+
   /* 审批卡正文。入参就是 console.js 里那个 `msg.approval`
      （{ preview, status, open, done }），不另造一层结构。 */
   function approvalBody(a) {
     var preview = (a && a.preview) || {};
     var params = preview.parameters;
+    // 摘要排在最前：它是**读法**（这次改动是什么、谁做、沿用哪些），
+    // 图与参数是**证据**（形状、原始字段）。正文不再重复铺一遍这段文字，
+    // 有卡的消息只渲染卡，这一处就是它唯一的落点。
+    var summaryHtml = approvalSummary(preview);
+    // 有图就先给图：卡面要回答的第一件事是「这是什么形状」，参数是核对用的。
+    var diagram = flowDiagram(preview.graph);
 
     // 参数不是对象（老卡片、被清理的单子、或工具本来就没参数）时，
     // 只画流程条。空壳卡片比一张只有标题的卡更让人怀疑是不是加载失败。
     if (!params || typeof params !== "object" || Array.isArray(params)) {
-      return preview.tool_name || preview.operation ? flowBar(a, "write") : "";
+      if (diagram) return summaryHtml + diagram;
+      return summaryHtml +
+        (preview.tool_name || preview.operation ? flowBar(a, "write") : "");
     }
 
     var isTicket = looksLikeTicket(params);
     var card = isTicket ? ticketCard(params) : paramsCard(params);
-    return card + flowBar(a, isTicket ? "ticket" : "write");
+    return summaryHtml + diagram + card + flowBar(a, isTicket ? "ticket" : "write");
   }
 
   /* ---------------- 运行横条（L0「现在」） ----------------
@@ -2074,12 +2385,60 @@
     }).join("") + "</ul>";
   }
 
+  /* 清空点插在哪：`/clear` 那条回复**之后**。
+   *
+   * 返回下标表而不是单个下标：一个会话里可以清多次，每次都是一个点。
+   * 判据只认消息上的标记（`metadata.context_cleared` 随消息落库），
+   * 前端不另存「清空点」——多存一份就多一处会和气泡对不上的地方。
+   *
+   * 为什么和 foldSeam 放在一起：两者都是「这条消息之后插一条分隔」的布局
+   * 判断，分开放会出现「一个按 id 找、一个按标记找」的口径漂移。
+   */
+  function clearSeams(messages) {
+    var marks = {};
+    (messages || []).forEach(function (msg, i) {
+      if (msg && msg.contextCleared) marks[i] = true;
+    });
+    return marks;
+  }
+
+  /* 与压缩分隔条**故意长得不一样**：压缩是「点开还能看摘要」，
+     清空是「这段不再参与推理，看也只是记录」。做成同一种可展开的条，
+     用户会以为点开就能把上下文恢复回来。 */
+  function clearSeamHtml() {
+    return '<div class="chat-seam-clear"><span>' +
+      "以下为新对话 · 此前的记录不再参与推理</span></div>";
+  }
+
+  /* 清空点是否让最新那份摘要失效——**最后一次**清空落在摘要水位之后即为失效
+     （后端按摘要生成时刻过滤，见 `CONTEXT.md` §5.7：摘要要晚于最后一次清空
+     才生效，所以这里比的是最大值，不是最小值）。
+
+     这个判断必须在这里做，不能写成内联的 `Math.min.apply(null, []) > index`：
+     空标记表时 `Math.min` 是 `Infinity`，任何下标都小于它，于是**没清过的
+     会话**里所有折叠条会一起消失，而且没有任何报错。
+   */
+  function clearSuppressesSeam(clearMarks, seamIndex) {
+    var indexes = [];
+    var marks = clearMarks || {};
+    for (var key in marks) {
+      if (Object.prototype.hasOwnProperty.call(marks, key)) indexes.push(Number(key));
+    }
+    if (!indexes.length || seamIndex === null || seamIndex === undefined || seamIndex < 0) {
+      return false;
+    }
+    return Math.max.apply(null, indexes) > seamIndex;
+  }
+
   global.PAPRender = {
     rich: rich,
     chart: chartCard,
     sanitizeSvg: sanitizeSvg,
     auditMeta: auditMeta,
     approvalBody: approvalBody,
+    approvalSummary: approvalSummary,
+    approvalCoversMessage: approvalCoversMessage,
+    flowDiagram: flowDiagram,
     statusChip: statusChip,
     ticketCard: ticketCard,
     textBlocks: textBlocks,
@@ -2090,6 +2449,9 @@
     operationView: operationView,
     contextNote: contextNote,
     foldSeam: foldSeam,
+    clearSeams: clearSeams,
+    clearSeamHtml: clearSeamHtml,
+    clearSuppressesSeam: clearSuppressesSeam,
     obsTrend: obsTrend,
     obsBars: obsBars,
     inline: inline

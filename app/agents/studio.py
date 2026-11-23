@@ -13,7 +13,7 @@ Studio 输入中出现的 user_id / tenant_id / roles 一律忽略。
 
 注意工具注册表：生产的 MCP 工具在 `main.lifespan` 里注册，而 `langgraph dev`
 不走 lifespan，所以这里必须自己注册一次（见 `_ensure_mcp_tools`），否则
-Studio 里看不到任何 `prv_*` 工具。
+Studio 里看不到任何 MCP 工具（连接器接入的 `fc_*` 与管理员接入项）。
 
 本模块不参与生产服务启动，仅供 `langgraph dev` 与 Studio 观测使用。
 """

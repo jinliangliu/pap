@@ -80,7 +80,7 @@ async def test_chat_delegates_and_returns_the_specialist_answer(
             ),
             # 子调用里，运行值班先查一次再作答。
             # 这一步不是凑数：P1 起「没有任何依据的结论不准过桥」，
-            # 一条凭空生成的答复会被拦下（`AGENT_CONNECT.md` §7.1-7）。
+            # 一条凭空生成的答复会被拦下。
             ActionPlan(
                 action="read_tool",
                 tool_name="get_platform_time",

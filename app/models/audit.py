@@ -23,6 +23,13 @@ class AuditEventType(str, enum.Enum):
     KNOWLEDGE_SEARCHED = "knowledge_searched"
 
     TOOL_REQUESTED = "tool_requested"
+    # 「这次调用被允许了」——一条**决策**记录，写在执行之前。
+    #
+    # 与 TOOL_SUCCEEDED 分开，是因为它们回答的不是同一个问题：这条答
+    # 「谁允许了、依据哪一版策略」，那条答「跑完没有」。只有后者时，
+    # 进程在 handler 里被杀掉就什么都不剩——而「批过、开始跑、然后没了」
+    # 恰恰是最需要事后看见的一种情况。
+    TOOL_ALLOWED = "tool_allowed"
     TOOL_SUCCEEDED = "tool_succeeded"
     TOOL_FAILED = "tool_failed"
     TOOL_DENIED = "tool_denied"

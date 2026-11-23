@@ -13,8 +13,10 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.db.session import async_session_factory
+from app.integrations.mcp_client import McpUnavailableError
 from app.models.audit import AuditLog
 from app.models.connector import Connector, ConnectorCredential
+from app.services import connector_service
 from app.tenancy.context import tenant_scope
 
 BASE = "/api/v1/connectors"
@@ -24,6 +26,24 @@ PLATFORM = "platform"
 
 def _name() -> str:
     return f"conn_{uuid.uuid4().hex[:10]}"
+
+
+@pytest.fixture(autouse=True)
+def _offline_mcp(monkeypatch):
+    """把「拉远端工具清单」打成即时失败。
+
+    保存凭据现在会顺带复查一次连通性（`routes/connectors.set_credential`）。
+    不拦的话，每条写凭据的用例都会去解析并连接 `mcp.example.com`：有外网时
+    白等若干秒，没外网时卡到超时——两种都会让这份文件的耗时取决于网络。
+
+    只拦最外层的 `fetch_remote_tools`。「没配凭据就不该去连」这类判定仍在
+    真实路径上跑，所以 `test_health_check_without_credential_says_so` 照旧有效。
+    """
+
+    async def _fail(**_kwargs):
+        raise McpUnavailableError("测试环境不打外网。")
+
+    monkeypatch.setattr(connector_service, "fetch_remote_tools", _fail)
 
 
 @pytest.fixture
@@ -295,3 +315,109 @@ async def test_delete_also_purges_stored_credentials(admin_client, clean_connect
                 )
                 is None
             )
+
+
+async def test_saving_credential_rechecks_health(admin_client, client, clean_connectors):
+    """存完凭据要立刻复查一次。
+
+    健康状态是「上一次检查」的结论，凭据换了它就不成立。不复查的表现是一个
+    自相矛盾的卡片：「已配置凭据」配着「尚未配置凭据，无法校验」——而后面那句
+    是十几分钟前留下的。人只能去翻日志才敢确定自己那一下保存成功了没有。
+    """
+    created = await _create(admin_client)
+    assert created["health_status"] == "unknown"
+
+    response = await client.put(
+        f"{BASE}/{created['name']}/credential", json={"secret": "tok-recheck"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "凭据已保存" in body["message"]
+    # 桩让复查必然失败。关键不是它失败，而是结论跟着保存一起回来了。
+    assert body["health_status"] == "error"
+
+    detail = await client.get(f"{BASE}/{created['name']}")
+    assert detail.json()["health_status"] == "error"
+    assert detail.json()["health_checked_at"] is not None
+
+    async with async_session_factory() as session:
+        with tenant_scope(PLATFORM):
+            rows = (
+                await session.scalars(
+                    select(AuditLog).where(
+                        AuditLog.event_type == "connector_health_checked"
+                    )
+                )
+            ).all()
+
+    assert rows, "自动复查没有落审计"
+    assert any((row.metadata_json or {}).get("auto") is True for row in rows)
+
+
+async def test_bearer_never_keeps_a_pasted_token_as_header_name(
+    admin_client, client, clean_connectors
+):
+    """bearer 不会把头名存下来，历史行上的也会被清掉。
+
+    头名留着一个「能填但没人读」的框，结果就是令牌被贴进去：明文进平台表
+    （`connectors` 没有行级安全），又被列表接口原样回显，而出站请求一次都没用到它。
+    清掉旧值不能只清库——审计会记 `before`，旧值进去等于换个地方永久留存。
+    """
+    token = "pk_mcp_9f2b7c1d4e5a6b7c8d9e0f1a2b3c4d5e"
+
+    created = await _create(admin_client, auth_type="bearer", auth_header_name=token)
+    assert created["auth_header_name"] == ""
+
+    # 改造之前建的行：令牌已经躺在 auth_header_name 里。
+    async with async_session_factory() as session:
+        with tenant_scope(PLATFORM):
+            row = await session.scalar(
+                select(Connector).where(Connector.name == created["name"])
+            )
+            row.auth_header_name = token
+            await session.commit()
+
+    response = await admin_client.patch(
+        f"{BASE}/{created['name']}",
+        json={"auth_type": "bearer", "auth_header_name": ""},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["auth_header_name"] == ""
+
+    async with async_session_factory() as session:
+        with tenant_scope(PLATFORM):
+            row = await session.scalar(
+                select(Connector).where(Connector.name == created["name"])
+            )
+            assert row.auth_header_name == ""
+            logs = (
+                await session.scalars(
+                    select(AuditLog).where(AuditLog.event_type == "connector_updated")
+                )
+            ).all()
+
+    assert logs, "改了定义却没有审计"
+    for log in logs:
+        assert token not in str(log.metadata_json)
+
+
+async def test_discover_without_credential_points_at_the_credential(
+    admin_client, clean_connectors
+):
+    """没凭据时「发现工具」要说「先配凭据」，不是「网关拦了请求」。
+
+    真实发生的顺序是：用户清掉凭据 → 点「发现工具」→ 服务端照发请求 →
+    远端 401（body 不是 JSON-RPC，SDK 把状态码丢了）→ 路由统一包成
+    502「网关或反向代理拦下了请求」。人于是去查隧道，而真正要做的是
+    把令牌填回去。这条用例钉住「不再发出这个必然失败的请求」。
+    """
+    created = await _create(admin_client, kind="mcp", auth_type="bearer")
+
+    response = await admin_client.post(f"{BASE}/{created['name']}/discover")
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "凭据" in detail
+    assert "网关" not in detail

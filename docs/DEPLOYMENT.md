@@ -128,7 +128,7 @@ install -m 0644 deploy/systemd/pap-watchdog.timer /etc/systemd/system/
 install -d -m 0750 /var/lib/pap-watchdog
 install -m 0600 deploy/pap-watchdog.env.example /etc/pap-watchdog.env   # 已有则跳过
 systemctl daemon-reload && systemctl enable --now pap-watchdog.timer
-# 详见 docs/MONITORING.md
+# 巡检项在 scripts/watchdog.py 的 CHECKS 里
 ```
 
 ## 5. Nginx 反向代理
@@ -173,7 +173,7 @@ curl -s -u pap-admin:<密码> -H 'X-Authenticated-Subject: attacker' \
 curl -s -o /dev/null -w '%{http_code}\n' -u pap-admin:<密码> http://<公网IP>/metrics
 ```
 
-写操作链路（审批闭环）见 `docs/VERIFY.md`。
+写操作链路（审批闭环）部署后要手工跑一遍：发起一次写操作，确认审批单能开、能恢复、能驳回。
 
 ## 6.1 浏览器控制台（SSH 隧道）
 
@@ -279,7 +279,7 @@ journalctl -u pap-watchdog | grep watchdog_checks | tail -5   # 最近几轮巡�
 |---|---|
 | 发新版本 | `deploy/sync.sh --restart`；带数据库迁移用 `deploy/sync.sh --migrate`（已含重启） |
 | 改了知识资料 | `uv run python -m scripts.ingest_knowledge --tenant <id>`（无需重启） |
-| 收到巡检告警 | 按 `docs/MONITORING.md` 第 5 节定位；告警项名称即检查项名称 |
+| 收到巡检告警 | 告警项名称即 `scripts/watchdog.py` 里的检查函数名，按名定位 |
 | 新增迁移 | `uv run alembic revision --autogenerate -m "..."` 后检查生成内容，再用 `--migrate` 部署 |
 | 查审批状态 | `SELECT status, tool_name, error_code FROM approval_requests ORDER BY created_at DESC LIMIT 20;` |
 | 查审计链 | `SELECT event_type, count(*) FROM audit_logs GROUP BY 1 ORDER BY 2 DESC;` |

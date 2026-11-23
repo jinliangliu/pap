@@ -5,7 +5,7 @@ Agent 运行在平台进程内，但**不执行任何代码**。需要跑代码�
 gVisor 容器，拿回 stdout / stderr / 退出码。
 
 第一阶段采用 **Docker + gVisor（runsc）**。第二、三阶段（Kubernetes + Kata、
-Firecracker Worker Pool）只有设计存档，见 `docs/SANDBOX_ROADMAP.md`。
+Firecracker Worker Pool）不在当前实现范围内。
 
 ## 1. 为什么必须外置
 
@@ -57,6 +57,7 @@ Firecracker Worker Pool）只有设计存档，见 `docs/SANDBOX_ROADMAP.md`。
 POST /v1/execute
 Authorization: Bearer <SANDBOX_API_KEY>
 X-Sandbox-Tenant: <tenant_id>
+X-Policy-Revision: 7
 Idempotency-Key: approval:<thread_id>:<run_id>
 Content-Type: application/json
 
@@ -64,7 +65,11 @@ Content-Type: application/json
   "language": "python",
   "code": "print(sum(range(1, 101)))",
   "stdin": "",
-  "timeout_seconds": 30
+  "timeout_seconds": 30,
+  "policy": {
+    "revision": 7,
+    "settings": {"tool.backup_enabled": true, "tool.backup_threshold_mb": 100}
+  }
 }
 ```
 
@@ -73,10 +78,24 @@ Content-Type: application/json
 ```json
 {"execution_id": "e-1", "status": "succeeded", "exit_code": 0,
  "stdout": "5050\n", "stderr": "", "duration_ms": 412,
- "truncated": false, "backend": "runsc"}
+ "truncated": false, "backend": "runsc", "policy_revision": 7}
 ```
 
 `status`：`succeeded` / `failed` / `timeout` / `cancelled`。
+
+**`policy` 是自包含的一份。** 沙箱不该在执行中途回头问平台「现在是什么
+策略」——那次读取与这次提交之间，管理员可能刚按了开关，而代码已经按旧
+规则跑起来了。`settings` 的键是点分形式（与 `platform_settings.key` 一致），
+因为那是存储层唯一稳定的标识。
+
+**`policy_revision` 必须原样回显。** 平台据此判断「这次执行是不是按我发
+的那一版跑的」：对不上时结果仍然保留，但不计入这次调用的结论
+（`POLICY_SNAPSHOT_MISMATCH`）。老版本服务端不回这个字段时**不判失败**——
+缺字段说明协议还没实现，不是它用了别的版本。
+
+需要按号取回某一版的完整值时，平台侧有
+`GET /api/v1/admin/runtime-settings/snapshots/{revision}`（`revision=0` 表示
+「从未改过配置，全按 `.env` 默认」，永远查得到）。
 
 也支持 202 + 轮询（客户端按 `SANDBOX_POLL_INTERVAL_SECONDS` 轮询
 `GET /v1/executions/{id}`），本实现直接返回终态。
@@ -118,8 +137,9 @@ Content-Type: application/json
 # 1) 安装 gVisor 并注册 docker 运行时（需重建 docker daemon 配置）
 sudo GVISOR_VERSION=release-20261026.0 bash deploy/sandbox/install-runsc.sh
 
-# 2) 构建运行时镜像（只含解释器与执行入口）
-bash deploy/sandbox/build-image.sh
+# 2) 构建运行时镜像（只含解释器、执行入口与删除护栏）
+#    从旧 tag 升上来时加 PAP_BUILD_PULL=0，避免基底 python:3.12-slim 顺带换代
+PAP_BUILD_PULL=0 bash deploy/sandbox/build-image.sh pap-sandbox-runtime:4
 
 # 3) 独立用户 + 独立虚拟环境 + docker 组
 useradd --system --home /opt/pap-sandbox --shell /usr/sbin/nologin sandbox || true
@@ -133,7 +153,8 @@ chown -R sandbox:sandbox /opt/pap-sandbox
 install -m 0600 -o root -g sandbox /dev/null /etc/pap-sandbox.env
 cat >/etc/pap-sandbox.env <<'EOF'
 PAP_SANDBOX_BACKEND=runsc
-PAP_SANDBOX_IMAGE=pap-sandbox-runtime:1
+# 与 build-image.sh 打出的 tag 保持一致；换镜像就是改这一行 + 重启服务
+PAP_SANDBOX_IMAGE=pap-sandbox-runtime:4
 PAP_SANDBOX_API_KEY=<至少 32 位随机串>
 PAP_SANDBOX_MAX_CONCURRENT=4
 PAP_SANDBOX_MAX_PER_TENANT=2
@@ -151,7 +172,7 @@ PAP_INSTALL_SANDBOX=1 bash deploy/install.sh
 
 历史上正是因为靠手工拷贝，`/opt/pap-sandbox/server.py` 曾停留在旧版本
 （缺 `X-Sandbox-User` / `X-Sandbox-Conversation` 归属校验），而仓库里已经是新版。
-排查手法见 `docs/REMOTE_AUDIT.md` 第 3 节。
+排查手法见 `docs/DEPLOYMENT.md` §7「代码同步与日常运维」：比对远端与工作区的文件清单与行尾。
 
 跳过沙箱（例如只更新主服务）：`PAP_INSTALL_SANDBOX=0 bash deploy/install.sh`。
 
@@ -237,3 +258,48 @@ import socket; socket.create_connection(("1.1.1.1", 443), timeout=3)
 - **执行记录在内存**：进程重启后旧 `execution_id` 回读 404，审批会停在 `EXECUTED`。这是刻意的——不允许用"猜"来完成核验。部署更新时避开有在途审批的窗口。
 - **单机**：容器都在同一台宿主上，节点故障会丢掉所有在途执行；跨机扩展属于阶段二。
 - **语言支持**：镜像内只有 Python 与 Node。新增语言要同时改 `runtime.LANGUAGES`、`image/runner.py` 与镜像。
+
+## 10. 容器内的删除护栏
+
+模型写的代码里出现 `os.remove` / `shutil.rmtree` 的概率不低——它通常是
+「清理中间产物」这一句的自然写法。网关拦不到字符串里的删除，只有真跑起来
+才看得见，所以护栏放在**进程内**：实现是 `app/sandbox_guard/safe_delete.py`，
+由 `deploy/sandbox/image/sitecustomize.py` 在解释器启动时装上，随镜像进
+`site-packages`。
+
+| 平台 | 后端 | 落到哪 |
+|---|---|---|
+| Windows | `SHFileOperationW` + `FOF_ALLOWUNDO` | 资源管理器回收站 |
+| macOS | `FSMoveObjectToTrashSync` | 废纸篓 |
+| Linux | freedesktop Trash 规范 | `$XDG_DATA_HOME/Trash/{files,info}` |
+
+不自己造 `.pap-trash/` 目录：那样「怎么还原」会变成只有 PAP 知道的私事，
+用户在系统里翻不到，磁盘满了也没人清。
+
+**批量护栏**（`SAFE_DELETE_BULK_REJECTED`），两条：
+
+- 一次给出太多路径（`delete_many`）→ 直接拒绝，**在任何移动之前**；
+- 60 秒窗口内删到第 51 个 → 从这一个起拒绝。逐文件的
+  `for f in glob(...): os.remove(f)` 单看每次调用只有一个路径，只看参数
+  这道护栏永远不会响，而它恰恰就是把目录清空的那个形状。此时前 50 个
+  已经在回收站里（拒绝不回滚），它们都能还原。
+
+整目录删除另有一条上限：1000 个条目。「删一个目录」是一次可整体还原的
+操作，但一万个条目进回收站既搬不动也没人清，那时更可能是路径写错了。
+
+### 两个实测出来的约束（改这层前先读）
+
+**1. 开关是「文件在不在镜像里」，不是环境变量。**
+`/opt/pap/runner.py` 起用户代码子进程时用的是一份写死的最小环境
+（`PATH` / `HOME` / `LANG` / `PYTHONIOENCODING` / `PYTHONDONTWRITEBYTECODE`），
+镜像的 `ENV` 传不进那段代码。第一版镜像带着 `PAP_SAFE_DELETE=1` 构建出来，
+实测 `os.remove` 上并没有被换掉。所以钩子默认就装，只有显式写
+`PAP_SAFE_DELETE=0`（false/no/off）才关——那在宿主侧调试时才有意义。
+
+**2. 只覆盖 Python 侧的删除入口。**
+`rm -rf` 是另一个进程，拦不到——那是沙箱隔离边界的事，不要指望这里。
+同一句话里的 `os.remove` 会被拦，`subprocess.run(["rm", ...])` 不会。
+
+**边界**：删掉的东西在回收站里，**不释放空间**；而 `/work` 是 tmpfs，
+容器一退出就没了。所以它保住的是「同一次执行里删错了还能捞回来」，
+不是跨次执行。跨次能还原的备份属于平台侧的 `write_backups`。

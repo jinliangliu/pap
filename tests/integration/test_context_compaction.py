@@ -286,3 +286,28 @@ async def test_eviction_alone_triggers_compaction(client, capturing_planner, sum
     assert len(rows) == 1, "挤掉够多旧轮次就该压，不该等总占比到线"
     assert rows[0].turns_covered >= 1
     assert summarizer.transcripts, "不仅要落库，还要真的问过模型"
+
+
+async def test_compaction_does_not_repeat_without_new_evicted_turns(
+    client, capturing_planner, summarizer, small_window
+):
+    """压过一次、又没有新的窗口外轮次时，下一轮不许再压一遍。
+
+    线上旧实现把「水位之后的全部轮次」当待压量，窗口内的也算进来，间隔检查于是
+    永远通过：三分钟内压了五次，每次都重写全量，1200 字的上限怎么都写不完，
+    摘要只好一直停在几天前。判断待压量只能用「会被挤出窗口的那部分」。
+    """
+    thread_id = f"ctx-no-repeat-{uuid.uuid4().hex[:8]}"
+
+    for index in range(8):
+        await _say(client, thread_id, f"第{index}轮：继续跟进 3 号工单" + "细节" * 60)
+
+    conversation_id = await _conversation_id(client, thread_id)
+    await _set_measured(conversation_id, 20_000)
+    await _say(client, thread_id, "接着上次的说")
+    assert len(await _summaries(conversation_id)) == 1, "第一次该压"
+
+    # 只加一句短话：窗口几乎没动，窗口外没有新的轮次可压。
+    await _say(client, thread_id, "嗯")
+
+    assert len(await _summaries(conversation_id)) == 1, "没有新的窗口外轮次，不许重压"

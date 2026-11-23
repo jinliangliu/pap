@@ -202,6 +202,84 @@ async def test_write_tool_requires_approval_even_if_flag_missing():
     assert gateway.requires_approval(tool) is True
 
 
+async def test_plan_carries_the_operation_summary():
+    """确认卡正文来自这里：参数是一整份结构时，摘要就是审批人唯一看得懂的那段。"""
+
+    async def summarize(ctx, arguments):  # noqa: ANN001
+        return f"将写入 {arguments['value']}"
+
+    gateway = build_gateway(write_tool(summarize=summarize))
+
+    plan = await gateway.prepare_call(
+        context=context(scopes=("tools:write",)),
+        tool_name="write",
+        arguments={"value": "abc"},
+        reason="",
+    )
+
+    assert plan.summary == "将写入 abc"
+
+
+async def test_plan_carries_the_shape_when_the_tool_gives_one():
+    """摘要可以带一张结构图：图只由工具给结构，不让模型现场编 SVG。
+
+    卡片上那张图（`preview.graph`）就是从 `plan.graph` 落下去的。老钩子只返回
+    字符串，所以这里同时盯住「字符串仍然能用」——不然加图就得改每个工具。
+    """
+
+    async def summarize(ctx, arguments):  # noqa: ANN001
+        from app.tools.types import ToolBrief
+
+        return ToolBrief(
+            text="新建流程「巡检」",
+            graph={"entry": "a", "nodes": [{"id": "a"}], "edges": []},
+        )
+
+    gateway = build_gateway(write_tool(summarize=summarize))
+
+    plan = await gateway.prepare_call(
+        context=context(scopes=("tools:write",)),
+        tool_name="write",
+        arguments={"value": "abc"},
+        reason="",
+    )
+
+    assert plan.summary == "新建流程「巡检」"
+    assert plan.graph["entry"] == "a"
+
+
+async def test_a_broken_summary_does_not_block_the_approval():
+    """摘要失败只让卡片少一段正文，不能把「本来能确认的操作」变成报错。"""
+
+    async def summarize(ctx, arguments):  # noqa: ANN001
+        raise RuntimeError("boom")
+
+    gateway = build_gateway(write_tool(summarize=summarize))
+
+    plan = await gateway.prepare_call(
+        context=context(scopes=("tools:write",)),
+        tool_name="write",
+        arguments={"value": "abc"},
+        reason="",
+    )
+
+    assert plan.summary == ""
+    assert plan.requires_approval is True
+
+
+async def test_tool_without_summarizer_has_an_empty_summary():
+    gateway = build_gateway(write_tool())
+
+    plan = await gateway.prepare_call(
+        context=context(scopes=("tools:write",)),
+        tool_name="write",
+        arguments={"value": "abc"},
+        reason="",
+    )
+
+    assert plan.summary == ""
+
+
 async def test_timeout_returns_structured_failure():
     async def slow_handler(ctx, arguments):  # noqa: ANN001
         await asyncio.sleep(0.05)

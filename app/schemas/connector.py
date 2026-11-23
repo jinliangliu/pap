@@ -91,6 +91,10 @@ class ConnectorCredentialResponse(APIModel):
     connector: str
     credential_set: bool
     message: str
+    # 保存凭据会顺带复查一次连通性（见 routes/connectors.set_credential）。
+    # 把结论单独给出来，前端才能把「存进去了但对端不通」显示成告警，
+    # 而不是一句看起来一样的「保存成功」。
+    health_status: str = "unknown"
 
 
 class ConnectorHealthResponse(APIModel):

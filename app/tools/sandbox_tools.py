@@ -26,6 +26,7 @@ from app.integrations.sandbox_client import (
     get_sandbox_client,
 )
 from app.models.approval import RiskLevel
+from app.services import runtime_settings
 from app.tools.types import (
     ToolDefinition,
     ToolExecutionContext,
@@ -83,6 +84,12 @@ async def execute_code(
     if isinstance(requested, int) and not isinstance(requested, bool):
         budget = max(1, min(requested, settings.sandbox_timeout_seconds))
 
+    # 钉住的版本优先；没钉就取当前。**两者都必须带上**：沙箱那段代码的
+    # 行为（能不能写、写多大、要不要留档）取决于这些值，而它不该在执行中途
+    # 回头问平台一次——那次读取与这次提交之间，管理员可能刚按了开关。
+    policy_revision = context.policy_revision or runtime_settings.current_revision()
+    policy = await runtime_settings.snapshot_at(policy_revision) or {}
+
     try:
         result = await _resolve_client().execute(
             code=code,
@@ -93,6 +100,8 @@ async def execute_code(
             tenant_id=context.tenant_id,
             user_id=context.user_id,
             conversation_id=context.conversation_id or None,
+            policy_revision=policy_revision,
+            policy=policy,
         )
     except SandboxRejected as exc:
         return ToolExecutionResult(
@@ -126,6 +135,29 @@ async def execute_code(
         )
 
     payload = _to_payload(language, result)
+    payload["policy_revision"] = policy_revision
+
+    # 回显校验：沙箱回报的版本与推过去的不是同一个，说明它按另一套配置跑的。
+    #
+    # 这里**不**把代码执行算成成功：结果可能对，但「按哪套规则跑出来的」
+    # 答不上来，而一次说不清依据的执行不该被当成这次调用的结论。原始输出
+    # 仍然完整保留，人能看到它到底干了什么。
+    #
+    # 老版本沙箱不回这个字段（None），不判失败——协议是新增的，缺字段说明
+    # 对方还没实现，不是它用了别的版本。
+    if result.policy_revision is not None and result.policy_revision != policy_revision:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            external_operation_id=result.execution_id,
+            result=payload,
+            message=(
+                f"沙箱按策略第 {result.policy_revision} 版执行，而本次提交的是第 "
+                f"{policy_revision} 版。执行结果不能按本次策略解释，已保留原始输出。"
+            ),
+            error_code="POLICY_SNAPSHOT_MISMATCH",
+            retryable=False,
+        )
 
     if result.succeeded:
         return ToolExecutionResult(

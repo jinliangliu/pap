@@ -105,10 +105,44 @@ def test_transcript_keeps_user_and_assistant_labeled():
     assert "助手：已关闭工单 A" in text
 
 
-def test_clean_summary_truncates_with_marker():
-    body = ctx.clean_summary("行\n\n\n" + "字" * (ctx.SUMMARY_MAX_CHARS + 50))
+def test_clean_summary_drops_oldest_conclusions_not_whole_sections():
+    """超限时丢【已定结论】里最旧的条目，其余四节一条不能少。
 
-    assert "\n\n\n" not in body
+    线上旧实现是整体 `body[:1200]`：最后一句切在「…要求直」，
+    【未完成】【被否决】整节被吃掉——而「用户说过别做什么」正是最不能丢的部分。
+    """
+    conclusions = "\n".join(f"- 第{index}条结论" + "细节" * 40 for index in range(40))
+    summary = (
+        "【当前目标】跟进 3 号工单\n"
+        f"【已定结论】\n{conclusions}\n"
+        "【未完成】等用户确认站点 id\n"
+        "【指代绑定】「那个」→ 3 号工单\n"
+        "【被否决】不改成已关闭"
+    )
+
+    body = ctx.clean_summary(summary)
+
+    assert "【未完成】等用户确认站点 id" in body
+    assert "【指代绑定】「那个」→ 3 号工单" in body
+    assert "【被否决】不改成已关闭" in body
+    assert "更早结论已省略" in body, "丢了多少条要写出来"
+    # 不切半句：留下来的条目必须是完整的。
+    for line in body.splitlines():
+        if line.startswith("- 第"):
+            assert line.endswith("细节")
+    assert len(body) < len(summary)
+
+
+def test_clean_summary_keeps_short_summary_verbatim():
+    body = ctx.clean_summary("【当前目标】a\n\n\n【被否决】无")
+
+    assert body == "【当前目标】a\n【被否决】无"
+
+
+def test_clean_summary_hard_cuts_a_single_oversized_line():
+    """没有小标题的旧摘要整整一行：只能硬切，但至少留标记。"""
+    body = ctx.clean_summary("字" * (ctx.SUMMARY_MAX_CHARS + 50))
+
     assert body.endswith("…")
     assert len(body) == ctx.SUMMARY_MAX_CHARS + 1
 

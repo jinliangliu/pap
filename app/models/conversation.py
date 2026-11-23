@@ -74,13 +74,24 @@ class Conversation(TenantScoped, Base):
 
     # 上一轮实测的 prompt token 数（供应商报的值，经回调收集后落库）。
     # 放业务表而不是只记在观测里：观测可以整体关掉，而「这一轮该不该压缩」
-    # 不能因为开关状态而失去依据。见 docs/CONTEXT.md §4。
+    # 不能因为开关状态而失去依据。
     last_prompt_tokens: Mapped[int] = mapped_column(
         Integer,
         default=0,
         server_default="0",
         nullable=False,
     )
+
+    # 上下文清空点。`/clear` 清的是「这一轮还看得见哪些轮次」，不是消息本身——
+    # 聊天窗口里的历史是审计记录，删掉就再也答不出「他当时问过什么」。
+    # 取历史时按 `created_at` **严格大于**它过滤；同一轮问答的两条消息
+    # 时刻不同（`add_message` 显式写带微秒的时间），所以水位取后一条即可把它们都排除。
+    context_cleared_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 清空点那条回复的消息 id。给界面插分隔条用：messages 表没有自增序号，
+    # 只能靠 id 定位到「插在这条之后」。
+    context_cleared_through_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
 
     messages: Mapped[list[Message]] = relationship(
         back_populates="conversation",

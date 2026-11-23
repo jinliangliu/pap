@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from app.knowledge.service import search_as_tool
 from app.models.approval import RiskLevel
 from app.tools.types import (
     ToolDefinition,
@@ -45,6 +44,13 @@ async def search_knowledge(
     arguments: dict[str, Any],
 ) -> ToolExecutionResult:
     """在已授权的知识库分级内检索；权限过滤在检索前完成。"""
+    # 延迟导入：`app.knowledge.service` 会经 `app.agents.prompts` 拉到
+    # `app.agents` → `graph` → `nodes` → 又回到 `app.knowledge.service`。
+    # 顶层导入时先 import `app.tools.builtins` 的一方就会撞上「partially
+    # initialized module」。应用启动时恰好是先 import agents，所以线上不显；
+    # 任何脚本/用例先碰工具包就炸——这种「取决于谁先来」的导入顺序不该留着。
+    from app.knowledge.service import search_as_tool
+
     documents, citations = await search_as_tool(
         query=str(arguments["query"]),
         scopes=context.scopes,

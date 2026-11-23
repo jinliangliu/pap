@@ -11,7 +11,7 @@ LangSmith 退役后的替代：一轮对话落一条 trace，节点/模型/工�
 敏感级别与消息表一致，隔离要求不能更低。
 
 表建好但不填数据：开关默认关闭（OBS_ENABLED=false），部署时不产生任何写入。
-上线前清数据的步骤见 docs/OBSERVABILITY.md §11.2。
+上线前清数据：先按时间范围导出再删，不要直接 truncate。
 """
 
 from typing import Sequence, Union

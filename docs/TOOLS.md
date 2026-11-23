@@ -144,9 +144,86 @@ requires_approval = tool.requires_approval or risk_level in _WRITE_RISKS
   不执行命令；遇到 `-u` / `--cookie` 直接 400；`Authorization` / `Cookie` 头会被丢弃，
   并在响应里通过 `dropped_headers` 明确告知。
 
-## 8. 已知限制
+## 8. 一次调用的三段轨迹：决策 → 备份 → 结果
+
+执行入口（`execute_read_only` / `execute_approved`）之后是固定顺序，不能换：
+
+```
+决策（写审计、进日志）
+  → 写前备份（仅对声明了 backup 钩子的写类工具）
+  → handler（带超时）
+  → 结果（写审计，带 decision 与 policy_revision）
+```
+
+### 8.1 审计记「决策」，不记「命令跑成功」
+
+| 事件 | 何时写 | 回答什么 |
+|---|---|---|
+| `tool_allowed` | 放行后、执行前 | 谁允许了、依据哪一版策略、备份规则是什么 |
+| `tool_denied` | 拒绝时（原有） | 哪一层边界挡住了 |
+| `tool_succeeded` / `tool_failed` | 执行后 | 成了没 |
+
+原先只有最后一类。进程在 handler 里被杀掉、或者备份失败提前抛异常时，
+审计里什么都不剩——而「批过了、要开始做、然后没了」恰恰最需要事后看见。
+决策行带 `success=true`（决策成立），**不表示操作成功**；操作成败在
+随后那条事件上，两者用 `decision` + `approval_id` 对齐。
+
+### 8.2 写前备份（`allow_with_backup`）
+
+工具声明 `backup` 钩子（`async (context, arguments) -> BackupSpec | None`）后，
+写操作被放行时会先把将被覆盖的状态存进 `write_backups`。
+
+- **钩子返回 `None` 表示「没有旧状态」**（新建），不是失败。混成一种，
+  新建类写操作会因为「备不了」被拦下。
+- **备份失败 = 不写**。备不下来还照写，等于把「有备份」这句话变成空话；
+  抛 `ToolBackupFailedError`，审批记为失败，人能看到「没执行，因为备份没成功」。
+- 决策标签 `allow_with_backup` 看的是**规则**（声明了钩子 + 开关开着），
+  不是这一次落成了没有。落成与否记在结果事件上。
+
+三个运行时开关（`/api/v1/admin/runtime-settings`，默认 `true / 100 / 3000`）：
+
+| 键 | 语义 |
+|---|---|
+| `tool.backup_enabled` | 总闸。关掉后钩子不再执行，写照常 |
+| `tool.backup_threshold_mb` | **单个对象**超过就不备（一次写不该先灌几百 MB 进库） |
+| `tool.backup_max_size_mb` | 该租户备份**总量**上限。到了就停，**不覆盖最旧的一份** |
+
+存满时覆盖旧备份能让上限看起来「永远够用」，代价是早期那次操作的原件在某天
+无声消失——而人正是靠它回滚的。日志里三个字段必须一起看：
+`backup_enabled=true` 单独出现会让人以为「这次一定备了」，实际可能是阈值挡的。
+
+目前接入了 `studio_workflow_save`：它的 `definition` 是整张图、覆盖即无旧版
+（修订号只加一，不留历史），是这套机制最需要的地方。
+
+审计里读这几个字段：
+
+| 字段 | 落在哪条事件 | 说明 |
+|---|---|---|
+| `backup_hook` | 决策 + 结果 | 这个工具**有没有声明**钩子。`captured` 为空时靠它区分「没钩子」与「有钩子但这次没旧状态」 |
+| `backup_enabled` / `_threshold_mb` / `_max_size_mb` | 决策 + 结果 | 当时的规则 |
+| `backup_captured` / `backup_skipped` / `backup_size_bytes` | 只在结果 | 这次落成了没有、多大 |
+| `backup_id` | 只在结果 | 原件在 `write_backups` 的哪一行。备份发生在决策之后，决策行给不出这个值 |
+
+### 8.3 策略版本（`policy_revision`）
+
+`platform_settings` 每次**生效值真的变了**就 +1 一个单调号，并落一份完整快照
+（`policy_snapshots`）。工具上下文带 `policy_revision`，两条审计都记它。
+
+- 为什么是整份快照：要能按号**原样取回**。存增量就得从头重放，而重放依赖
+  每一版都在——一次迁移、一次回滚就断了，断在哪一版事后看不出来。
+- 为什么 0 不落库：0 表示「从未改过配置，全按 `.env` 默认」，由代码合成。
+  空库环境不需要在启动时写一行才能自洽。
+- `GET /api/v1/admin/runtime-settings/snapshots/{revision}` 按号取回；
+  `found=false` 而不是 404——「这一版不存在」与「接口不存在」处置不同。
+
+沙箱侧同一份会随 `POST /v1/execute` 推过去并要求回显，见 `docs/SANDBOX.md §4`。
+
+## 9. 已知限制
 
 - 不支持 multipart / 文件上传类接口；
 - 不支持 OAuth2 客户端凭证等需要换取 token 的流程（只能用静态 Bearer）；
 - 不支持自定义响应映射：2xx 一律视为调用成功，业务成败由模型读 `data` 判断；
 - 自定义工具不支持按租户配置不同 URL：注册表是全局的，租户只决定「能不能用」。
+- **备份不可自动回滚**：`write_backups` 存的是原件，怎么用它恢复由人决定。
+  写得进外部系统的那些（连接器 / MCP）根本没有跨系统回滚，这张表只承诺
+  「原件还在」。

@@ -4,7 +4,7 @@ Revision ID: a8d3c1f62b04
 Revises: c2f7a8e41d63
 Create Date: 2026-11-12 16:10:00.000000
 
-三列，都是「多个 Agent 一起干活」时才需要的维度（见 docs/RUNTIME_VIEW.md §4）：
+三列，都是「多个 Agent 一起干活」时才需要的维度：
 
 - `obs_spans.agent_name`：这个 span 属于哪个智能体。委派时子图里的节点归
   被委派方。此前只有外层 `agent.ops` 这个 span 的 attrs 里带名字，它下面的

@@ -109,6 +109,7 @@ class DbAuditSink:
             "tool_executed": AuditEventType.TOOL_SUCCEEDED,
             "tool_denied": AuditEventType.TOOL_DENIED,
             "tool_requested": AuditEventType.TOOL_REQUESTED,
+            "tool_allowed": AuditEventType.TOOL_ALLOWED,
         }
 
         event_type = mapping.get(event, AuditEventType.TOOL_REQUESTED)
@@ -116,7 +117,13 @@ class DbAuditSink:
         # 拒绝本身就是「没成功」，但**不能**因此改写成 tool_failed：
         # 「被拒绝」和「跑了但失败」是两件事，前者是治理信号、后者是故障信号，
         # 归成一类之后审计里就再也数不出「这个 Agent 边界被撞了几次」。
-        if payload.get("success") is False and event_type is not AuditEventType.TOOL_DENIED:
+        #
+        # 决策行同理不参与改写：它记的是「允许」这个事实，`success` 在那一行上
+        # 表示「决策成立」，不表示操作成功。操作成败在随后那条 tool_executed 上。
+        if (
+            payload.get("success") is False
+            and event_type not in (AuditEventType.TOOL_DENIED, AuditEventType.TOOL_ALLOWED)
+        ):
             event_type = AuditEventType.TOOL_FAILED
 
         metadata = {
@@ -134,6 +141,19 @@ class DbAuditSink:
                 "denial_reason",
                 "agent_name",
                 "agent_revision",
+                # 决策路径专用：放行的原因、依据哪一版策略、备份的结论。
+                # 备份三个尺寸字段必须一起留：只看 captured=false 时，
+                # 分不清是「没声明钩子」「超阈值」还是「开关关了」。
+                "decision",
+                "policy_revision",
+                "backup_id",
+                "backup_enabled",
+                "backup_threshold_mb",
+                "backup_max_size_mb",
+                "backup_captured",
+                "backup_skipped",
+                "backup_size_bytes",
+                "backup_hook",
             )
         }
 
@@ -142,6 +162,15 @@ class DbAuditSink:
         # 查询会话在对话台里看不到，这里就是它唯一的痕迹，至少得能读出一句。
         # 参数值仍然不记：argument_keys 只有键名。
         message = payload.get("message")
+        if message is None and event_type is AuditEventType.TOOL_ALLOWED:
+            # 「允许」这条最容易被读成「做成了」，措辞上必须区分开：
+            # 写「已允许」而不是「已执行」，后面那条才是结果。
+            decision = payload.get("decision") or "allow"
+            suffix = "（已留备份）" if payload.get("backup_captured") else ""
+            message = (
+                f"{payload.get('agent_name') or '用户'} 获准调用"
+                f" {payload.get('tool_name') or '工具'}：{decision}{suffix}"
+            )
         if message is None and payload.get("agent_name"):
             verb = "尝试调用" if event_type is AuditEventType.TOOL_DENIED else "调用"
             message = f"{payload['agent_name']} {verb} {payload.get('tool_name') or '工具'}"

@@ -78,7 +78,7 @@ EXTRACT_SYSTEM_PROMPT = """你负责从一轮对话里挑出「值得长期记�
 判定标准：这条信息下一轮还用得上吗？换个会话还成立吗？两个都「是」才记。
 
 只输出 JSON，不要代码块，不要解释：
-{"memories":[{"type":"profile","title":"称呼","content":"希望被称呼为 dylan，不要用「您」。","confidence":0.95}]}
+{"memories":[{"type":"profile","title":"称呼","content":"希望被称呼为 alex，不要用「您」。","confidence":0.95}]}
 
 字段要求：
 - title：3-12 个字的名词短语（称呼 / 回答风格 / 观测方案），同一件事每次都用同一个标题；

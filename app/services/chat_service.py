@@ -13,11 +13,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime
 from typing import Any
 
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.agents.graph import get_agent_graph
 from app.agents.interrupts import extract_interrupt
@@ -85,11 +86,56 @@ def _channel_of(boundary: AgentBoundary | None) -> str:
 # 全列出来只会挤占上下文，而真正要处理的那份几乎总是最近的。
 _MAX_MATERIALS_IN_PROMPT = 20
 
+# 平台自己执行的斜杠指令（另一个是 `/workflow`，见 `workflow_service`）。
+#
+# **必须由平台执行，不能交给模型。** 模型会很配合地回一句「收到——上下文已清空」，
+# 然后下一轮照样记得全部历史：它没有「清空」这个动作可做，只是在说一件
+# 听起来对的话。承诺了没做的事比报错更难排查——用户要等到下一轮它又提起
+# 上周那件事，才发现那句「已清空」是假的。
+CLEAR_COMMAND = "/clear"
+
+
+def is_clear_command(text: str) -> bool:
+    """`/clear` 是否独占这一整条消息。
+
+    只认独占：`/clear 顺便看下 xxx` 不是清空，是一句话里带着这个词。
+    判定放宽到「斜杠 + 干净的命令词」，因为用户不会记大小写和尾随空格；
+    但**不**做前缀匹配——`/clearall`、`/cleared` 都不该清空一个会话。
+    """
+    value = (text or "").strip()
+    if not value.startswith("/"):
+        return False
+    return value[1:].strip().lower() == CLEAR_COMMAND[1:]
+
+
+def _clear_reply(cleared_turns: int) -> str:
+    """`/clear` 的回复。
+
+    由平台生成，不经模型：这段文字要描述**平台做过什么**，而模型并不知道
+    水位写没写、摘要作不作废。它照着写一句「已清空」，就成了一句无法核实的承诺。
+
+    三句话分别对应三件容易被误解的事：历史还在（但不再参与）、摘要也作废了
+    （不只是消息）、附件仍在（只是不再自动带上）。
+    """
+    if cleared_turns <= 0:
+        return (
+            "上下文已清空。\n\n"
+            "这个会话此前没有可清的内容——这一轮不会带上任何历史。"
+        )
+
+    return (
+        "上下文已清空。\n\n"
+        f"此前的 {cleared_turns} 轮对话不会再进入上下文，也不会经由以前的摘要回来。\n"
+        "上面的聊天记录仍然保留，只是作为可查阅的历史，不再参与推理。\n"
+        "此前上传的附件仍可点开，但不会再自动带上——需要的话重新提一句。"
+    )
+
 
 async def _conversation_materials(
     session: Any,
     *,
     conversation_id: uuid.UUID,
+    cleared_at: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """本会话里上传过的附件，最新的在前。
 
@@ -99,15 +145,21 @@ async def _conversation_materials(
 
     只读消息元数据，不碰文件：某条记录对应的文件真的没了，模型读到的是
     「附件不存在」，不会因此读到别人的材料——解析仍然要过租户 + 会话目录。
+
+    `cleared_at` 之后才带：`/clear` 的语义是「别再提之前的事」，清单也算
+    「之前的事」——留着清单，模型下一轮就会开口问「你上次那份规程」。
+    文件本身仍在会话里，用户点得开，只是不再自动进上下文。
     """
+    stmt = select(Message.metadata_json).where(
+        Message.conversation_id == conversation_id,
+        Message.role == MessageRole.USER,
+    )
+
+    if cleared_at is not None:
+        stmt = stmt.where(Message.created_at > cleared_at)
+
     rows = await session.scalars(
-        select(Message.metadata_json)
-        .where(
-            Message.conversation_id == conversation_id,
-            Message.role == MessageRole.USER,
-        )
-        .order_by(Message.created_at.desc())
-        .limit(50)
+        stmt.order_by(Message.created_at.desc()).limit(50)
     )
 
     materials: list[dict[str, Any]] = []
@@ -339,6 +391,17 @@ class ChatService:
     ) -> ChatResponse:
         boundary = boundary or agent_service.BASELINE
 
+        # `/clear` 先于附件校验与配额：它既不消耗一次对话额度，也不该把附件
+        # 当成一次输入（`/clear` 之后那些附件本来就不再进上下文）。
+        # 放在这里而不是给模型一支「清空工具」，是因为这件事没有需要判断的地方——
+        # 让模型参与只会多一种「它以为清了、其实没清」的失败方式。
+        if is_clear_command(message):
+            return await self._clear_context(
+                identity=identity,
+                client_thread=client_thread,
+                boundary=boundary,
+            )
+
         # 附件先校验、后扣配额：格式不对的请求不该消耗租户额度，
         # 也不该留下会话记录（否则用户会看到一条只有问题没有回答的空会话）。
         try:
@@ -418,6 +481,106 @@ class ChatService:
 
         return response
 
+    async def _clear_context(
+        self,
+        *,
+        identity: Identity,
+        client_thread: str,
+        boundary: AgentBoundary | None = None,
+    ) -> ChatResponse:
+        """执行 `/clear`：写一条水位，历史留在原地。
+
+        不这么做的两种后果都真实存在过：
+
+        - 只回一句「已清空」而不写水位 → 下一轮照旧带上全部历史
+          （线上就是如此：模型很配合，平台什么都没做）；
+        - 真把消息删掉 → 界面干净了，但「他当时问过什么」再也查不到，
+          审批单、审计、附件句柄指向的消息全成孤儿。
+
+        所以清的是「这一轮还看得见哪些轮次」，不是数据本身。
+        """
+        internal_thread = internal_thread_id(
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
+            client_id=client_thread,
+        )
+
+        with tenant_scope(identity.tenant_id):
+            async with async_session_factory() as session:
+                async with session.begin():
+                    conversation = await ensure_conversation(
+                        session,
+                        tenant_id=identity.tenant_id,
+                        user_id=identity.user_id,
+                        thread_id=internal_thread,
+                        # 标题只在创建时写一次。`/clear` 作为标题读起来像一句命令，
+                        # 而会话列表里需要的是「这条会话是什么」。
+                        title="上下文清空",
+                        channel=_channel_of(boundary),
+                    )
+
+                    # 先数「此前有多少轮」，再写这一条：本轮这两条不属于「此前」。
+                    # 口径与人眼一致（数用户气泡），不复用 `turns_covered`——
+                    # 那是「被挤出窗口的轮次」，与用户看到的行数不是一回事。
+                    previous_from = conversation.context_cleared_at
+                    counter = (
+                        select(func.count())
+                        .select_from(Message)
+                        .where(
+                            Message.conversation_id == conversation.id,
+                            Message.role == MessageRole.USER,
+                        )
+                    )
+                    if previous_from is not None:
+                        # 二次清空只数上一次清空之后的：否则文案里的数字越清越大，
+                        # 而用户眼里那段早就看不见了。
+                        counter = counter.where(Message.created_at > previous_from)
+
+                    cleared_turns = int(await session.scalar(counter) or 0)
+
+                    await add_message(
+                        session,
+                        tenant_id=identity.tenant_id,
+                        conversation_id=conversation.id,
+                        role=MessageRole.USER,
+                        content=CLEAR_COMMAND,
+                    )
+                    reply = await add_message(
+                        session,
+                        tenant_id=identity.tenant_id,
+                        conversation_id=conversation.id,
+                        role=MessageRole.ASSISTANT,
+                        content=_clear_reply(cleared_turns),
+                        # 刷新后要能认出「这一条是清空点」，前端据此插分隔条。
+                        metadata={"context_cleared": True},
+                    )
+
+                    # 水位取这条回复的时刻，而不是 `now()`：`add_message` 显式写带微秒
+                    # 的时间，两者不同，取它才能把 `/clear` 本身也严格排除在外。
+                    # 取服务器当前时间则会因为同事务内 now() 相同而漏掉这两条。
+                    conversation.context_cleared_at = reply.created_at
+                    conversation.context_cleared_through_id = reply.id
+                    conversation.last_active_at = reply.created_at
+
+                    reply_id = reply.id
+                    reply_at = reply.created_at
+
+        return ChatResponse(
+            thread_id=client_thread,
+            # 没有 run：这不是一次「运行」。建一条 run 会让观测页多出一条
+            # 没有模型调用的轮次，把「今天跑了多少轮」这个数污染掉。
+            run_id="",
+            status="completed",
+            answer=_clear_reply(cleared_turns),
+            metadata={
+                "context_cleared": True,
+                "cleared_turns": cleared_turns,
+                "cleared_through_message_id": str(reply_id),
+                "cleared_at": reply_at.isoformat(),
+            },
+            assistant_message_at=reply_at,
+        )
+
     async def _run_turn(
         self,
         *,
@@ -450,8 +613,13 @@ class ChatService:
                     # 本条之前上传过的材料：附件是会话资产，跨轮可读，
                     # 所以每轮都要把清单重新带上（模型只看得到句柄，看不到磁盘）。
                     # 必须在写入本条消息之前查，否则本条会被算进「此前」。
+                    # `/clear` 之后从水位算起：清空点是「别再提之前的事」，
+                    # 材料清单也算「之前的事」，否则模型下一轮就会问「你上次那份规程」。
+                    cleared_at = conversation.context_cleared_at
                     earlier = await _conversation_materials(
-                        session, conversation_id=conversation.id
+                        session,
+                        conversation_id=conversation.id,
+                        cleared_at=cleared_at,
                     )
 
                     # 落盘与会话绑定：句柄目录按 (租户, 会话) 隔离，
@@ -503,6 +671,9 @@ class ChatService:
             user_message=message,
             measured_tokens=last_prompt_tokens,
             exclude_message_id=user_message_id,
+            # 水位在落库那个事务里已经读出来了，这里直接用：再查一次会拿到
+            # 一个新快照，与刚刚写下去的那条对不上。
+            cleared_at=cleared_at,
         )
 
         # 附件已落盘成句柄：state 里只留 attachment_id，不把 base64 写进 checkpoint。
@@ -718,6 +889,10 @@ class ChatService:
         knowledge_fallback = (result.get("response_metadata") or {}).get(
             "knowledge_answer_fallback"
         )
+        # 结果气泡里的结构图（编排流程这类「结果本身有形状」的工具给的）。
+        # 与确认卡上那张同源，但走的是两条路：卡从审批单重新取，气泡从这条消息取
+        # ——不落库的话，刷新一次图就没了，只剩「步骤：a → b」那行字。
+        result_graph = (result.get("response_metadata") or {}).get("graph")
 
         async with span("persist.assistant_message", "db", attrs={"table": "messages"}):
             async with async_session_factory() as session:
@@ -742,6 +917,7 @@ class ChatService:
                                 if knowledge_fallback
                                 else {}
                             ),
+                            **({"graph": result_graph} if result_graph else {}),
                         },
                     )
 
@@ -1337,6 +1513,11 @@ class ChatService:
             # 结论同样要落库。不写的话，确认完再刷新会话，历史停在「请确认」那一句，
             # 人会以为没执行成功，再点一次——虽然幂等键挡住了重复执行，
             # 但「历史里看不出发生过什么」本身就不该出现。
+            # 结论这条消息也要带结构图：确认完之后人看的是这一段（卡片已经
+            # 变成「已处理」），而图正是他核对自己批了什么的东西。不带的话，
+            # 刷新之后结论还在、图没了，同一轮对话长成两个样子。
+            result_graph = (result.get("response_metadata") or {}).get("graph")
+
             await self._append_assistant(
                 identity=identity,
                 internal_thread=persist_thread_id or thread_id,
@@ -1346,6 +1527,7 @@ class ChatService:
                     "approval_id": approval_id,
                     "approval_action": action,
                     **({"delegated_to": result.get("agent_name")} if delegated else {}),
+                    **({"graph": result_graph} if result_graph else {}),
                 },
             )
 

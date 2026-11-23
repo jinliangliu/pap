@@ -95,7 +95,7 @@ async def test_create_and_list(mem_fixture):
             json={
                 "memory_type": "profile",
                 "title": "称呼",
-                "content": "希望被称呼为 dylan",
+                "content": "希望被称呼为 alex",
             },
         )
         assert created.status_code == 201

@@ -29,6 +29,7 @@ from app.db.session import async_session_factory
 from app.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from app.orchestration import engine
 from app.orchestration.definition import (
+    KIND_AGENT,
     DefinitionError,
     WorkflowPlan,
     compile_definition,
@@ -157,6 +158,14 @@ async def save_workflow(
 
     改名不允许：名字出现在 `/workflow <name>` 与审计里，改了会让历史记录指向一个
     再也找不到的入口。要改就新建一张。
+
+    「能跑」包含一件 `compile_definition` 查不到的事：图里指定的智能体得真的存在
+    且处于启用状态。编译是纯函数（不碰库），所以这一步在本层做——控制台与构建
+    助手走同一个 `save_workflow`，两边口径因此不会分叉。
+
+    **只在这张图真的变了时才做那两件事**（校验智能体、+1 修订号）：只改显示名、
+    说明或启停时 `definition` 是原样传回的，此时既不该让在飞的 run 看起来「跑的
+    是另一版」，也不该因为某个早已删掉的智能体而连名字都改不了。
     """
     if not _NAME_RE.match(name or ""):
         raise WorkflowError(
@@ -176,6 +185,10 @@ async def save_workflow(
             async with session.begin():
                 row = await session.scalar(select(Workflow).where(Workflow.name == name))
 
+                graph_changed = row is None or compiled != (row.definition or {})
+                if graph_changed:
+                    await _ensure_agents_available(session, plan)
+
                 if row is None:
                     row = Workflow(
                         tenant_id=tenant_id,
@@ -194,8 +207,10 @@ async def save_workflow(
                     row.definition = compiled
                     row.enabled = enabled
                     # 修订号只在**定义**变化时 +1：改个显示名不该让在飞的 run
-                    # 看起来像「跑的是另一版」。
-                    row.revision = int(row.revision or 0) + 1
+                    # 看起来像「跑的是另一版」。运行记录与 span 上记的就是这个号，
+                    # 它回答的是「那次到底跑了哪张图」，不是「这行什么时候被改过」。
+                    if graph_changed:
+                        row.revision = int(row.revision or 0) + 1
 
                 await session.flush()
                 # `updated_at` 是库端的 `onupdate`，flush 之后本地那份已经被置为
@@ -531,6 +546,84 @@ async def get_run(tenant_id: str, run_id: str) -> WorkflowRun | None:
 
 
 # ---------------------------------------------------------------- 内部
+
+
+_STATUS_TEXT = {"draft": "草稿", "disabled": "停用", "active": "启用"}
+
+# 拒绝时列几个可用标识。列全一屏没有意义，列三个又能让人看出「我该填什么」——
+# 取 8 是本层自己定的上限，与界面无关。
+_AGENT_HINTS = 8
+
+
+def _plan_agents(plan: WorkflowPlan) -> list[tuple[str, str]]:
+    """图里用到的智能体，`(第一次出现的节点 id, 标识)`。
+
+    同一个智能体出现在多个节点上只校验一次，但**保留第一次出现的位置**：
+    拒绝理由要说「第几步」，说「图里有错」等于没说。
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+
+    for nid in plan.order:
+        node = plan.nodes[nid]
+        names = [node.agent] if node.kind == KIND_AGENT and node.agent else []
+        names.extend(branch.agent for branch in node.branches if branch.agent)
+
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append((nid, name))
+
+    return out
+
+
+async def _ensure_agents_available(session, plan: WorkflowPlan) -> None:
+    """图里的智能体必须存在且处于启用状态。
+
+    这条校验不属于 `compile_definition`：那是纯函数，读不到库。可是「保存即编译，
+    存进库的一定是能跑的图」这句话如果漏掉它，就只对了一半——图里写一个不存在的
+    智能体照样存得进去，一直到有人在对话里 `/workflow` 触发它才失败，而那时看到的
+    是一句「当前租户下没有名为「x」的智能体」，配图的人早就不在屏幕前了。
+
+    用自然语言建流程时这不是边角情况：模型不知道租户里有哪些智能体，凭语义编一个
+    `inspector` 是最自然的动作。所以拒绝理由必须把**可用的标识**一起给出来，
+    下一轮它才能改对，而不是反复试名字。
+    """
+    wanted = _plan_agents(plan)
+    if not wanted:
+        return
+
+    rows = await agent_service.list_agents(session)
+    available = {str(row.name): row for row in rows}
+
+    for nid, name in wanted:
+        row = available.get(name)
+        if row is None:
+            names = [str(item.name) for item in rows[:_AGENT_HINTS]]
+            hint = (
+                f"当前租户的智能体：{'、'.join(names)}"
+                + ("…" if len(rows) > _AGENT_HINTS else "")
+                + "。"
+                if names
+                else "当前租户还没有任何智能体。"
+            )
+            raise WorkflowError(
+                "WORKFLOW_UNKNOWN_AGENT",
+                f"第「{nid}」步指定的智能体「{name}」不存在。{hint}"
+                "要用别的智能体，先把它建出来并启用，再回来保存这张图。",
+                node=nid,
+            )
+
+        status = str(getattr(row.status, "value", row.status))
+        if status != "active":
+            raise WorkflowError(
+                "WORKFLOW_INACTIVE_AGENT",
+                f"第「{nid}」步指定的智能体「{name}」当前是"
+                f"{_STATUS_TEXT.get(status, status)}状态，流程跑到那一步会被拒。"
+                "先启用它，或换一个启用中的智能体。",
+                node=nid,
+            )
 
 
 def _invoker(*, run_id: str, workflow_name: str, revision: int):

@@ -28,7 +28,7 @@ from typing import Any, NoReturn, Protocol
 
 from app.models.approval import RiskLevel
 from app.observability.context import span
-from app.services import runtime_settings
+from app.services import runtime_settings, write_backup_service
 from app.services.rate_limit_service import RateLimitExceeded
 from app.services.tenant_service import TenantService, get_tenant_service
 from app.tools.registry import ToolNotFoundError, ToolRegistry
@@ -39,6 +39,7 @@ from app.tools.schemas import (
 )
 from app.tools.types import (
     ConnectorRuntime,
+    ToolBrief,
     ToolCallPlan,
     ToolDefinition,
     ToolExecutionContext,
@@ -54,6 +55,16 @@ DENIAL_ROLE = "role"
 DENIAL_TENANT = "tenant"
 DENIAL_AGENT = "agent"
 DENIAL_REASONS = frozenset({DENIAL_SCOPE, DENIAL_ROLE, DENIAL_TENANT, DENIAL_AGENT})
+
+# 一次调用被**放行**的原因。与审计的 `tool_allowed` 事件一一对应。
+#
+# 为什么不把 `allow_with_backup` 做成第四种租户策略动作：写入类无论如何都要
+# 过审批（`approval_required` 的兜底），再开一个「免审批但要留档」的动作，
+# 等于在「写必须有第二个人看过」这条线上开一个口子。这里的语义更窄也更实：
+# 审批照旧，但执行前先把原件备下来——决策因此是「批准 + 已留档」。
+DECISION_ALLOW = "allow"
+DECISION_APPROVED = "approved"
+DECISION_ALLOW_WITH_BACKUP = "allow_with_backup"
 
 
 class ToolGatewayError(RuntimeError):
@@ -123,6 +134,15 @@ class ToolCredentialMissingError(ToolGatewayError):
     code = "CONNECTOR_CREDENTIAL_MISSING"
 
 
+class ToolBackupFailedError(ToolGatewayError):
+    """写前备份没能落库，本次写入**没有执行**。
+
+    单独一类而不是并进通用异常：它的处置动作是「去看备份存储为什么写不进去」
+    （库满、权限、JSON 不可序列化），而通用异常只会让人以为是工具坏了。
+    """
+    code = "BACKUP_FAILED"
+
+
 class ToolAuditSink(Protocol):
     async def record(self, event: str, payload: dict[str, Any]) -> None: ...
 
@@ -157,6 +177,10 @@ _WRITE_RISKS = frozenset(
         RiskLevel.EXTERNAL,
     }
 )
+
+# 摘要只准读参数，正常情况下是纯计算。给 5 秒是防「实现里顺手查了库、
+# 而库刚好慢」把确认卡拖到超时——那时用户看到的是一张没有正文的卡。
+_SUMMARY_TIMEOUT_SECONDS = 5.0
 
 
 def is_write_risk(risk: RiskLevel) -> bool:
@@ -362,6 +386,8 @@ class ToolGateway:
         # 预览阶段用缓存做一次快速拦截；执行阶段还会强制重新加载。
         await self._check_tenant_policy_cached(tool=tool, context=context)
 
+        brief = await self._summarize(tool=tool, context=context, arguments=arguments)
+
         return ToolCallPlan(
             tool_name=tool.name,
             display_name=tool.display_name,
@@ -370,7 +396,47 @@ class ToolGateway:
             reason=(reason or "").strip() or tool.description,
             requires_approval=self.requires_approval_for(tool=tool, context=context),
             verification_hint=tool.verification_hint,
+            summary=brief.text,
+            graph=brief.graph,
         )
+
+    async def _summarize(
+        self,
+        *,
+        tool: ToolDefinition,
+        context: ToolExecutionContext,
+        arguments: dict[str, Any],
+    ) -> ToolBrief:
+        """给确认卡算正文与结构图。
+
+        失败一律吞掉并返回空：摘要是「让人看懂」的辅助，不是校验。
+        让它的异常挡住审批，等于把一张本来能确认的卡片变成报错——而这恰是
+        `preflight` 那条注释反过来讲的事（注定失败的别弹卡，能弹的别弹不出来）。
+        """
+        if tool.summarize is None:
+            return ToolBrief()
+
+        try:
+            brief = await asyncio.wait_for(
+                tool.summarize(context, arguments),
+                timeout=_SUMMARY_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "生成操作摘要失败，确认卡只显示参数。",
+                extra={"event": "tool_summary_failed", "tool_name": tool.name},
+                exc_info=True,
+            )
+            return ToolBrief()
+
+        # 老钩子返回字符串：包一层就够，不必让每个工具改返回值。
+        if isinstance(brief, ToolBrief):
+            return ToolBrief(
+                text=str(brief.text or "").strip(),
+                graph=brief.graph if isinstance(brief.graph, dict) else None,
+            )
+
+        return ToolBrief(text=str(brief or "").strip())
 
     async def check_resource_access(
         self,
@@ -456,6 +522,7 @@ class ToolGateway:
             tool=tool,
             context=context,
             arguments=arguments,
+            decision=DECISION_ALLOW,
         )
 
     async def execute_approved(
@@ -488,6 +555,7 @@ class ToolGateway:
             tool=tool,
             context=context,
             arguments=arguments,
+            decision=DECISION_APPROVED,
         )
 
     async def verify(
@@ -971,14 +1039,30 @@ class ToolGateway:
         tool: ToolDefinition,
         context: ToolExecutionContext,
         arguments: dict[str, Any],
+        decision: str,
     ) -> ToolExecutionResult:
         """给工具调用套一个 span，然后走正常的 `_invoke_handler`。
 
         两个执行入口（只读 / 已审批）共用这里，避免「审批后的写操作在观测里
         凭空消失」——而写操作恰恰是最需要事后复盘的。
 
+        顺序是**决策 → 审计 → 备份 → 执行**，不能换：
+
+        - 决策先落地，因为它是这次调用能不能发生的依据。备份失败时（备份
+          本身是一次写库），审计里仍然留着「它被批准过」——否则事后只能
+          看到一句「备份失败」，看不出这次调用本来是被允许的。
+        - 备份在执行之前，因为它的全部意义就在这个「之前」。
+
+        `allow_with_backup` 在决策阶段就定下来，看的是**规则**（工具声明了
+        钩子 + 开关开着），不是这一次的落库结果。落成了没有，属于结果的
+        一部分，记在随后的 `tool_executed` 上。两者混在一起会让「决策」
+        变成「结果」的别名，而这正是这次要拆开的东西。
+
         观测关闭或无 trace 上下文时 `span()` 是空转对象，这段代码等于没写。
         """
+        # 钉了版本就用钉的，没钉就取当前值——两条路径记下来的都是**实际依据**。
+        policy_revision = context.policy_revision or runtime_settings.current_revision()
+
         async with span("tool.call", "tool", attrs={"tool": tool.name}) as handle:
             handle.add(
                 risk_level=tool.risk_level.value,
@@ -988,19 +1072,43 @@ class ToolGateway:
                 station_id=arguments.get(tool.station_id_argument)
                 if tool.station_id_argument
                 else None,
+                policy_revision=policy_revision,
             )
             handle.content(input=arguments)
+
+            decision = self._decision_label(tool=tool, base=decision)
+
+            await self._record_decision(
+                tool=tool,
+                context=context,
+                decision=decision,
+                policy_revision=policy_revision,
+                arguments=arguments,
+            )
+
+            backup = await self._backup_before_write(
+                tool=tool,
+                context=context,
+                arguments=arguments,
+                decision=decision,
+                policy_revision=policy_revision,
+            )
 
             result = await self._invoke_handler(
                 tool=tool,
                 context=context,
                 arguments=arguments,
+                decision=decision,
+                policy_revision=policy_revision,
+                backup=backup,
             )
 
             handle.add(
                 ok=result.success,
                 verified=result.verified,
                 error_code=result.error_code,
+                decision=decision,
+                backup_captured=backup.captured if backup is not None else None,
                 result_chars=len(json.dumps(result.result, ensure_ascii=False, default=str))
                 if result.result
                 else 0,
@@ -1010,12 +1118,180 @@ class ToolGateway:
                 handle.fail(result.error_code or "tool_failed")
             return result
 
+    @staticmethod
+    def _decision_label(*, tool: ToolDefinition, base: str) -> str:
+        """把入口给的基础结论，叠上「要不要留档」变成最终的决策标签。
+
+        只对已批准的写操作生效：只读直通本来就是 `allow`，给它贴上
+        `allow_with_backup` 会让人以为只读调用也在备份。
+        """
+        if base != DECISION_APPROVED:
+            return base
+
+        if tool.backup is None or not runtime_settings.backup_enabled():
+            return base
+
+        return DECISION_ALLOW_WITH_BACKUP
+
+    async def _backup_before_write(
+        self,
+        *,
+        tool: ToolDefinition,
+        context: ToolExecutionContext,
+        arguments: dict[str, Any],
+        decision: str,
+        policy_revision: int,
+    ) -> write_backup_service.BackupOutcome | None:
+        """写前备份。只有声明了 `backup` 钩子的写类工具会走这里。
+
+        三种「不备」必须分开，否则事后读日志的人会得出错误结论：
+
+        - 开关关：直接不进来（`backup_enabled` 在日志里已经是 false）。
+        - 钩子返回 None：这次没有旧状态可备（新建）。正常，不是失败。
+        - 超阈值 / 存满：`BackupOutcome.skipped` 如实带回原因。
+
+        钩子抛异常或落库失败时**拦住本次写入**：备不下来还照写，等于把
+        「有备份」这个承诺变成一句空话。异常抛出去，审批服务会把这条审批
+        记为失败，人能看到「没执行，因为备份没成功」。
+        """
+        if tool.backup is None or tool.risk_level not in _WRITE_RISKS:
+            return None
+
+        if not runtime_settings.backup_enabled():
+            return None
+
+        try:
+            spec = await tool.backup(context, arguments)
+        except Exception as exc:
+            logger.exception(
+                "写前备份钩子失败，本次写入未执行。",
+                extra={
+                    "event": "write_backup_hook_failed",
+                    "tool_name": tool.name,
+                    "tenant_id": context.tenant_id,
+                },
+            )
+            raise ToolBackupFailedError("写前备份失败，本次操作未执行。") from exc
+
+        if spec is None:
+            return None
+
+        try:
+            return await write_backup_service.capture(
+                tenant_id=context.tenant_id,
+                tool_name=tool.name,
+                decision=decision,
+                policy_revision=policy_revision,
+                spec=spec,
+                thread_id=context.thread_id,
+                run_id=context.run_id,
+                approval_id=context.approval_id,
+                actor_id=context.user_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "写前备份落库失败，本次写入未执行。",
+                extra={
+                    "event": "write_backup_store_failed",
+                    "tool_name": tool.name,
+                    "tenant_id": context.tenant_id,
+                },
+            )
+            raise ToolBackupFailedError("写前备份未能保存，本次操作未执行。") from exc
+
+    async def _record_decision(
+        self,
+        *,
+        tool: ToolDefinition,
+        context: ToolExecutionContext,
+        decision: str,
+        policy_revision: int,
+        arguments: dict[str, Any],
+    ) -> None:
+        """把「这次调用被放行了」记进审计，**在执行之前**。
+
+        原先只有执行完的那一条（`tool_executed` → succeeded / failed）。
+        那意味着进程在 handler 里被杀掉时，审计里什么都不会留下——而
+        「被批准过、开始执行、然后没了」恰恰是最需要事后看见的一种情况。
+        决策与结果是两件事：前者回答「谁允许了」，后者回答「成了没」。
+
+        决策行带 `success=True`（决策本身成立），不表示操作成功；操作成败
+        在随后那条 `tool_executed` 上。两者用 `decision` + `approval_id` 对齐。
+
+        这里只记**策略**（开关与两个阈值），不记这一次备份落成了没有：
+        备份发生在下一句，此刻还没有结论。把「尚未发生」写成 `captured=false`
+        会让人以为「备过了但没成」。
+        """
+        policy_fields = {
+            "backup_enabled": runtime_settings.backup_enabled(),
+            "backup_threshold_mb": runtime_settings.backup_threshold_mb(),
+            "backup_max_size_mb": runtime_settings.backup_max_size_mb(),
+            # 「这个工具到底有没有声明钩子」。少了这一位，读到
+            # `decision=allow_with_backup` 而 `captured` 为 null 的人无从判断
+            # 是「没钩子」还是「钩子在、只是这次没旧状态」——两种情况下一步
+            # 该做的事完全不同。
+            "backup_hook": tool.backup is not None,
+        }
+
+        logger.info(
+            "工具调用已放行。",
+            extra={
+                "event": "tool_decision",
+                "tool_name": tool.name,
+                "decision": decision,
+                "policy_revision": policy_revision,
+                "risk_level": tool.risk_level.value,
+                "argument_keys": sorted(arguments),
+                "tenant_id": context.tenant_id,
+                **policy_fields,
+            },
+        )
+
+        # 日志先写、审计后写，且日志**不依赖**审计通道是否存在：
+        # 没有 sink 的部署（脚本、单测）仍然要能从日志里看出「这次放行了、
+        # 依据哪一版、备份规则是什么」。反过来则不然——日志是日志，
+        # 审计是审计，一个缺了不该让另一个消失。
+        if self._audit_sink is None:
+            return
+
+        try:
+            await self._audit_sink.record(
+                "tool_allowed",
+                {
+                    "tool_name": tool.name,
+                    "risk_level": tool.risk_level.value,
+                    "decision": decision,
+                    "policy_revision": policy_revision,
+                    # 决策成立 == 这条记录成立；操作成败在下一条事件里。
+                    "success": True,
+                    "argument_keys": sorted(arguments),
+                    **policy_fields,
+                    "tenant_id": context.tenant_id,
+                    "user_id": context.user_id,
+                    "thread_id": context.thread_id,
+                    "run_id": context.run_id,
+                    "approval_id": context.approval_id,
+                    "agent_name": context.agent_name,
+                    "agent_revision": context.agent_revision,
+                },
+            )
+        except Exception:
+            # 审计写失败不改结论：这次调用该不该执行，不由「日志写没写进去」决定。
+            # 但必须留痕迹——否则「审计页少了一条」会被当成「没发生过」。
+            logger.exception(
+                "写入工具决策审计失败。",
+                extra={"event": "tool_audit_failed", "tool_name": tool.name},
+            )
+
     async def _invoke_handler(
         self,
         *,
         tool: ToolDefinition,
         context: ToolExecutionContext,
         arguments: dict[str, Any],
+        decision: str = DECISION_ALLOW,
+        policy_revision: int = 0,
+        backup: write_backup_service.BackupOutcome | None = None,
     ) -> ToolExecutionResult:
         started = time.perf_counter()
 
@@ -1111,6 +1387,14 @@ class ToolGateway:
                         "error_code": result.error_code,
                         "duration_ms": duration_ms,
                         "argument_keys": sorted(arguments),
+                        # 与前面那条决策行对齐：同一次调用共用一份 decision 与
+                        # 版本号，事后能把「谁允许的」和「成了没」串起来。
+                        "decision": decision,
+                        "policy_revision": policy_revision,
+                        # 与决策行同名字段：两行对齐靠它，读的时候不必回看
+                        # 工具定义去确认「这个工具本来有没有备份钩子」。
+                        "backup_hook": tool.backup is not None,
+                        **(backup.log_fields() if backup is not None else {}),
                         "tenant_id": context.tenant_id,
                         "user_id": context.user_id,
                         "thread_id": context.thread_id,

@@ -754,8 +754,29 @@ def test_studio_extra_tools_are_read_only():
 
     gateway = get_tool_gateway()
     for name in agent_service.STUDIO_EXTRA_TOOLS:
+        # 业务读数来自连接器接入项，这个部署里可能一条都没接——没注册就无从
+        # 谈风险级，跳过。真正挡住「手滑写成写工具」的是下面那条按名字判的用例。
+        if not gateway.has_tool(name):
+            continue
         tool = gateway.get_tool(name)
         assert not is_write_risk(tool.risk_level), name
+
+
+def test_studio_extra_business_tools_are_reads_by_name():
+    """额外放行的业务工具，名字里必须只有读动词。
+
+    风险级要等工具注册进网关才查得到，而「别把写工具塞进这份名单」这件事
+    得在代码评审阶段就挡住。名单是手写的，`fc_executestationcontrol` 这种
+    名字里没有 get/list/query，这条断言当场拦下。
+
+    只看动词前缀不看完整名单：接入项增删工具是常事，名单跟着改是正常的，
+    但把一个 `execute`/`set`/`cancel` 写进「只读」清单永远不该发生。
+    """
+    assert agent_service.STUDIO_BUSINESS_READ_TOOLS, "名单不该为空，否则这条用例是摆设"
+
+    for name in agent_service.STUDIO_BUSINESS_READ_TOOLS:
+        verb = name.split("_", 1)[1]
+        assert verb.startswith(("get", "list", "query")), name
 
 
 async def test_studio_agent_can_read_attachments():
@@ -805,3 +826,110 @@ async def test_sync_studio_definition_refreshes_stale_instruction():
 
     assert changed is True
     assert "密钥不经过对话" in (row.instruction or "")
+
+
+# ---------------- 工具清单的呈现 ----------------
+#
+# 读工具这条路径不经过模型：`studio_describe(resource="tool")` 的 message 被
+# `nodes._summarize_result` 直接当答复给用户。曾经每个工具独占一行（名称 +
+# 显示名 + 风险级 + 来源），77 个工具就是七十多行文本，于是用户问「查一下 0 库存
+# 物料」收到的是整整一屏工具目录。压缩成「分组一行」之后，同样的问题至少先是
+# 一句关于工具数量与来源的判断，而不是一份抄给他的清单。
+
+
+def _tool(name: str, risk: str = "read", source: str = "builtin") -> dict:
+    return {
+        "name": name,
+        "display_name": name,
+        "risk_level": risk,
+        "requires_approval": risk != "read",
+        "source": source,
+    }
+
+
+def test_tool_inventory_groups_by_source_instead_of_one_line_each():
+    items = [_tool(f"read_{i}") for i in range(5)] + [_tool("write_x", "write")]
+
+    text = studio_tools._tool_inventory(items)
+
+    assert text.startswith("当前可调用 6 个工具：builtin 6 个（可写 1）。")
+    assert text.count("\n") == 2, "一个来源占一行，再加一行下一步提示，不能退回逐条成行"
+    assert "write_x〔写〕" in text, "写工具必须留在文本里：能不能动数据是用户最关心的"
+    assert "read_0" in text
+
+
+def test_tool_inventory_puts_write_tools_first_and_survives_truncation():
+    """写工具永远排在组首：组内超过上限时被截掉的必须是只读工具。"""
+    items = [_tool(f"a_read_{i:02d}") for i in range(30)] + [_tool("z_write", "write")]
+
+    text = studio_tools._tool_inventory(items)
+
+    names_line = text.splitlines()[1]
+    assert names_line.split("：", 1)[1].startswith("z_write〔写〕"), "写工具排在组首，截断碰不到它"
+    assert "等 31 个" in names_line, "截断了多少要写出来，否则模型以为工具就这么几个"
+
+
+def test_tool_inventory_keeps_counts_when_every_group_is_large():
+    items = [_tool(f"fc_{i:02d}", source="mcp") for i in range(30)] + [
+        _tool(f"http_{i:02d}", "write", source="http") for i in range(3)
+    ]
+
+    text = studio_tools._tool_inventory(items)
+
+    head = text.splitlines()[0]
+    assert "mcp 30 个（可写 0）" in head
+    assert "http 3 个（可写 3）" in head
+
+
+def test_tool_inventory_tells_the_model_what_to_do_next():
+    """清单末尾必须给下一步动作。
+
+    线上反复出现「用户让删一批工具 → 模型调了本工具 → 把清单当答复交差」。
+    模型对「工具刚告诉它的下一步」比系统提示词更服从，所以动作写在这里。
+    """
+    text = studio_tools._tool_inventory([_tool("prv_x")])
+
+    tail = text.splitlines()[-1]
+    assert tail.startswith("以上是清单，不是操作结果")
+    assert "studio_tool_delete" in tail
+    assert "不要只把清单交出去" in tail
+
+
+def test_tool_inventory_groups_mcp_by_prefix_and_marks_code_registered():
+    """用户说「某一批接口」时，清单里必须真有那一批的名字。
+
+    这是 prv_ 时代的真实事故：按来源分组后 prv_ 排在 fc_ 后面，被每组上限整段
+    截掉，模型手上没有名字，只能把 fc_ 的清单交出去。prv_ 那批已下线（改由
+    FioCloud 连接器提供 fc_*），用例改用虚构名字，锁的是「按前缀分组、写工具
+    不被截断」这个机制。
+    另外代码注册的工具删不掉；不标出来，模型会去逐个撞拒绝。
+    """
+    items = [_tool(f"fc_tool_{index:02d}", source="mcp") for index in range(20)] + [
+        _tool("prv_a", source="mcp"),
+        _tool("prv_b", source="mcp"),
+    ]
+
+    text = studio_tools._tool_inventory(items, code_local={"prv_a", "prv_b"})
+
+    lines = text.splitlines()
+    prv_line = next(line for line in lines if "mcp/prv_" in line)
+    assert "prv_a" in prv_line and "prv_b" in prv_line, "前缀是用户嘴里的名字，不能被截掉"
+    assert "代码注册，删不掉" in prv_line
+    assert any("mcp/fc_" in line for line in lines), "同一来源的另一个前缀也要在"
+
+
+def test_tool_inventory_says_which_tools_can_still_be_removed():
+    """同前缀下混着两类时，要点名可删的那几个。
+
+    当时线上 prv_ 共 22 个：21 个是代码注册（只能改代码），只有
+    prv_execute_station_control 是连接器接入项、能取消接入。用例沿用这组虚构
+    名字——它测的是「同前缀下要点名可删的那几个」，不是那 22 个是否还在。
+    只说「有删不掉的」，模型还是不知道该动哪一个，于是又反问用户。
+    """
+    items = [_tool("prv_a", source="mcp"), _tool("prv_b", source="mcp")]
+
+    text = studio_tools._tool_inventory(items, code_local={"prv_a"})
+
+    body = "\n".join(text.splitlines()[:-1])  # 最后一行是通用提示，本身含「代码注册」四个字
+    assert "1 个代码注册、删不掉" in body
+    assert "可删：prv_b" in body

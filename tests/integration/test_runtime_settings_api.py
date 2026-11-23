@@ -14,6 +14,7 @@ from sqlalchemy import delete, select
 from app.db.session import async_session_factory
 from app.models.audit import AuditEventType, AuditLog
 from app.models.platform_setting import PlatformSetting
+from app.models.policy_snapshot import PolicySnapshot
 from app.observability.writer import get_writer
 from app.services import runtime_settings
 
@@ -28,12 +29,14 @@ async def _clean():
     async with async_session_factory() as session:
         async with session.begin():
             await session.execute(delete(PlatformSetting))
+            await session.execute(delete(PolicySnapshot))
     yield
     await get_writer().set_enabled(False)
     runtime_settings.reset_for_tests()
     async with async_session_factory() as session:
         async with session.begin():
             await session.execute(delete(PlatformSetting))
+            await session.execute(delete(PolicySnapshot))
 
 
 async def test_requires_platform_admin(client):
@@ -150,3 +153,107 @@ async def test_chunk_limit_change_is_audited_under_its_own_key(admin_client):
     # 审计表不随 platform_settings 一起清，所以只断言「最近一条」是容量那条：
     # 同一用例文件里前面还有观测开关的审计，按集合相等会比较到别人的行。
     assert rows[-1].resource_id == runtime_settings.KNOWLEDGE_MAX_CHUNKS
+
+
+# ---------------- 策略版本与快照 ----------------
+
+
+async def test_changing_a_setting_returns_a_new_revision(admin_client):
+    """改一次 +1，并且这次响应里就能看到新号。
+
+    页面靠这个号回答「我刚才那次保存生效了没有」——不给号，人只能再发一次
+    请求去比对，而那次请求与保存之间别人可能又改了一次。
+    """
+    await runtime_settings.load()
+
+    before = (await admin_client.get(BASE)).json()["revision"]
+
+    body = (await admin_client.put(BASE, json={"knowledge_max_chunks": 1234})).json()
+
+    assert body["revision"] > before
+    assert body["knowledge_max_chunks"] == 1234
+
+
+async def test_snapshot_endpoint_returns_the_version_that_was_used(admin_client):
+    """按号取回当时那一版：审计里记的是号，这里是号对应的值。"""
+    await runtime_settings.load()
+
+    first = (await admin_client.put(BASE, json={"knowledge_max_chunks": 1111})).json()
+    revision = first["revision"]
+
+    await admin_client.put(BASE, json={"knowledge_max_chunks": 2222})
+
+    snapshot = (
+        await admin_client.get(f"{BASE}/snapshots/{revision}")
+    ).json()
+
+    assert snapshot["found"] is True
+    assert snapshot["revision"] == revision
+    # 取回的是**当时**那份，不是现在的 2222。
+    assert snapshot["settings"][runtime_settings.KNOWLEDGE_MAX_CHUNKS] == 1111
+
+
+async def test_snapshot_of_an_unknown_revision_says_not_found(admin_client):
+    """查不到返回 found=false 而不是 404：「这一版不存在」与「接口不存在」
+    对调用方是两种完全不同的处置。"""
+    runtime_settings.reset_for_tests()
+    await runtime_settings.load()
+
+    body = (await admin_client.get(f"{BASE}/snapshots/999999")).json()
+
+    assert body["found"] is False
+    assert body["settings"] == {}
+
+
+async def test_revision_zero_is_always_available(admin_client):
+    """0 表示「从未改过配置」，由代码合成——它是第一条工具调用所处的策略，
+    所以不能查不到。"""
+    runtime_settings.reset_for_tests()
+    await runtime_settings.load()
+
+    body = (await admin_client.get(f"{BASE}/snapshots/0")).json()
+
+    assert body["found"] is True
+    assert body["settings"][runtime_settings.DEFAULT_TOOL_ACTION] == "allow"
+
+
+async def test_backup_settings_are_persisted_and_audited_separately(admin_client):
+    """备份三项各自一条审计：混成一条就查不出「谁把阈值调小了」。"""
+    await runtime_settings.load()
+
+    response = await admin_client.put(
+        BASE,
+        json={
+            "tool_backup_enabled": True,
+            "tool_backup_threshold_mb": 50,
+            "tool_backup_max_size_mb": 2000,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+    assert body["tool_backup_threshold_mb"] == 50
+    assert body["tool_backup_max_size_mb"] == 2000
+    assert body["tool_backup_threshold_mb_source"] == "runtime"
+
+    assert runtime_settings.backup_threshold_mb() == 50
+
+    async with async_session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(AuditLog)
+                .where(AuditLog.event_type == AuditEventType.ADMIN_ACTION)
+                .where(AuditLog.message == "runtime_settings_updated")
+            )
+        ).all()
+
+    resources = {row.resource_id for row in rows}
+    assert runtime_settings.TOOL_BACKUP_THRESHOLD_MB in resources
+    assert runtime_settings.TOOL_BACKUP_MAX_SIZE_MB in resources
+
+
+async def test_backup_size_out_of_range_is_rejected(admin_client):
+    """尺寸项不做夹取：夹了之后人看到的数字和填的对不上，会以为没保存。"""
+    for bad in (0, 200000):
+        response = await admin_client.put(BASE, json={"tool_backup_threshold_mb": bad})
+        assert response.status_code == 422, response.text

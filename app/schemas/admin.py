@@ -182,6 +182,25 @@ class McpToolRegisterRequest(APIModel):
     token: str | None = Field(default=None, max_length=512)
 
 
+class McpToolUpdateRequest(APIModel):
+    """改一条接入项的风险等级与展示文案。
+
+    风险等级就是「要不要审批」的开关——网关按等级推导，表里不存
+    `requires_approval`——所以它必须能改。接入是批量做的，那时只能给一个
+    统一的保守值（默认 `write`）；之后要按工具逐个降到读/普通，否则
+    「查一次压力」也会弹审批单，平台等于不可用。
+
+    **不提供 `enabled`**：启停要配 register/unregister，一部分改在库里、
+    一部分改在注册表里，最容易出现的状态是「库里是启用、网关照旧没有」。
+    停用就走取消接入，语义干净。
+    """
+
+    risk_level: RiskLevel | None = None
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=2000)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=300)
+
+
 class McpRegisteredToolResponse(APIModel):
     id: int
     local_name: str
@@ -197,6 +216,13 @@ class McpRegisteredToolResponse(APIModel):
     server_url: str | None = None
     # 令牌只回「有没有」，不回明文。
     token_set: bool = False
+    # 令牌从哪来：connector / row / env / none。见 `token_source_of`。
+    # 只回 `token_set` 时，经连接器接入的行永远显示「未配置」——行上确实没有，
+    # 令牌在连接器凭据里，两者混在一起就分不清「设计如此」和「调不通」。
+    token_source: str = "row"
+    connector_name: str | None = None
+    # 本租户在这条连接器上有没有凭据；非连接器接入时为 None（不适用）。
+    connector_credential_set: bool | None = None
     created_by: str | None = None
     created_at: datetime
 
@@ -229,6 +255,20 @@ class RuntimeSettingsResponse(APIModel):
     knowledge_max_chunks: int = 2000
     knowledge_max_chunks_source: str = "env"
 
+    # 当前策略版本。每次生效值真的变了就 +1，0 = 从未改过配置（全按 .env）。
+    # 页面把它显示出来，是为了让「我改的这版到底生效了没有」有一个可核对的号。
+    revision: int = 0
+
+    # 写前备份三项。`enabled` 是总闸，两个尺寸分别是「单个对象超过就不备」
+    # 与「这个租户的备份总量上限」。三者要一起看：单看 enabled=true 会误以为
+    # 「一定备了」，而实际上可能被阈值挡掉。
+    tool_backup_enabled: bool = True
+    tool_backup_enabled_source: str = "env"
+    tool_backup_threshold_mb: int = 100
+    tool_backup_threshold_mb_source: str = "env"
+    tool_backup_max_size_mb: int = 3000
+    tool_backup_max_size_mb_source: str = "env"
+
 
 class RuntimeSettingsUpdate(APIModel):
     # 两项都是「不传 = 不动」。原先是必填，于是只想改容量的一次 PUT 必须
@@ -244,4 +284,39 @@ class RuntimeSettingsUpdate(APIModel):
         ge=1,
         le=20000,
         description="单篇文档的切片上限。留空表示不修改。",
+    )
+
+    tool_backup_enabled: bool | None = Field(
+        default=None,
+        description="写操作前是否留原件。关掉后备份钩子不再执行，写操作照常。",
+    )
+
+    tool_backup_threshold_mb: int | None = Field(
+        default=None,
+        ge=1,
+        le=102400,
+        description="单个对象超过这个大小就不备份（MB）。",
+    )
+
+    tool_backup_max_size_mb: int | None = Field(
+        default=None,
+        ge=1,
+        le=102400,
+        description="该租户备份总量上限（MB）。到了就停止新增，不覆盖旧备份。",
+    )
+
+
+class PolicySnapshotResponse(APIModel):
+    """某一版策略的完整生效值。
+
+    `settings` 的键是点分形式（与 `platform_settings.key` 一致），不是接口
+    字段名：快照要能被平台之外的东西（沙箱子进程、排障脚本）原样读走，
+    而点分键是存储层唯一稳定的标识。
+    """
+
+    revision: int
+    settings: dict[str, Any]
+    found: bool = Field(
+        default=True,
+        description="false 表示库里没有这一版（号比现有最大版本大，或已被清退）。",
     )

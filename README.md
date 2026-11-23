@@ -68,23 +68,16 @@ uv run pytest
 ## 部署
 
 - 单机部署（systemd + Nginx 反代 + Basic 认证）：[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
-- 部署后验收清单：[`docs/VERIFY.md`](docs/VERIFY.md)
 - LangGraph Studio 观测（SSH 隧道 + `baseUrl=http://127.0.0.1:2024`）：[`docs/STUDIO.md`](docs/STUDIO.md)
 - 多租户隔离模型与运维：[`docs/MULTI_TENANCY.md`](docs/MULTI_TENANCY.md)
-- 服务端巡检与告警（7 项检查，每分钟一轮）：[`docs/MONITORING.md`](docs/MONITORING.md)
-- 远端部署与工作区比对（可反复执行的巡检清单）：[`docs/REMOTE_AUDIT.md`](docs/REMOTE_AUDIT.md)
 - 代码沙箱：[`docs/SANDBOX.md`](docs/SANDBOX.md)
 - 工具来源、自定义 HTTP Tool 与导入导出：[`docs/TOOLS.md`](docs/TOOLS.md)
 - 权限：三态工具策略（允许 / 需确认 / 拒绝）、风险只上调与两个平台开关：[`docs/PERMISSIONS.md`](docs/PERMISSIONS.md)
 - 构建助手「从文件导入」：上传一份文件 + 说一句用途，按内容建成知识库文档 / 技能 / OpenAPI 工具：[`docs/STUDIO_IMPORT.md`](docs/STUDIO_IMPORT.md)
 - 知识库：文档入库、增量同步、切片与检索：[`docs/KNOWLEDGE.md`](docs/KNOWLEDGE.md)
-- 知识库语料缺口清单（现场作业类问题答不了时先看这份）：[`docs/KNOWLEDGE_GAPS.md`](docs/KNOWLEDGE_GAPS.md)
 - 智能体：职责边界、生命周期与治理不变量：[`docs/AGENTS.md`](docs/AGENTS.md)
 - 技能：作业指令、触发匹配与工具白名单：[`docs/SKILLS.md`](docs/SKILLS.md)
 - 对话会话历史与删除语义：[`docs/CONVERSATIONS.md`](docs/CONVERSATIONS.md)
-- 长对话上下文与压缩（设计稿）：[`docs/CONTEXT.md`](docs/CONTEXT.md)
-- 踩过的坑、根因与判据清单（发版前对照）：[`docs/LESSONS.md`](docs/LESSONS.md)
-- 待办清单（上线前阻断项、技能 P2、知识库 P1、观测 M4/M5）：[`docs/TODO.md`](docs/TODO.md)
 - 部署资产：[`deploy/systemd/`](deploy/systemd)、[`deploy/nginx/`](deploy/nginx)、[`deploy/firewall/`](deploy/firewall)
 
 ```bash
@@ -100,9 +93,8 @@ deploy/sync.sh --verify                 # 只比对本地提交与服务器工�
 
 ## 架构要点
 
-完整分层与六张图见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)；
-为什么按这个顺序建、哪些明确不做、每笔决定付了什么代价，见
-[`docs/DESIGN.md`](docs/DESIGN.md)。下面是几条最容易踩错的。
+完整分层与六张图见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+下面是几条最容易踩错的。
 
 - **单一配置入口**：`app/core/config.py`。
 - **单一 ORM**：`app/models/`，Alembic 迁移是唯一 schema 来源。
@@ -142,7 +134,5 @@ deploy/sync.sh --verify                 # 只比对本地提交与服务器工�
   重判，「无权看」「已失效」「没有材料」是三个不同错误；没有任何依据的结论不会过桥。
   被委派方执行写操作时，审批单由它自己开、由人确认，单子上冻结整条委派链——
   批准期间上游被收窄，这张单子就作废。Agent 级配额与绩效看板的口径写在
-  [`docs/A2A.md`](docs/A2A.md)、[`docs/AGENT_QUOTA.md`](docs/AGENT_QUOTA.md)、
-  [`docs/AGENTS.md`](docs/AGENTS.md) §8，不是遗漏。
-- 连接器**没有** OAuth2 / 每用户授权、连接器级限流、定时巡检与凭据加密存储；
-  四条的原因与开工条件在 [`docs/TODO.md`](docs/TODO.md) §4.6。
+  [`docs/A2A.md`](docs/A2A.md)、[`docs/AGENTS.md`](docs/AGENTS.md) §8，不是遗漏。
+- 连接器**没有** OAuth2 / 每用户授权、连接器级限流、定时巡检与凭据加密存储。

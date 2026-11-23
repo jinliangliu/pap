@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
@@ -123,6 +124,36 @@ def test_mcp_connector_rejects_auth_types_it_cannot_send():
             ConnectorKind.HTTP, ConnectorAuthType.HEADER, "X-Api-Key"
         )
         == "X-Api-Key"
+    )
+
+
+def test_bearer_and_none_never_keep_a_header_name():
+    """bearer 只发 `Authorization`，请求头名根本不参与请求。
+
+    原样保留它的后果不是「多存一个字段」，而是把令牌收进了一个非密文字段：
+    `connectors` 是平台表、没有行级安全，列表接口又会原样回显它。
+    线上真发生过——`part_keeper` 的 `pk_mcp_…` 就躺在 `auth_header_name` 里，
+    而人以为那是「令牌填好了」。
+    """
+    token = "pk_mcp_9f2b7c1d4e5a6b7c8d9e0f1a2b3c4d5e"
+
+    for kind in (ConnectorKind.MCP, ConnectorKind.HTTP):
+        assert (
+            connector_service.validate_auth(kind, ConnectorAuthType.BEARER, token) == ""
+        )
+
+    assert (
+        connector_service.validate_auth(
+            ConnectorKind.HTTP, ConnectorAuthType.NONE, "X-Api-Key"
+        )
+        == ""
+    )
+    # Basic 同样只发 Authorization 头。
+    assert (
+        connector_service.validate_auth(
+            ConnectorKind.HTTP, ConnectorAuthType.BASIC, token
+        )
+        == ""
     )
 
 
@@ -548,13 +579,22 @@ async def test_mcp_tool_uses_connector_endpoint_and_tenant_secret(
 # ---------------- 批量接入：默认风险等级取严的一侧 ----------------
 
 
-async def _bind(monkeypatch, connector_id: int, items: list[dict]) -> list[str]:
+async def _bind(
+    monkeypatch,
+    connector_id: int,
+    items: list[dict],
+    *,
+    descriptions: dict[str, str] | None = None,
+) -> list[str]:
     """跑一次真实绑定流程，远端用假 descriptor 顶掉网络。"""
     from app.integrations.mcp_client import McpToolDescriptor
 
+    described = descriptions or {}
     remote = {
-        "send_message": McpToolDescriptor(name="send_message", description="", input_schema={}),
-        "delete_message": McpToolDescriptor(name="delete_message", description="", input_schema={}),
+        name: McpToolDescriptor(
+            name=name, description=described.get(name, ""), input_schema={}
+        )
+        for name in ("send_message", "delete_message")
     }
 
     async def fake_fetch(*, url, token):  # noqa: ANN001
@@ -630,6 +670,130 @@ async def test_batch_bind_rejects_unknown_risk_level(seeded_identity, monkeypatc
         )
 
     assert "banana" in str(exc.value)
+
+
+async def test_batch_bind_fills_description_from_remote(seeded_identity, monkeypatch):
+    """批量接入没带说明时，取远端 schema 里那句。
+
+    前端只提交（远端名、本地名、风险级），说明就在 `remote[...]` 里。
+    丢掉它的代价不只是工具页「（无描述）」：`_build_definition` 直接取
+    `spec.description`，模型看到的也是空——只能靠 `fc_querypressure`
+    这样的名字猜这个工具干什么。
+    """
+    from app.models.mcp_registered import McpRegisteredTool
+
+    connector_id = await _make_connector(
+        name=f"mcp_{uuid.uuid4().hex[:8]}",
+        kind=ConnectorKind.MCP,
+        base_url="https://mcp.example.com/mcp",
+    )
+    local = f"t_{uuid.uuid4().hex[:8]}"
+    await _bind(
+        monkeypatch,
+        connector_id,
+        [{"remote_name": "send_message", "local_name": local}],
+        descriptions={"send_message": "发送一条消息"},
+    )
+
+    async with async_session_factory() as session:
+        with tenant_scope(TENANT):
+            row = await session.scalar(
+                select(McpRegisteredTool).where(McpRegisteredTool.local_name == local)
+            )
+            assert row is not None
+            assert row.description == "发送一条消息"
+
+
+async def test_rebind_does_not_wipe_existing_description(seeded_identity, monkeypatch):
+    """重新接入一次不该把已有说明清空。
+
+    空串在这条路径上表示「这次没带说明」，不是「把说明删掉」。按后者处理，
+    重跑一遍接入就会抹掉人工写好的说明，而界面上看不出发生过什么。
+    """
+    from app.models.mcp_registered import McpRegisteredTool
+
+    connector_id = await _make_connector(
+        name=f"mcp_{uuid.uuid4().hex[:8]}",
+        kind=ConnectorKind.MCP,
+        base_url="https://mcp.example.com/mcp",
+    )
+    local = f"t_{uuid.uuid4().hex[:8]}"
+    await _bind(
+        monkeypatch,
+        connector_id,
+        [{"remote_name": "send_message", "local_name": local}],
+        descriptions={"send_message": "发送一条消息"},
+    )
+    # 第二次：远端说明变空、调用方也没带。
+    await _bind(monkeypatch, connector_id, [{"remote_name": "send_message", "local_name": local}])
+
+    async with async_session_factory() as session:
+        with tenant_scope(TENANT):
+            row = await session.scalar(
+                select(McpRegisteredTool).where(McpRegisteredTool.local_name == local)
+            )
+            assert row is not None
+            assert row.description == "发送一条消息"
+
+
+def test_token_source_tells_connector_from_row():
+    """「令牌从哪来」必须能分开，否则「未配置」既是设计如此又是故障。
+
+    经连接器接入的行上 `token` 永远是空的（端点与凭据都由连接器接管）。
+    只看 `token_set` 时，这种行和「真的没配凭据」显示成同一句话。
+    """
+    from app.models.connector import Connector
+    from app.models.mcp_registered import McpRegisteredTool
+    from app.services.mcp_tool_service import token_source_of
+
+    row = McpRegisteredTool(local_name="t", remote_name="r", display_name="t", description="")
+    connector = Connector(name="c", base_url="https://x.example.com/mcp")
+
+    assert token_source_of(row, connector=connector) == "connector"
+    assert token_source_of(row) == "env"
+
+    row.token = "tok"
+    assert token_source_of(row) == "row"
+
+    row.token = None
+    row.server_url = "https://other.example.com/mcp"
+    assert token_source_of(row) == "none"
+
+
+def test_row_to_response_reports_connector_credential_state():
+    """接口要把「哪个连接器、本租户配没配」一起回出去。
+
+    只回 `token_set=False` 时，界面只能写「未配置」——管理员在连接器页明明
+    看到「已配置」，到了工具页却是另一句话，于是来问「为什么」。
+    """
+    from app.models.connector import Connector
+    from app.models.mcp_registered import McpRegisteredTool
+    from app.services.mcp_tool_service import row_to_response
+
+    row = McpRegisteredTool(
+        id=1,
+        local_name="fc_liststations",
+        remote_name="listStations",
+        display_name="listStations",
+        description="列出站点",
+        connector_id=3,
+        risk_level=RiskLevel.READ,
+        created_at=datetime.now(timezone.utc),
+    )
+    connector = Connector(id=3, name="prv", base_url="http://127.0.0.1:8765/mcp")
+
+    response = row_to_response(row, connector=connector, credential_set=True)
+
+    assert response.token_set is False
+    assert response.token_source == "connector"
+    assert response.connector_name == "prv"
+    assert response.connector_credential_set is True
+
+    # 独立行（没有连接器）不该被贴上「本租户」标签。
+    standalone = row_to_response(row)
+    assert standalone.token_source == "env"
+    assert standalone.connector_name is None
+    assert standalone.connector_credential_set is None
 
 
 # ---------------- 删除连接器：凭据不能留在库里 ----------------
@@ -717,3 +881,4 @@ async def test_maintenance_purges_orphan_credentials_per_tenant(seeded_identity)
                 ).all()
 
         assert [row.connector_id for row in rows] == [live_id], tenant
+

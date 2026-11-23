@@ -2,7 +2,10 @@
 """MCP 接入的单元测试。
 
 不连真实 MCP Server：这里验证的是「本地这一层」的行为——
-白名单映射、业务成败映射、凭据缺失、控制下发的两段串联。
+白名单机制、业务成败映射、凭据缺失、多端点、参数说明。
+
+prv_ 那批（21 个）已整体下线，改由 FioCloud 连接器提供 fc_*；
+所以「白名单」一节测的是机制，不是那 21 条数据。
 协议层是否正确由部署后的联调验证（见 docs/MCP_INTEGRATION.md）。
 """
 
@@ -23,12 +26,9 @@ from app.models.approval import RiskLevel
 from app.tools import mcp_tools
 from app.tools.gateway import ToolGateway
 from app.tools.mcp_tools import (
-    _REMOTE_BY_LOCAL,
-    APPLY_TOOL_NAME,
     MCP_TOOL_SPECS,
     McpCredentialMissingError,
     McpToolSpec,
-    _make_apply_handler,
     _make_passthrough_handler,
     _to_result,
     register_mcp_tools,
@@ -47,6 +47,18 @@ def _context(tenant_id: str = "default") -> ToolExecutionContext:
         roles=("dev",),
         scopes=("tools:read",),
     )
+
+
+# 白名单为空后，验证「本地这一层」的通用行为需要自己造一条 spec。
+# 它不进注册表，只用来起 handler 与 schema。
+_SPEC = McpToolSpec(
+    local_name="remote_status",
+    display_name="查询远端服务状态",
+    description="用于验证映射与失败分类。",
+    risk_level=RiskLevel.READ,
+    remote_name="getServerStatus",
+    timeout_seconds=30,
+)
 
 
 class FakeClient:
@@ -75,69 +87,29 @@ def mcp_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------- 白名单 ----------------
 
 
-def test_every_spec_maps_to_a_remote_tool() -> None:
-    """每个本地工具都必须能追到远端工具名，否则注册时会静默消失。"""
-    for spec in MCP_TOOL_SPECS:
-        if spec.local_name == APPLY_TOOL_NAME:
-            assert spec.local_name not in _REMOTE_BY_LOCAL
-            continue
-        assert spec.local_name in _REMOTE_BY_LOCAL, spec.local_name
+# 代码白名单现在是空的：prv_ 那批整体下线，改由 FioCloud 连接器提供 fc_*。
+# 下面两条锁的是**机制**而不是数据——白名单还有没有能力挡住配置覆盖，
+# 与「当前登记了几条」是两件事。
 
 
-def test_local_names_are_unique_and_prefixed() -> None:
-    names = [spec.local_name for spec in MCP_TOOL_SPECS]
-    assert len(names) == len(set(names))
+def test_code_whitelist_is_empty_after_prv_tools_retired() -> None:
+    """任何一条 prv_ 残留都会让旧工具与 fc_* 同时出现在模型目录里。
 
-    # 统一前缀，避免与本地工具重名时互相覆盖。
-    assert all(name.startswith("prv_") for name in names)
-
-
-_WRITE_RISKS = {
-    RiskLevel.WRITE,
-    RiskLevel.EXECUTE,
-    RiskLevel.DESTRUCTIVE,
-    RiskLevel.EXTERNAL,
-}
-
-
-def test_write_risk_tools_require_approval() -> None:
+    反向验证过：删掉 mcp_tools 里那批 spec 之前，这条断言的是 21 个名字；
+    漏删一条就红，而不是等到线上发现同一个能力挂了两个工具。
     """
-    会产生外部副作用的工具必须走审批。
-
-    Gateway 对 write 及以上风险本来就会强制审批，这里再断言一次，
-    是为了防止有人把 execute 类工具的 risk 误改成 read。
-    """
-    for spec in MCP_TOOL_SPECS:
-        if spec.risk_level in _WRITE_RISKS:
-            assert spec.requires_approval, spec.local_name
+    assert MCP_TOOL_SPECS == ()
+    assert mcp_tools.code_local_names() == set()
+    assert mcp_tools.remote_to_local_map() == {}
 
 
-def test_export_tools_do_not_require_approval() -> None:
-    """
-    导出类工具（趋势/CSV/PDF）只读站点数据，副作用仅是在 MCP 服务端落一个文件，
-    不改变站点状态。用户查趋势不该等审批，所以定成 normal。
+def test_code_whitelist_still_shadows_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """机制没随数据一起消失：登记过的名字不许被配置覆盖。"""
+    monkeypatch.setattr(mcp_tools, "MCP_TOOL_SPECS", (_SPEC,))
 
-    这条断言的作用是防回退：如果有人把它们改回 write，或网关以后把 normal
-    也算作需审批，这里会先红。
-    """
-    exports = {
-        "prv_pressure_trend",
-        "prv_export_records",
-        "prv_download_report_pdf",
-    }
-    specs = {spec.local_name: spec for spec in MCP_TOOL_SPECS}
-
-    for name in exports:
-        spec = specs[name]
-        assert spec.risk_level is RiskLevel.NORMAL, name
-        assert spec.requires_approval is False, name
-
-
-def test_approval_set_is_only_the_control_dispatch() -> None:
-    """当前只有真实下发需要审批；多出一个都说明风险分级被改歪了。"""
-    requiring = {spec.local_name for spec in MCP_TOOL_SPECS if spec.requires_approval}
-
-    assert requiring == {"prv_apply_station_control"}
+    assert mcp_tools.code_local_names() == {"remote_status"}
 
 
 # ---------------- 结果映射 ----------------
@@ -216,7 +188,7 @@ def test_empty_station_list_explains_permission_boundary() -> None:
             "identity_station_filter": [],
             "stations": [],
         },
-        tool_name="prv_list_stations",
+        tool_name="fc_liststations",
     )
 
     assert result.success is True
@@ -231,7 +203,7 @@ def test_empty_station_list_explains_permission_boundary() -> None:
 def test_empty_result_is_not_reported_as_plain_success() -> None:
     result = _to_result(
         {"success": True, "data_source": "API", "count": 0, "records": []},
-        tool_name="prv_query_alarms",
+        tool_name="fc_queryalarms",
     )
 
     assert result.success is True
@@ -241,18 +213,18 @@ def test_empty_result_is_not_reported_as_plain_success() -> None:
 def test_non_empty_result_keeps_neutral_message() -> None:
     result = _to_result(
         {"success": True, "data_source": "API", "count": 2, "stations": [{}, {}]},
-        tool_name="prv_list_stations",
+        tool_name="fc_liststations",
     )
 
     assert result.message == "已完成远端调用。"
 
 
-def test_apply_prefix_wins_over_empty_detection() -> None:
-    """控制下发的 message 由 handler 决定，不能被空结果推断覆盖。"""
+def test_message_prefix_wins_over_empty_detection() -> None:
+    """调用方给了结论句就以它为准，不能被「空结果」推断覆盖。"""
     result = _to_result(
         {"success": True, "data_source": "API", "count": 0},
         message_prefix="控制指令已提交。",
-        tool_name=APPLY_TOOL_NAME,
+        tool_name="fc_executestationcontrol",
     )
 
     assert result.message == "控制指令已提交。"
@@ -265,7 +237,7 @@ async def test_missing_tenant_token_is_rejected(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(settings, "mcp_server_url", "http://127.0.0.1:8765/mcp")
     monkeypatch.setattr(settings, "mcp_tenant_tokens", {})
 
-    spec = MCP_TOOL_SPECS[0]
+    spec = _SPEC
     handler = _make_passthrough_handler(spec, "getServerStatus")
 
     result = await handler(_context(), {})
@@ -291,7 +263,7 @@ async def test_other_tenant_token_is_not_reused(
         ),
     )
 
-    spec = MCP_TOOL_SPECS[0]
+    spec = _SPEC
     handler = _make_passthrough_handler(spec, "getServerStatus")
 
     result = await handler(_context("test"), {})
@@ -311,7 +283,7 @@ async def test_auth_rejection_is_not_retryable(
 
     monkeypatch.setattr(mcp_tools, "_client_for", _raise)
 
-    spec = MCP_TOOL_SPECS[0]
+    spec = _SPEC
     handler = _make_passthrough_handler(spec, "getServerStatus")
 
     result = await handler(_context(), {})
@@ -330,7 +302,7 @@ async def test_transport_error_is_retryable(
 
     monkeypatch.setattr(mcp_tools, "_client_for", _raise)
 
-    spec = MCP_TOOL_SPECS[0]
+    spec = _SPEC
     handler = _make_passthrough_handler(spec, "getServerStatus")
 
     result = await handler(_context(), {})
@@ -340,115 +312,7 @@ async def test_transport_error_is_retryable(
     assert result.retryable is True
 
 
-# ---------------- 控制下发 ----------------
-
-
-async def test_apply_runs_prepare_then_execute(
-    mcp_configured: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake = FakeClient(
-        {
-            "prepareStationControl": {
-                "success": True,
-                "confirmation_can_execute": True,
-                "preview_id": "a" * 32,
-                "preview": {"action": "set_press_level"},
-            },
-            "executeStationControl": {
-                "success": True,
-                "data_source": "API",
-                "command_id": "cmd-1",
-            },
-        }
-    )
-    monkeypatch.setattr(
-        mcp_tools,
-        "_client_for",
-        lambda context, *, call_timeout, spec=None: fake,
-    )
-
-    spec = next(s for s in MCP_TOOL_SPECS if s.local_name == APPLY_TOOL_NAME)
-    result = await _make_apply_handler(spec)(
-        _context(), {"station": "T002509008", "action": "set_press_level"}
-    )
-
-    assert [name for name, _ in fake.calls] == [
-        "prepareStationControl",
-        "executeStationControl",
-    ]
-    execute_args = fake.calls[1][1]
-    assert execute_args["preview_id"] == "a" * 32
-    assert execute_args["confirm"] is True
-
-    assert result.success is True
-    assert result.external_operation_id == "cmd-1"
-
-
-async def test_apply_stops_when_prepare_fails(
-    mcp_configured: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """预演不通过时绝不能再调 execute —— 那等于绕过条件检查直接写设备。"""
-    fake = FakeClient(
-        {
-            "prepareStationControl": {
-                "success": False,
-                "error": "当前令牌 write_scope=none",
-            }
-        }
-    )
-    monkeypatch.setattr(
-        mcp_tools,
-        "_client_for",
-        lambda context, *, call_timeout, spec=None: fake,
-    )
-
-    spec = next(s for s in MCP_TOOL_SPECS if s.local_name == APPLY_TOOL_NAME)
-    result = await _make_apply_handler(spec)(
-        _context(), {"station": "T002509008", "action": "set_press_level"}
-    )
-
-    assert [name for name, _ in fake.calls] == ["prepareStationControl"]
-    assert result.success is False
-    assert "未下发任何指令" in (result.message or "")
-
-
-async def test_apply_stops_when_precondition_not_met(
-    mcp_configured: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    prepare 只校验参数，能不能执行看 confirmation_can_execute。
-
-    写开关关闭、动作不在白名单时 prepare 依然 success=true，此时继续调 execute
-    等于把「审批通过」当成「条件满足」。
-    """
-    fake = FakeClient(
-        {
-            "prepareStationControl": {
-                "success": True,
-                "confirmation_can_execute": False,
-                "blockers": ["服务未开启写入（write_enabled=false）"],
-                "preview_id": "b" * 32,
-            }
-        }
-    )
-    monkeypatch.setattr(
-        mcp_tools,
-        "_client_for",
-        lambda context, *, call_timeout, spec=None: fake,
-    )
-
-    spec = next(s for s in MCP_TOOL_SPECS if s.local_name == APPLY_TOOL_NAME)
-    result = await _make_apply_handler(spec)(
-        _context(), {"station": "T002509008", "action": "high_pressure"}
-    )
-
-    assert [name for name, _ in fake.calls] == ["prepareStationControl"]
-    assert result.success is False
-    assert result.error_code == "MCP_PRECONDITION_FAILED"
-    assert "write_enabled" in (result.message or "")
+# ---------------- 参数说明 ----------------
 
 
 def test_schema_hints_explain_control_parameters() -> None:
@@ -456,7 +320,6 @@ def test_schema_hints_explain_control_parameters() -> None:
     远端 schema 只有类型没有语义，模型会把 action 填成自然语言。
     本地必须补上取值说明，并在控制类工具上写清约束。
     """
-    spec = next(s for s in MCP_TOOL_SPECS if s.local_name == APPLY_TOOL_NAME)
     schema = mcp_tools._apply_schema_hints(
         {
             "type": "object",
@@ -467,7 +330,7 @@ def test_schema_hints_explain_control_parameters() -> None:
                 "schedule": {"type": "array"},
             },
         },
-        local_name=spec.local_name,
+        local_name="fc_preparestationcontrol",
     )
 
     assert "close_main" in schema["properties"]["action"]["description"]
@@ -478,7 +341,7 @@ def test_schema_hints_explain_control_parameters() -> None:
 def test_schema_hints_do_not_mutate_remote_schema() -> None:
     """远端 schema 对象是共享的，打补丁不能改到原对象。"""
     original = {"type": "object", "properties": {"station": {"type": "string"}}}
-    mcp_tools._apply_schema_hints(original, local_name="prv_query_pressure")
+    mcp_tools._apply_schema_hints(original, local_name="fc_querypressure")
 
     assert "description" not in original["properties"]["station"]
 
@@ -517,11 +380,43 @@ async def test_register_skips_tools_missing_on_remote(
     monkeypatch.setattr(settings, "mcp_enabled", True)
 
     gateway = ToolGateway(ToolRegistry())
+    spec = McpToolSpec(
+        local_name="remote_status",
+        display_name="查询远端服务状态",
+        description="",
+        risk_level=RiskLevel.READ,
+        remote_name="getServerStatus",
+    )
 
-    registered = await register_mcp_tools(gateway)
+    registered = await register_mcp_tools(gateway, extra_specs=(spec,))
 
     assert registered == 1
-    assert [tool.name for tool in gateway.list_tools()] == ["prv_server_status"]
+    assert [tool.name for tool in gateway.list_tools()] == ["remote_status"]
+
+
+async def test_register_skips_admin_spec_missing_on_remote(
+    mcp_configured: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """远端没有这个工具就跳过它，不能本地凭空注册一个空壳。
+
+    白名单为空之后，这条路径成了唯一的注册入口，所以必须有覆盖。
+    """
+    FakeProbe.descriptors = []
+    monkeypatch.setattr(mcp_tools, "McpToolClient", FakeProbe)
+    monkeypatch.setattr(settings, "mcp_enabled", True)
+
+    gateway = ToolGateway(ToolRegistry())
+    spec = McpToolSpec(
+        local_name="gone_tool",
+        display_name="已下线",
+        description="",
+        risk_level=RiskLevel.READ,
+        remote_name="goneTool",
+    )
+
+    assert await register_mcp_tools(gateway, extra_specs=(spec,)) == 0
+    assert gateway.list_tools() == []
 
 
 async def test_register_is_noop_when_disabled(
@@ -547,14 +442,51 @@ async def test_register_tolerates_unreachable_server(
     monkeypatch.setattr(settings, "mcp_enabled", True)
 
     gateway = ToolGateway(ToolRegistry())
+    spec = McpToolSpec(
+        local_name="ocr_file",
+        display_name="识别文件文字",
+        description="",
+        risk_level=RiskLevel.READ,
+        remote_name="ocr_file",
+        server_url="http://127.0.0.1:8001/mcp",
+    )
 
-    assert await register_mcp_tools(gateway) == 0
+    assert await register_mcp_tools(gateway, extra_specs=(spec,)) == 0
     assert gateway.list_tools() == []
+
+
+# FioCloud 连接器接入的 22 个本地名（`mcp_registered_tools`）。
+# 写死在测试里是故意的：说明表的键拼错时，远端只会少一段提示、不会报错，
+# 唯一能发现的办法是拿一份「现在真有哪些工具」的清单来比对。
+_FC_LOCAL_NAMES = {
+    "fc_cancelstationcontrol",
+    "fc_downloadreportpdf",
+    "fc_executestationcontrol",
+    "fc_exportstationrecords",
+    "fc_getcontrolconfig",
+    "fc_getcutoffvalvestatus",
+    "fc_getserverstatus",
+    "fc_getstationcapabilities",
+    "fc_getstationcommand",
+    "fc_getstationoverview",
+    "fc_getstationprofile",
+    "fc_liststationcommands",
+    "fc_liststations",
+    "fc_preparestationcontrol",
+    "fc_queryalarms",
+    "fc_queryioalarms",
+    "fc_querypressure",
+    "fc_querypressuretrend",
+    "fc_queryreliefreport",
+    "fc_queryreliefsamples",
+    "fc_queryreliefvalve",
+    "fc_setscenario",
+}
 
 
 def test_schema_hints_cover_only_declared_tools() -> None:
     """说明表里的本地名必须真实存在，否则整段提示静默失效。"""
-    declared = {spec.local_name for spec in MCP_TOOL_SPECS}
+    declared = _FC_LOCAL_NAMES | {spec.local_name for spec in MCP_TOOL_SPECS}
 
     unknown = set(mcp_tools._SCHEMA_HINTS) - declared
 
@@ -565,7 +497,7 @@ def test_unknown_param_hint_is_ignored_not_injected() -> None:
     """远端没有的参数不能被凭空塞进 schema——那会让模型以为可以传。"""
     schema = {"type": "object", "properties": {"station": {"type": "string"}}}
 
-    out = mcp_tools._apply_schema_hints(schema, local_name="prv_download_report_pdf")
+    out = mcp_tools._apply_schema_hints(schema, local_name="fc_downloadreportpdf")
 
     assert "report_path" not in out["properties"]
     assert out["properties"]["station"]["description"]
@@ -578,10 +510,10 @@ def test_download_report_explains_report_path_source() -> None:
         "properties": {"report_path": {"type": "string"}, "file_name": {"type": "string"}},
     }
 
-    out = mcp_tools._apply_schema_hints(schema, local_name="prv_download_report_pdf")
+    out = mcp_tools._apply_schema_hints(schema, local_name="fc_downloadreportpdf")
 
     hint = out["properties"]["report_path"]["description"]
-    assert "原样" in hint and "prv_relief_report" in hint
+    assert "原样" in hint and "fc_queryreliefreport" in hint
 
 
 async def test_register_includes_admin_attached_tools(
@@ -641,9 +573,18 @@ async def test_register_lets_code_specs_win_over_admin_ones(
     monkeypatch.setattr(settings, "mcp_server_url", "http://127.0.0.1:8765/mcp")
     monkeypatch.setattr(settings, "mcp_tenant_tokens", {"default": "tok"})
 
+    code_spec = McpToolSpec(
+        local_name="query_pressure",
+        display_name="代码登记的读取工具",
+        description="代码白名单优先。",
+        risk_level=RiskLevel.READ,
+        remote_name="queryPressure",
+    )
+    monkeypatch.setattr(mcp_tools, "MCP_TOOL_SPECS", (code_spec,))
+
     gateway = ToolGateway(ToolRegistry())
     shadow = McpToolSpec(
-        local_name="prv_query_pressure",
+        local_name="query_pressure",
         display_name="被顶掉的配置",
         description="不该生效。",
         risk_level=RiskLevel.DESTRUCTIVE,
@@ -653,7 +594,7 @@ async def test_register_lets_code_specs_win_over_admin_ones(
 
     await register_mcp_tools(gateway, extra_specs=(shadow,))
 
-    tool = gateway.get_tool("prv_query_pressure")
+    tool = gateway.get_tool("query_pressure")
     assert tool.display_name != "被顶掉的配置"
     # 代码里的读取工具不需要审批；若配置生效会变成危险工具。
     assert tool.risk_level is RiskLevel.READ

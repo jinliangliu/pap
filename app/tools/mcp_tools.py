@@ -93,238 +93,54 @@ def endpoint_key(url: str | None) -> str:
     return (url or "").strip().rstrip("/")
 
 
-# 远端全部 22 个工具里，这里登记 20 个直接透传 + 1 个组合封装。
-# 刻意没有暴露的两个：
-#   setScenario      —— 只在演示部署（PRV_DEMO_MODE=1）生效，生产环境切场景没有意义，
-#                       但它会把后续查询变成假数据，风险大于收益；
-#   executeStationControl —— 单独暴露时模型必须自己保管 preview_id，
-#                       跨轮次极易丢失或张冠李戴，改由 prv_apply_station_control 内部串联。
-MCP_TOOL_SPECS: tuple[McpToolSpec, ...] = (
-    McpToolSpec(
-        local_name="prv_server_status",
-        display_name="查询燃气 MCP 服务状态",
-        description=(
-            "查看燃气调压 MCP 服务自身的配置完整性、当前身份与平台连通性。"
-            "排障或确认对端可用时先调它。"
-        ),
-        risk_level=RiskLevel.READ,
-        timeout_seconds=30,
-    ),
-    McpToolSpec(
-        local_name="prv_list_stations",
-        display_name="查询调压站目录",
-        description=(
-            "列出当前身份被授权访问的调压站，可用站名或通信序列号做子串筛选。"
-            "不确定站名时先调它拿准确的 station 值。"
-        ),
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_station_profile",
-        display_name="读取调压站设备档案",
-        description="读取设备类型、名称、编号以及平台保存的采样与上报周期配置。",
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_station_capabilities",
-        display_name="核对调压站可用能力",
-        description=(
-            "核对当前站点的可用能力与已知缺口。"
-            "在承诺控制、终端回执、阀位、事件或通知之前必须先调用。"
-        ),
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_station_overview",
-        display_name="查询调压站综合概览",
-        description=(
-            "聚合进出口压力、切断阀、放散阀、IO 报警、运行模式与进口压力波动，"
-            "是了解站点整体状态的首选工具。"
-        ),
-        risk_level=RiskLevel.READ,
-        timeout_seconds=90,
-    ),
-    McpToolSpec(
-        local_name="prv_query_pressure",
-        display_name="查询进出口压力",
-        description=(
-            "查询调压站进出口压力，返回平台配置的限值上下限与超限状态。"
-            "数值与单位按平台原样透传，不换算。"
-        ),
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_cutoff_valve_status",
-        display_name="查询切断阀状态",
-        description="查询切断阀状态，区分主路（1#）与备路（2#）。",
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_relief_valve",
-        display_name="查询放散阀状态",
-        description="查询放散阀报警通道状态与放散总累积流量（m³）。",
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_io_alarms",
-        display_name="查询 IO 报警通道",
-        description=(
-            "查询平台实际暴露的 IO/报警通道（门禁、放散阀 1/2、切断阀主/备路），不做虚构补齐。"
-        ),
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_query_alarms",
-        display_name="查询报警记录",
-        description=(
-            "分页查询报警记录：scope=unconfirmed 查未确认报警，"
-            "confirmed 查已确认归档，diff 查差压报警归档（不支持时间范围）。"
-        ),
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_relief_samples",
-        display_name="查询放散采样明细",
-        description="分页查询两路放散字段的历史采样记录。",
-        risk_level=RiskLevel.READ,
-        timeout_seconds=90,
-    ),
-    McpToolSpec(
-        local_name="prv_relief_report",
-        display_name="查询放散量报表",
-        description="查询放散量历史报表，period 取 daily（日）或 monthly（月）。",
-        risk_level=RiskLevel.READ,
-        timeout_seconds=90,
-    ),
-    # 下面三个导出类工具定成 normal 而不是 write：
-    # 它们读的是站点数据，副作用仅是「在 MCP 服务端留下一个导出文件」，
-    # 不改变站点配置、不下发指令。用户查一次趋势要等审批，成本远大于风险。
-    # 定成 write 也没用——网关对 write 及以上会强制走审批。
-    McpToolSpec(
-        local_name="prv_pressure_trend",
-        display_name="查询压力趋势曲线",
-        description=("查询测点历史趋势曲线。远端会在服务端生成并返回 CSV 内容，不修改站点配置。"),
-        risk_level=RiskLevel.NORMAL,
-        timeout_seconds=180,
-        success_message="趋势曲线已取回。",
-    ),
-    McpToolSpec(
-        local_name="prv_export_records",
-        display_name="导出站点记录",
-        description=(
-            "把报警明细或放散采样明细分批导出为 CSV（UTF-8 BOM）。"
-            "只在 MCP 服务端产生导出文件，不修改站点配置。"
-        ),
-        risk_level=RiskLevel.NORMAL,
-        timeout_seconds=180,
-        success_message="记录导出完成。",
-    ),
-    McpToolSpec(
-        local_name="prv_download_report_pdf",
-        display_name="下载放散报表 PDF",
-        description="把放散报表 PDF 下载到 MCP 服务端本地目录，不修改站点配置。",
-        risk_level=RiskLevel.NORMAL,
-        timeout_seconds=120,
-        success_message="报表已下载到 MCP 服务端。",
-    ),
-    McpToolSpec(
-        local_name="prv_control_config",
-        display_name="查询控制配置",
-        description="查询运行模式、压力档位、曲线压力限值与指定星期的时段表。",
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_prepare_station_control",
-        display_name="生成调压控制预览",
-        description=(
-            "生成一次控制预览，只做条件检查与预演，**不向设备下发任何指令**。"
-            "返回的 preview_id 有效期为 5 分钟。"
-        ),
-        risk_level=RiskLevel.READ,
-    ),
-    McpToolSpec(
-        local_name="prv_cancel_station_control",
-        display_name="作废控制预览",
-        description="作废一张尚未提交的本地预览（用户拒绝或改变主意时使用）。",
-        risk_level=RiskLevel.READ,
-        timeout_seconds=30,
-    ),
-    McpToolSpec(
-        local_name="prv_station_command",
-        display_name="查询控制命令记录",
-        description="按编号查询一条控制命令的本地记录：创建/提交时间、动作、每步平台返回与状态。",
-        risk_level=RiskLevel.READ,
-        timeout_seconds=30,
-    ),
-    McpToolSpec(
-        local_name="prv_list_commands",
-        display_name="列出站点控制命令",
-        description="列出指定站点最近的控制命令（最多 10 条，按创建时间倒序）。",
-        risk_level=RiskLevel.READ,
-        timeout_seconds=30,
-    ),
-    McpToolSpec(
-        local_name="prv_apply_station_control",
-        display_name="下发调压控制指令",
-        description=(
-            "向调压站下发控制指令（修改压力档位或运行模式），属于外部写入。"
-            "内部先做服务端预演再提交；预演不通过时不会下发。"
-            "调用前应先用 prv_station_capabilities 核对该站点是否支持该动作。"
-        ),
-        risk_level=RiskLevel.EXTERNAL,
-        requires_approval=True,
-        timeout_seconds=120,
-    ),
-)
+# 代码白名单当前为空（2026-11-19 起）。
+#
+# 这里原本登记 21 个 `prv_*`：远端 22 个工具里挑 20 个直接透传，外加一个
+# `prv_apply_station_control` 把 prepare 与 execute 串成一步——execute 需要的
+# preview_id 只有 5 分钟有效期，拆成两个工具交给模型保管，跨轮次必然丢。
+#
+# 这批工具已由 FioCloud 连接器整体替代：`fc_liststations` / `fc_querypressure` /
+# `fc_preparestationcontrol` + `fc_executestationcontrol` 等，登记在
+# `mcp_registered_tools`，不在这里。远端能力逐条对得上，唯一差异是控制下发
+# 从「一步」变回「两步」——先 prepare 拿 preview_id，再 execute 提交。
+#
+# 保留空元组而不是删掉变量：白名单机制仍在用——`code_local_names()` 决定
+# 「哪些名字不许被控制台配置覆盖」，注册流程按它比对。以后要再往代码里登记
+# 工具，往这里加一条即可，其它路径不用动。
+MCP_TOOL_SPECS: tuple[McpToolSpec, ...] = ()
 
-
-# 本地工具名 → 远端工具名。组合型工具没有远端同名对应，单独处理。
-_REMOTE_BY_LOCAL: dict[str, str] = {
-    "prv_server_status": "getServerStatus",
-    "prv_list_stations": "listStations",
-    "prv_station_profile": "getStationProfile",
-    "prv_station_capabilities": "getStationCapabilities",
-    "prv_station_overview": "getStationOverview",
-    "prv_query_pressure": "queryPressure",
-    "prv_cutoff_valve_status": "getCutoffValveStatus",
-    "prv_relief_valve": "queryReliefValve",
-    "prv_io_alarms": "queryIOAlarms",
-    "prv_query_alarms": "queryAlarms",
-    "prv_relief_samples": "queryReliefSamples",
-    "prv_relief_report": "queryReliefReport",
-    "prv_pressure_trend": "queryPressureTrend",
-    "prv_export_records": "exportStationRecords",
-    "prv_download_report_pdf": "downloadReportPdf",
-    "prv_control_config": "getControlConfig",
-    "prv_prepare_station_control": "prepareStationControl",
-    "prv_cancel_station_control": "cancelStationControl",
-    "prv_station_command": "getStationCommand",
-    "prv_list_commands": "listStationCommands",
-}
-
-APPLY_TOOL_NAME = "prv_apply_station_control"
-_APPLY_PREPARE_REMOTE = "prepareStationControl"
-_APPLY_EXECUTE_REMOTE = "executeStationControl"
+# 本地工具名 → 远端工具名。白名单为空时这张表也空；
+# 管理员接入的工具把远端名直接带在 spec 上，不查这里。
+_REMOTE_BY_LOCAL: dict[str, str] = {}
 
 # 远端返回里判定「这是演示数据」的标记。演示数据不能被当作已核验的真实结果。
 _DEMO_SOURCES = frozenset({"mock", "demo", "simulated"})
 
 # 远端用 pydantic 生成 schema，参数只有 title 没有 description，模型只能靠猜。
 # 这几个参数猜错的代价很高（控制动作填错就是误操作），所以在这里补中文说明。
+#
+# 键是**本地**工具名：FioCloud 连接器接入的 `fc_*` 也走 `_build_definition`，
+# 所以这批说明现在挂在 fc_ 上。prv_ 那套下线时一起迁过来——不迁就等于
+# 删掉写工具的安全说明，「action 只能取这几个值」再没有地方告诉模型。
 _STATION_HINT = (
     "调压站标识：可用站名、通信序列号或设备主键。"
-    "不确定时先调 prv_list_stations 取准确值；留空则由服务端使用默认站点。"
+    "不确定时先调 fc_liststations 取准确值；留空则由服务端使用默认站点。"
+)
+
+_ACTION_HINT = (
+    "控制动作，只能取以下值："
+    "close_main（关闭 1# 主路切断阀）、close_backup（关闭 2# 备用切断阀）、"
+    "high_pressure（切到高压档）、low_pressure（切到低压档）、"
+    "set_schedule（整体覆盖指定星期的时段表，需同时给 weekday 与 schedule）。"
+    "peak_mode、valley_mode、set_pressure 当前未开放，填了会被拒绝。"
 )
 
 _SCHEMA_HINTS: dict[str, dict[str, str]] = {
-    "prv_apply_station_control": {
+    "fc_preparestationcontrol": {
         "station": _STATION_HINT,
         "action": (
-            "控制动作，只能取以下值："
-            "close_main（关闭 1# 主路切断阀）、close_backup（关闭 2# 备用切断阀）、"
-            "high_pressure（切到高压档）、low_pressure（切到低压档）、"
-            "set_schedule（整体覆盖指定星期的时段表，需同时给 weekday 与 schedule）。"
-            "peak_mode、valley_mode、set_pressure 当前未开放，填了会被拒绝。"
+            _ACTION_HINT + "返回值里 confirmation_can_execute 为 false 时表示条件不满足，"
+            "blockers 会说明原因，此时不要继续调 fc_executestationcontrol。"
         ),
         "weekday": "星期，1=周一 … 7=周日，仅 set_schedule 需要。",
         "schedule": (
@@ -333,28 +149,26 @@ _SCHEMA_HINTS: dict[str, dict[str, str]] = {
             "不接受空表（不允许用空表清空原表）。"
         ),
     },
-    "prv_prepare_station_control": {
-        "station": _STATION_HINT,
-        "action": (
-            "控制动作，只能取以下值：close_main / close_backup / high_pressure / "
-            "low_pressure / set_schedule。返回值里 confirmation_can_execute 为 false 时"
-            "表示条件不满足，blockers 会说明原因。"
-        ),
-        "weekday": "星期，1=周一 … 7=周日，仅 set_schedule 需要。",
-        "schedule": "时段表，仅 set_schedule 需要，格式见动作说明。",
-    },
-    "prv_cancel_station_control": {
+    "fc_executestationcontrol": {
         "preview_id": (
-            "要作废的预览编号，必须原样取自 prv_prepare_station_control 返回的 preview_id，"
+            "预览编号，必须原样取自 fc_preparestationcontrol 返回的 preview_id，"
+            "不要自行构造；有效期 5 分钟，过期会被拒绝。"
+        ),
+        "station": _STATION_HINT + "必须与 prepare 时的取值一致。",
+        "action": _ACTION_HINT + "必须与 prepare 时的取值一致，否则远端返回 PREVIEW_MISMATCH。",
+    },
+    "fc_cancelstationcontrol": {
+        "preview_id": (
+            "要作废的预览编号，必须原样取自 fc_preparestationcontrol 返回的 preview_id，"
             "不要自行构造。"
         ),
     },
-    "prv_station_command": {
+    "fc_getstationcommand": {
         "command_id": (
-            "控制命令编号，来自控制下发结果或 prv_list_commands 的返回，不要自行编造。"
+            "控制命令编号，来自控制下发结果或 fc_liststationcommands 的返回，不要自行编造。"
         ),
     },
-    "prv_query_alarms": {
+    "fc_queryalarms": {
         "station": _STATION_HINT,
         "scope": (
             "unconfirmed=未确认的基础报警；confirmed=已确认的报警归档；"
@@ -366,19 +180,19 @@ _SCHEMA_HINTS: dict[str, dict[str, str]] = {
         "start_page": "起始页码，续查时用返回 pagination.next_query 里的值。",
         "max_pages": "最多取几页，用于控制单次返回体积。",
     },
-    "prv_relief_samples": {
+    "fc_queryreliefsamples": {
         "station": _STATION_HINT,
         "start": "起始时间，北京时间，格式 yyyy-MM-dd HH:mm:ss。",
         "end": "结束时间，北京时间，格式 yyyy-MM-dd HH:mm:ss。",
         "start_page": "起始页码，续查时用返回 pagination.next_query 里的值。",
         "max_pages": "最多取几页。",
     },
-    "prv_relief_report": {
+    "fc_queryreliefreport": {
         "station": _STATION_HINT,
         "period": "daily=日报（period_value 传 yyyy-MM）；monthly=月报（period_value 传 yyyy）。",
         "period_value": "统计周期值，格式取决于 period；留空取当前月／当前年。",
     },
-    "prv_export_records": {
+    "fc_exportstationrecords": {
         "station": _STATION_HINT,
         "record_type": "alarms=报警明细；relief=放散采样明细。",
         "start": "起始时间，北京时间，格式 yyyy-MM-dd HH:mm:ss。",
@@ -387,10 +201,10 @@ _SCHEMA_HINTS: dict[str, dict[str, str]] = {
         "max_pages": "最多导出几页，默认 100；总量大时先用较小的值试一次。",
     },
     # 这个参数填错的代价最高：远端只认它自己生成的路径，自行拼出来的会直接失败。
-    "prv_download_report_pdf": {
+    "fc_downloadreportpdf": {
         "station": _STATION_HINT,
         "report_path": (
-            "报表路径，必须**原样**取自 prv_relief_report 返回的 report_path，"
+            "报表路径，必须**原样**取自 fc_queryreliefreport 返回的 report_path，"
             "不要自行拼接服务器路径。"
         ),
         "file_name": (
@@ -398,17 +212,17 @@ _SCHEMA_HINTS: dict[str, dict[str, str]] = {
             "注意文件落在 MCP 服务端，不在用户本机。"
         ),
     },
-    "prv_control_config": {
+    "fc_getcontrolconfig": {
         "station": _STATION_HINT,
         "weekday": "要读取时段表的星期，1=周一 … 7=周日；留 0 或省略按北京时间当天。",
     },
-    "prv_list_stations": {
+    "fc_liststations": {
         "query": "可选子串筛选，匹配站名或通信序列号，不区分大小写。",
     },
-    "prv_list_commands": {
+    "fc_liststationcommands": {
         "station": _STATION_HINT,
     },
-    "prv_pressure_trend": {
+    "fc_querypressuretrend": {
         "station": _STATION_HINT,
         "accesses": (
             "测点通道代码数组（如 [\"CH1\",\"CH2\"]），最多 3 个；"
@@ -428,7 +242,7 @@ def _apply_schema_hints(schema: dict[str, Any], *, local_name: str) -> dict[str,
     在远端 schema 上补参数说明，并禁止未声明参数。
 
     远端每次只给类型不给语义，模型把 action 填成「关闭主路」这种自然语言
-    是最常见的失败方式。补一层描述比在提示词里解释 21 个工具便宜得多。
+    是最常见的失败方式。补一层描述比在提示词里逐个解释工具便宜得多。
     """
     patched = copy.deepcopy(schema)
 
@@ -590,7 +404,10 @@ def _empty_message(payload: dict[str, Any], *, tool_name: str | None) -> str:
     「已完成」，模型和用户都会把它读成「站点全离线」或「服务异常」，
     而真实原因是权限边界。
     """
-    if tool_name == "prv_list_stations":
+    # 站点目录空返回的两种含义相差很远：权限边界 vs 真的没有站点。
+    # 两个名字都认：fc_liststations 是现在走的那条，prv_ 是历史会话里的名字
+    # （结果渲染会把它带回来），不认它就会把「无授权站点」说成「无记录」。
+    if tool_name in {"fc_liststations", "prv_list_stations"}:
         total = payload.get("total_authorized")
         visible = payload.get("visible_to_identity")
 
@@ -720,96 +537,6 @@ def _make_passthrough_handler(spec: McpToolSpec, remote_name: str):  # noqa: ANN
     return handler
 
 
-def _make_apply_handler(spec: McpToolSpec):  # noqa: ANN202
-    """
-    控制下发：审批通过后，先远端预演再提交。
-
-    之所以把 prepare 与 execute 合成一个本地工具：
-    execute 需要的 preview_id 由 prepare 产生，有效期只有 5 分钟。
-    若拆成两个工具交给模型保管，跨轮次很容易超时或张冠李戴，
-    而审批流程本身可能停顿几分钟。合成之后，preview 只在审批通过后的
-    这一瞬间存在，不存在「审批单指向一个过期预览」的窗口。
-    """
-
-    async def handler(
-        context: ToolExecutionContext,
-        arguments: dict[str, Any],
-    ) -> ToolExecutionResult:
-        try:
-            client = _client_for(
-                context, call_timeout=float(spec.timeout_seconds), spec=spec
-            )
-
-            prepare_args = {
-                key: value
-                for key, value in arguments.items()
-                if value is not None and value != "" and value != []
-            }
-
-            prepared = await client.call_tool(
-                remote_tool_name=_APPLY_PREPARE_REMOTE,
-                arguments=prepare_args,
-            )
-
-            if not prepared.get("success", False):
-                return _to_result(prepared, message_prefix="控制预演未通过，未下发任何指令。")
-
-            # prepare 只要参数合法就会 success=true，真正能不能执行看这个字段。
-            # 条件不满足时（写开关关闭、动作不在白名单、回路未启用）绝不能继续调
-            # execute —— 那不是「试一下」，而是拿审批通过当条件满足。
-            if not prepared.get("confirmation_can_execute", False):
-                blockers = prepared.get("blockers") or []
-                reason = "；".join(str(item) for item in blockers) or "远端未说明原因。"
-                return ToolExecutionResult(
-                    success=False,
-                    result=prepared,
-                    message=f"控制预演未通过，未下发任何指令。原因：{reason}",
-                    error_code="MCP_PRECONDITION_FAILED",
-                )
-
-            preview_id = prepared.get("preview_id")
-
-            if not preview_id:
-                return ToolExecutionResult(
-                    success=False,
-                    result=prepared,
-                    message="远端没有返回预览编号，为避免误下发已中止。",
-                    error_code="MCP_PREVIEW_MISSING",
-                )
-
-            execute_args: dict[str, Any] = {
-                "preview_id": str(preview_id),
-                "confirm": True,
-            }
-            # 远端的 execute 会拿这两个字段与预览记录比对，传原值即可；
-            # 不一致时远端返回 PREVIEW_MISMATCH，不会写设备。
-            for key in ("station", "action"):
-                if arguments.get(key):
-                    execute_args[key] = arguments[key]
-
-            executed = await client.call_tool(
-                remote_tool_name=_APPLY_EXECUTE_REMOTE,
-                arguments=execute_args,
-            )
-        except (McpError, McpCredentialMissingError) as exc:
-            logger.warning(
-                "MCP 控制下发失败。",
-                extra={
-                    "event": "mcp_tool_failed",
-                    "tool_name": spec.local_name,
-                    "error_code": getattr(exc, "code", "MCP_CREDENTIAL_MISSING"),
-                    "tenant_id": context.tenant_id,
-                },
-            )
-            return _failure(exc)
-
-        # 把预演阶段看到的条件一起带回，便于用户判断「为什么快照与刚才不同」。
-        merged = dict(executed)
-        merged.setdefault("preview", prepared.get("preview") or prepared.get("plan"))
-
-        return _to_result(merged, message_prefix="控制指令已提交。")
-
-    return handler
 
 
 def _build_definition(
@@ -817,17 +544,12 @@ def _build_definition(
     *,
     descriptor: McpToolDescriptor | None,
 ) -> ToolDefinition:
-    if spec.local_name == APPLY_TOOL_NAME:
-        # 组合工具的入参与远端 prepare 完全相同。
-        remote_name = _APPLY_PREPARE_REMOTE
-        handler = _make_apply_handler(spec)
-    else:
-        # 代码登记的工具靠 _REMOTE_BY_LOCAL 查远端名；管理员接入的工具
-        # 把远端名直接带在 spec 上（这条表外的映射只有它自己知道）。
-        remote_name = spec.remote_name or _REMOTE_BY_LOCAL.get(spec.local_name)
-        if not remote_name:
-            raise ValueError(f"工具 {spec.local_name} 没有登记远端工具名。")
-        handler = _make_passthrough_handler(spec, remote_name)
+    # 代码登记的工具靠 _REMOTE_BY_LOCAL 查远端名；管理员接入的工具
+    # 把远端名直接带在 spec 上（这条表外的映射只有它自己知道）。
+    remote_name = spec.remote_name or _REMOTE_BY_LOCAL.get(spec.local_name)
+    if not remote_name:
+        raise ValueError(f"工具 {spec.local_name} 没有登记远端工具名。")
+    handler = _make_passthrough_handler(spec, remote_name)
 
     schema = (
         descriptor.input_schema
@@ -958,21 +680,23 @@ async def register_mcp_tools(
         )
         return 0
 
-    try:
-        default_by_name = await fetch_remote_tools()
-    except (McpError, McpConfigError) as exc:
-        logger.warning(
-            "拉取 MCP 工具清单失败，本次不注册 MCP 工具。",
-            extra={"event": "mcp_list_tools_failed", "error_code": getattr(exc, "code", "")},
-            exc_info=True,
-        )
-        return 0
+    # 端点 → 远端清单。默认端点只在真有代码登记的工具时才拉：白名单为空时
+    # （现在就是）为它发一次请求，只会在对端不可达时每天刷一条告警。
+    by_server: dict[str, dict[str, McpToolDescriptor]] = {}
+    default_by_name: dict[str, McpToolDescriptor] = {}
 
-    # 端点 → 远端清单。默认端点已经拿到了，其它端点按接入项登记的地址再拉一次；
-    # 某个端点连不上只影响它自己的工具，不该把默认端点的一起拖下水。
-    by_server: dict[str, dict[str, McpToolDescriptor]] = {
-        endpoint_key(settings.mcp_server_url): default_by_name
-    }
+    if MCP_TOOL_SPECS:
+        try:
+            default_by_name = await fetch_remote_tools()
+        except (McpError, McpConfigError) as exc:
+            logger.warning(
+                "拉取 MCP 工具清单失败，本次不注册代码白名单里的工具。",
+                extra={"event": "mcp_list_tools_failed", "error_code": getattr(exc, "code", "")},
+                exc_info=True,
+            )
+            default_by_name = {}
+        else:
+            by_server[endpoint_key(settings.mcp_server_url)] = default_by_name
 
     async def descriptors_for(spec: McpToolSpec) -> dict[str, McpToolDescriptor]:
         endpoint = _endpoint_of(spec)
@@ -1000,11 +724,7 @@ async def register_mcp_tools(
     missing: list[str] = []
 
     for spec in MCP_TOOL_SPECS:
-        remote_name = (
-            _APPLY_PREPARE_REMOTE
-            if spec.local_name == APPLY_TOOL_NAME
-            else _REMOTE_BY_LOCAL.get(spec.local_name)
-        )
+        remote_name = spec.remote_name or _REMOTE_BY_LOCAL.get(spec.local_name)
 
         descriptor = default_by_name.get(remote_name) if remote_name else None
 

@@ -1,7 +1,7 @@
 # app/tools/builtins/delegate_tools.py
 """把一件事交给另一个智能体（A2A handoff）——模型侧的入口。
 
-规则见 `docs/A2A.md`，数据面见 `docs/AGENT_CONNECT.md`。三句话概括：
+规则见 `docs/A2A.md`。三句话概括：
 
 1. **单调收窄**：被委派方的边界必须是委派方的子集。判定只做一件事——禁止变宽；
 2. **不同步继承上下文**：只传 `task`（和 A 判断必要的 `context`），不传原始消息、

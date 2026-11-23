@@ -314,3 +314,105 @@ async def test_detail_returns_context_summaries(
     assert only["summary"].startswith("【当前目标】")
     assert only["tokens_before"] == 800
     assert only["tokens_after"] == 120
+
+
+async def test_workflow_card_and_conclusion_both_carry_the_graph(
+    client, session, seeded_identity, planner
+):
+    """图要跟着审批单和结论各留一份，两条路都能单独还原。
+
+    线上出现过的形状：卡片只有一行「新建或修改编排流程」+ 一份折叠的 definition，
+    用户扫一眼就点了确认——而那张图有分叉，文字里只体现为一个分号。图随
+    `preview` 落进审批单（刷新后取得到），结论那条消息另存一份 `metadata.graph`
+    （确认完卡片变成「已处理」，人这时候核对的正是结论那段）。
+    """
+    from app.models.agent import Agent, AgentStatus
+
+    session.add(
+        Agent(
+            tenant_id="default",
+            name="ops",
+            display_name="运行值班",
+            status=AgentStatus.ACTIVE,
+        )
+    )
+    await session.commit()
+
+    await _grant(session, "agent:write")
+    # 构建助手是首次访问惰性创建的：不先读一次列表，chat 会因为「智能体不存在」被拒。
+    await client.get("/api/v1/agents")
+
+    definition = {
+        "entry": "check",
+        "nodes": [
+            {
+                "id": "check",
+                "agent": "ops",
+                "task": "查告警",
+                "emit": {"field": "level", "values": ["严重", "无"]},
+                "next": [
+                    {"when": {"key": "level", "op": "eq", "value": "严重"}, "to": "act"},
+                    {"when": None, "to": "report"},
+                ],
+            },
+            {"id": "act", "agent": "ops", "task": "处置", "next": [{"when": None, "to": "report"}]},
+            {"id": "report", "kind": "compose", "task": "日报", "next": []},
+        ],
+    }
+
+    planner(
+        [
+            ActionPlan(
+                action="write_tool",
+                tool_name="studio_workflow_save",
+                arguments={
+                    "mode": "create",
+                    "name": "graph-check",
+                    "display_name": "分级处置",
+                    "definition": definition,
+                },
+                reason="用户描述了有先后顺序与分流的处置过程。",
+            )
+        ]
+    )
+
+    response = await client.post(
+        "/api/v1/chat",
+        json={
+            "thread_id": "conv-graph-card",
+            "message": "建一个分级处置流程",
+            "agent": "studio",
+        },
+    )
+    body = response.json()
+    assert body.get("status") == "awaiting_approval", body
+
+    graph = body["approval"]["preview"]["graph"]
+    assert [node["id"] for node in graph["nodes"]] == ["check", "act", "report"]
+    # 兜底边必须在：缺了它，图上看着像「没有分流」。
+    assert any(edge["when"] is None and edge["to"] == "report" for edge in graph["edges"])
+
+    confirmed = await client.post(
+        f"/api/v1/approvals/{body['approval']['approval_id']}/confirm", json={}
+    )
+    assert confirmed.status_code == 200
+
+    item = await _find(client, "conv-graph-card")
+    detail = (await client.get(f"{BASE}/{item['id']}")).json()
+    last = detail["messages"][-1]
+    assert last["metadata"]["approval_action"] == "confirm"
+    assert [node["id"] for node in last["metadata"]["graph"]["nodes"]] == [
+        "check",
+        "act",
+        "report",
+    ]
+
+    # 收尾：这条用例真的建了一张流程和一个智能体，别的用例按条数断言时会撞上
+    # （观测拓扑那边就有 `workflow_count == 1`）。
+    from app.models.workflow import Workflow
+
+    for row in (await session.scalars(select(Workflow).where(Workflow.name == "graph-check"))):
+        await session.delete(row)
+    for row in (await session.scalars(select(Agent).where(Agent.name == "ops"))):
+        await session.delete(row)
+    await session.commit()

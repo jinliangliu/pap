@@ -26,11 +26,20 @@
 
 ## 2. 本地映射
 
-远端 22 个工具，代码白名单暴露 **21** 个。全部带 `prv_` 前缀，避免与本地工具重名。
+远端 22 个工具，**代码白名单当前为空**（`MCP_TOOL_SPECS = ()`）。
+
+2026-11-19 起，原本登记在代码里的 21 个 `prv_*` 整体下线，改由 **FioCloud
+连接器**接入为 `fc_*`：同一个下游系统，20 个直接透传工具逐条对得上
+（`prv_query_pressure` → `fc_querypressure`、`prv_list_stations` →
+`fc_liststations`、`prv_export_records` → `fc_exportstationrecords` …），
+差别只有控制下发从「一步」回到「两步」，见 §3。
+
+白名单机制本身保留——`code_local_names()` 仍决定「哪些名字不许被控制台配置
+覆盖」。以后要再往代码里登记工具，往 `MCP_TOOL_SPECS` 加一条即可。
 
 白名单有两个来源，代码优先：
 
-1. `app/tools/mcp_tools.py` 里的 `MCP_TOOL_SPECS`（下表）——带审批语义，
+1. `app/tools/mcp_tools.py` 里的 `MCP_TOOL_SPECS`（现为空）——带审批语义，
    不允许被配置覆盖，也不能在控制台取消；
 2. **控制台接入**（2026-11-05 起）：管理员在「工具 → MCP Tool → 发现」里
    对未接入的远端工具点「接入」，填本地名、中文说明与风险等级，
@@ -70,67 +79,80 @@
 > 连接器是那层的上一层：工具只记 `connector_id`，端点和凭据都由连接器提供。
 > 两者不要混用——一条记录如果挂了连接器，行上的 `server_url` / `token` 会被忽略。
 
+**工具详情里的「令牌来源」有四种**（后端 `token_source_of`，前端 `tokenCell`）：
 
-| 本地工具 | 远端工具 | 风险 | 审批 |
-|---|---|---|---|
-| `prv_server_status` | getServerStatus | read | |
-| `prv_list_stations` | listStations | read | |
-| `prv_station_profile` | getStationProfile | read | |
-| `prv_station_capabilities` | getStationCapabilities | read | |
-| `prv_station_overview` | getStationOverview | read | |
-| `prv_query_pressure` | queryPressure | read | |
-| `prv_cutoff_valve_status` | getCutoffValveStatus | read | |
-| `prv_relief_valve` | queryReliefValve | read | |
-| `prv_io_alarms` | queryIOAlarms | read | |
-| `prv_query_alarms` | queryAlarms | read | |
-| `prv_relief_samples` | queryReliefSamples | read | |
-| `prv_relief_report` | queryReliefReport | read | |
-| `prv_control_config` | getControlConfig | read | |
-| `prv_prepare_station_control` | prepareStationControl | read | |
-| `prv_cancel_station_control` | cancelStationControl | read | |
-| `prv_station_command` | getStationCommand | read | |
-| `prv_list_commands` | listStationCommands | read | |
-| `prv_pressure_trend` | queryPressureTrend | normal | |
-| `prv_export_records` | exportStationRecords | normal | |
-| `prv_download_report_pdf` | downloadReportPdf | normal | |
-| `prv_apply_station_control` | prepare + execute | external | ✓ |
+| `token_source` | 含义 | 界面写法 |
+|---|---|---|
+| `connector` | 端点与凭据都由连接器接管，行上永远没有令牌 | 「由连接器「prv」提供」+ 本租户已配置 / 未配置凭据 |
+| `row` | 这条接入项自带令牌（v1 的外部端点） | 已配置（仅该端点） |
+| `env` | 没自带，运行时按租户取 `.env` 的 MCP 令牌 | 未自带，沿用 `.env` 的 MCP 令牌 |
+| `none` | 其它端点且没令牌 = 这个端点不鉴权 | 该端点不带鉴权 |
 
-**只有真实下发（`prv_apply_station_control`）需要审批。** 三个导出类工具
-（趋势 CSV、记录导出、放散报表 PDF）确实会在 MCP 容器里落文件
-（`trends/`、`exports/`、`reports/`），但它们读的是站点数据、不改变站点
-配置也不下发指令，把「查一次趋势」做成要走审批，成本远大于风险，因此
-定为 `normal`。
+为什么不再是「未配置」一句话：`connector` 那一行的 `token_set` 必然是 `false`
+（`row_to_spec` 里直接置 None），写成「未配置」既把设计说成故障，又和「连接器
+停用 / 本租户没配凭据」混成同一句话——后者是真的调不通。凭据状态按**调用方
+所在租户**算，与连接器列表页的 `credential_set` 同一口径。
 
-需要注意 `risk_level` 是判定的唯一开关：网关对 `write` 及以上会**无条件**
-强制审批（`ToolGateway.requires_approval`），所以只把 `requires_approval`
-改成 `False` 是没用的，必须同时降到 `normal`。
 
-代价是这些导出文件会持续堆积，目前没有自动清理。文件都在 MCP 容器的
-数据卷里，需要时按 `docs/MONITORING.md` 的磁盘检查项观察增长。
+当前的 `fc_*` 清单以控制台「工具 → MCP Tool」为准（`mcp_registered_tools` 表）。
+风险级是接入时填的，不是平台默认值。
 
-**刻意不暴露**：
+**写操作一律走审批。** 网关对 `write` 及以上会**无条件**强制审批
+（`ToolGateway.requires_approval`），`risk_level` 是唯一开关：只把
+`requires_approval` 改成 `false` 没有用，必须同时把风险级降到 `read`。
+
+FioCloud 接入时 22 个 `fc_*` 全部填了 `write`——当时连接器「发现工具」只有一个
+整批档位，一次接进二十几个，人只会填一个保守值。结果是连查询也出审批单：
+「现在压力多少」都要点确认，平台等于不可用。2026-11-19 已按用途分档：
+
+> 弹窗后来改成了**逐行一个下拉**（初值按工具名推断，另留「批量设为」把值刷进
+> 未接入的行），所以下一次接入不必再走「整批 write → 事后逐个 PATCH」这条路。
+
+| 档位 | 数量 | 工具 |
+|---|---|---|
+| `read` | 16 | 所有 `fc_get*` / `fc_list*` / `fc_query*`（纯查询，不落文件、不动设备） |
+| `normal` | 4 | `fc_downloadreportpdf`、`fc_exportstationrecords`（容器里落文件）、`fc_preparestationcontrol`、`fc_cancelstationcontrol`（占用/作废一条只活 300 秒的预览） |
+| `write` | 1 | `fc_executestationcontrol`（真正下发指令，必须审批） |
+
+按工具逐个定，不要图省事整批改：`normal` 与 `write` 那 5 条降下去就再也拦不住了。
+
+**改风险级的入口**：`PATCH /api/v1/admin/mcp/tools/{local_name}`，body 可带
+`risk_level` / `display_name` / `description` / `timeout_seconds`。落库、写审计
+（before/after）、并**同步注册表里的那份定义**——审批由风险级推导，只改库会导致
+界面写「读取」而实际照样弹审批单。同步时连 `requires_approval` 一起改：
+它是「风险级 + 显式声明」的或，只换 `risk_level` 会被旧的 `True` 顶回来。
+
+接口不提供 `enabled`：启停要配 register/unregister，一半改库一半改注册表，
+最容易出现「库里启用、网关照旧没有」。停用走取消接入。
+
+**仍然不该接入的**：
 
 - `setScenario` —— 只在 `PRV_DEMO_MODE=1` 的演示部署生效，切完会把后续查询
-  变成假数据。生产环境暴露它，等于给模型一个「把真实数据换成演示数据」的开关。
-- `executeStationControl` —— 它需要的 `preview_id` 由 `prepareStationControl`
-  产生且只活 5 分钟。拆成两个工具交给模型保管，跨轮次极易超时或张冠李戴。
-  改为由 `prv_apply_station_control` 在审批通过后内部串联，见下节。
+  变成假数据。prv_ 时代它是刻意不暴露的，FioCloud 接入时被一起接了进来
+  （`fc_setscenario`）。**2026-11-19 已取消接入。** 重新接进来就等于重新给模型
+  一个「把真实数据换成演示数据」的开关。
 
-## 3. 控制下发为什么合成一个工具
+## 3. 控制下发：两步，且必须重新预演
 
-审批流程可能停顿几分钟，而远端预览只活 300 秒。如果让模型先调 prepare 拿到
-`preview_id`、再走审批、再调 execute，就会出现「审批单指向一个已过期预览」的窗口。
+`prv_` 时代把 prepare 与 execute 合成一个工具，理由很实在：审批可能停顿几分钟，
+而远端预览只活 300 秒；合成之后 preview 只在审批通过那一瞬间存在。
 
-合成之后：
+改用 `fc_*` 后组合工具没了，回到远端本来的两步：
 
 ```
-审批通过 → handler 内部 prepare（条件检查，不写设备）
-        → 立即 execute(confirm=true)（300 秒内必然完成）
+fc_preparestationcontrol  → preview_id（300 秒有效）
+fc_executestationcontrol  → 提交，带 preview_id + confirm=true
 ```
 
-prepare 失败就直接返回，**不会调用 execute** —— 这一点有单测覆盖
-（`test_apply_stops_when_prepare_fails`）。远端还会拿 `station` / `action`
-与预览记录比对，不一致返回 `PREVIEW_MISMATCH`，同样不写设备。
+**流程上必须补一件事：用户确认之后要重新 prepare 一次，用新的 preview_id 再
+execute。** 拿预演阶段的 id 去提交，审批一停就过期；即便没过期，远端也会拿
+`station` / `action` 与预览记录比对，不一致返回 `PREVIEW_MISMATCH`，同样不写设备。
+这条约束原本由组合 handler 内部保证，现在写在「切断阀关断」技能的第 5 步里
+（`skills` 表的 `valve-shutdown`）。
+
+参数语义（action 的可选值、schedule 的 15 分钟步长、preview_id 必须原样取自
+prepare 返回值）仍补在 schema 上：`mcp_tools._SCHEMA_HINTS` 的键在 prv_ 下线时
+一起改成了 fc_ 的本地名，这段说明没有丢。
 
 ## 4. 授权边界（容易误解，务必看清）
 
@@ -332,9 +354,14 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 # 平台注册了多少 MCP 工具
 journalctl -u personal-agent-platform -n 200 --no-pager | grep mcp_tools_registered
 
-# 工具是否出现在模型目录
+# 工具是否出现在模型目录，以及各自的审批开关
 curl -s -H 'X-Authenticated-Subject: pap-admin' http://127.0.0.1:8000/api/v1/tools \
-  | python3 -c "import json,sys; print([t['name'] for t in json.load(sys.stdin) if t['name'].startswith('prv_')])"
+  | python3 -c "
+import json,sys
+for t in json.load(sys.stdin):
+    if t['name'].startswith('fc_'):
+        print(t['risk_level'], t['requires_approval'], t['name'])
+"
 ```
 
 常见错误码：
@@ -355,17 +382,21 @@ curl -s -H 'X-Authenticated-Subject: pap-admin' http://127.0.0.1:8000/api/v1/too
 
 ## 8. 联调清单
 
-1. `MCP_ENABLED=true` + 令牌配好后重启，日志应出现 `mcp_tools_registered`，
-   `registered=21`。
-2. `/api/v1/tools` 里出现 21 个 `prv_*`。
-3. `default` 租户问「列出你能看到的调压站」，应返回 10 个真实站名（owner 令牌全站点）。
+1. `MCP_ENABLED=true` + 令牌配好后重启，日志应出现 `mcp_tools_registered`。
+   数量按**当前接入项**算：代码白名单为空的部署，注册的是连接器那批
+   （FioCloud 现在 21 个）。
+2. `/api/v1/tools` 里能看到这批工具（当前是 21 个 `fc_*`），风险级按 §2 那张表，
+   只有 `fc_executestationcontrol` 的 `requires_approval` 为 `true`。
+3. `default` 租户问「列出你能看到的调压站」，应返回全部 10 个站点（owner 令牌覆盖全站点）。
 4. `test` 租户配 `isolated` 令牌后问同一句，应得到「当前身份看不到任何站点」
    并说明是空白名单——**不是** `MCP_CREDENTIAL_MISSING`，更不能拿到 default 的 10 个站。
    两种隔离形态要分清：没配令牌是「拒绝」，配了空白名单是「空结果」。
-5. 发起控制下发，应先进审批。确认后分三种结果：
-   - 对端 `write_scope=none` → 「控制预演未通过，未下发任何指令」；
-   - 动作不在 `allowed_actions` → 同样中止，`blockers` 说明是哪个门没开；
-   - 两道门都放行 → 真正下发，由 handler 内部串联 prepare→execute。
+5. 发起控制下发，应先进审批。确认后按**两步**做，且要重新 prepare：
+   - `fc_preparestationcontrol` 失败 → 「控制预演未通过，未下发任何指令」，
+     不再调 execute；
+   - 预演通过 → 立刻用新的 `preview_id` 调 `fc_executestationcontrol`；
+   - 拿旧的 `preview_id` 会被远端判 `PREVIEW_MISMATCH`（或已过期），同样不写设备。
+   - 对端 `write_scope=none` 时预演就会中止，`blockers` 写明是哪个门没开。
 6. 审批通过后如果对端说不能执行，必须停在 `MCP_PRECONDITION_FAILED`，
    不能再调 `execute`——那是把「审批通过」当成「条件满足」。
 
@@ -378,7 +409,7 @@ curl -s -H 'X-Authenticated-Subject: pap-admin' http://127.0.0.1:8000/api/v1/too
 - 审批取消/过期时不会回调对端的 `cancelStationControl`。孤儿预览在 300 秒后
   自行过期，无副作用；但因为控制下发是「审批后才 prepare」，正常路径不产生预览。
 - MCP 工具的租户策略（`tenant_tool_policies`）与本地工具共用同一张表，
-  可以按租户单独停用某个 `prv_*` 工具。
+  可以按租户单独停用某个 `fc_*` 工具。
 - 控制台接入的工具有几个边界：接入/取消接入不清理 `tenant_tool_policies`
   里按本地名留下的策略行（重新接入同名工具时沿用，是刻意行为）；
   远端工具下线后接入项还在库里，启动时跳过并记 `mcp_tools_missing`，
@@ -416,7 +447,7 @@ ZeroPadding、base64，密钥硬编码在对端 `server.py`），再 `POST {base
 
 ## 10. 与对端版本的关系（2026-11-04）
 
-对端在 `<commit>` 之后加了一层 **HTTP 层鉴权前筛**（`prv_auth.AuthPrefilter`），
+对端在后续一版里加了一层 **HTTP 层鉴权前筛**（`prv_auth.AuthPrefilter`），
 由 `PRV_STRICT_HTTP_AUTH` 控制，默认关闭。它对客户端的要求只有一条，
 但踩不上就会误判：
 

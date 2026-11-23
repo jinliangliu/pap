@@ -111,7 +111,7 @@ async def test_start_row_lands_before_the_turn_finishes(session, monkeypatch):
         ) as trace:
             assert trace is not None
             row = await _wait_trace(trace.trace_id)
-            assert row is not None, "收尾之前库里就该有这一行（RUNTIME_VIEW.md §5.1）"
+            assert row is not None, "收尾之前库里就该有这一行"
             assert row.status == "running"
             assert row.ended_at is None
             assert row.thread_id == "thread-obs-live"

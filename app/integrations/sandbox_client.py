@@ -11,12 +11,19 @@
 协议约定（服务端需实现）：
 
     POST /v1/execute
-        body: {language, code, stdin, timeout_seconds}
+        body: {language, code, stdin, timeout_seconds,
+               policy: {revision, settings}}
         header: Authorization: Bearer <key>, X-Sandbox-Tenant: <tenant>,
-                Idempotency-Key: <key>
+                Idempotency-Key: <key>, X-Policy-Revision: <n>
         200 → 终态结果；202 → {execution_id, status: queued|running}
-    GET /v1/executions/{id}   → 同上，用于轮询
-    GET /v1/health            → 200 表示可用
+     GET /v1/executions/{id}   → 同上，用于轮询
+     GET /v1/health            → 200 表示可用
+
+`policy` 是**自包含**的一份完整策略，不是「你自己去查」的引用：沙箱在执行
+中途不该再问平台一次，否则那次读取与这次提交之间管理员按一下开关，同一次
+执行就跨越了两个策略。响应里的 `policy_revision` 必须原样回显——对不上时
+平台会保留输出但不计入结论（见 `app/tools/sandbox_tools.py`）。老服务端不
+回这个字段不算错：缺字段说明协议还没实现，不是它用了别的版本。
 
 终态 status 取值：succeeded / failed / timeout / cancelled。
 """
@@ -44,6 +51,13 @@ TENANT_HEADER = "X-Sandbox-Tenant"
 # 归属信息：执行记录绑定到具体用户与会话，便于审计与按人排查。
 USER_HEADER = "X-Sandbox-User"
 CONVERSATION_HEADER = "X-Sandbox-Conversation"
+# 策略版本：这次执行是按平台的哪一版运行时配置发起的。
+#
+# 为什么同时放头和 body：头是给网关/代理做路由与日志用的（不必解包），
+# body 里那份是**自包含**的（含完整的生效值），沙箱自身的行为不该依赖
+# 回头再问平台一次——那会让一次执行的中途依赖两次读取，而两次之间
+# 管理员可能已经按了开关。
+POLICY_REVISION_HEADER = "X-Policy-Revision"
 
 # 错误文本上限：服务端可能返回整页 HTML，不能原样塞进日志或用户回答。
 MAX_ERROR_CHARS = 240
@@ -76,6 +90,11 @@ class SandboxResult:
     truncated: bool = False
     # runsc / process：让审计与排障能看出这次执行用的是哪种隔离后端。
     backend: str = "unknown"
+    # 沙箱回报它实际使用的策略版本。None = 没回（老版本服务端）。
+    #
+    # 用 None 而不是 0 表示「没回」：0 是一个合法的 revision（全按 .env），
+    # 与「没告诉我们」混成一个值时，回显校验永远判不出缺失。
+    policy_revision: int | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -132,6 +151,7 @@ class SandboxClient:
         tenant_id: str | None = None,
         user_id: str | None = None,
         conversation_id: str | None = None,
+        policy_revision: int | None = None,
     ) -> dict[str, str]:
         headers = {"Accept": "application/json"}
 
@@ -154,6 +174,9 @@ class SandboxClient:
             # 不应该把同一段代码执行两遍。
             headers["Idempotency-Key"] = idempotency_key
 
+        if policy_revision is not None:
+            headers[POLICY_REVISION_HEADER] = str(policy_revision)
+
         return headers
 
     async def execute(
@@ -167,6 +190,8 @@ class SandboxClient:
         tenant_id: str | None = None,
         user_id: str | None = None,
         conversation_id: str | None = None,
+        policy_revision: int | None = None,
+        policy: dict[str, Any] | None = None,
     ) -> SandboxResult:
         deadline = time.monotonic() + self._timeout
 
@@ -177,12 +202,22 @@ class SandboxClient:
             "timeout_seconds": int(timeout_seconds or self._timeout),
         }
 
+        if policy_revision is not None:
+            # 自包含的一份：沙箱不必回头再问平台「现在是什么策略」。
+            # `settings` 用点分键（与 `platform_settings.key` 一致），
+            # 因为那是唯一稳定的标识，接口字段改名不该让历史快照失效。
+            payload["policy"] = {
+                "revision": int(policy_revision),
+                "settings": dict(policy or {}),
+            }
+
         data = await self._submit(
             payload,
             idempotency_key,
             tenant_id,
             user_id,
             conversation_id,
+            policy_revision,
         )
 
         if data.get("status") not in TERMINAL_STATUSES:
@@ -208,6 +243,7 @@ class SandboxClient:
         tenant_id: str | None,
         user_id: str | None = None,
         conversation_id: str | None = None,
+        policy_revision: int | None = None,
     ) -> dict[str, Any]:
         try:
             response = await self._client.post(
@@ -218,6 +254,7 @@ class SandboxClient:
                     tenant_id,
                     user_id,
                     conversation_id,
+                    policy_revision,
                 ),
             )
         except httpx.TimeoutException as exc:
@@ -317,6 +354,7 @@ class SandboxClient:
             duration_ms=_as_int(data.get("duration_ms")),
             truncated=stdout_cut or stderr_cut,
             backend=str(data.get("backend") or "unknown"),
+            policy_revision=_as_int(data.get("policy_revision")),
         )
 
     async def get_execution(

@@ -98,10 +98,38 @@ def row_to_spec(
     )
 
 
+def token_source_of(
+    row: McpRegisteredTool,
+    *,
+    connector: Connector | None = None,
+) -> str:
+    """这条接入项的令牌从哪来：`connector` / `row` / `env` / `none`。
+
+    经连接器接入的行上 `token` 永远是空的（`row_to_spec` 里直接置 None，
+    端点取 `connectors.base_url`、凭据按租户现取）。只看 `token_set` 就会把
+    「设计如此」显示成「未配置」，而它和「连接器停用 / 本租户没配凭据」
+    长得一模一样——那是真的调不通，两者必须分开。
+
+    独立行（没有连接器）的空令牌还有两种含义，按端点区分：与默认端点相同
+    时运行时按租户取 `.env` 的令牌；其它端点表示这个端点不需要鉴权。
+    """
+    if connector is not None:
+        return "connector"
+    if row.token:
+        return "row"
+    if endpoint_key(row.server_url or settings.mcp_server_url) == endpoint_key(
+        settings.mcp_server_url
+    ):
+        return "env"
+    return "none"
+
+
 def row_to_response(
     row: McpRegisteredTool,
     *,
     gateway: ToolGateway | None = None,
+    connector: Connector | None = None,
+    credential_set: bool | None = None,
 ) -> McpRegisteredToolResponse:
     registered = False
     if gateway is not None and gateway.has_tool(row.local_name):
@@ -122,6 +150,10 @@ def row_to_response(
         # 地址可以给：它出现在 .env 里，不是秘密。令牌只回「有没有」。
         server_url=row.server_url or None,
         token_set=bool(row.token),
+        token_source=token_source_of(row, connector=connector),
+        connector_name=connector.name if connector is not None else None,
+        # 只有连接器接入才有「本租户配没配」这一说；独立行的令牌是平台级的。
+        connector_credential_set=credential_set if connector is not None else None,
         created_by=row.created_by,
         created_at=row.created_at,
     )

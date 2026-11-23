@@ -405,6 +405,60 @@ def test_missing_fallback_is_rejected_at_compile_time():
     assert exc.value.code == "WORKFLOW_NO_FALLBACK"
 
 
+def test_condition_key_must_come_from_some_emit():
+    """条件键没有任何 `emit` 产出 → 保存时就拒。
+
+    `resolve_key` 只在黑板的 `keys` 里找，而 `keys` 全部来自声明过的 `emit`。
+    这类图不会报错：条件永远不成立，每次都走兜底边，看起来「跑通了」。
+    自然语言写图时最容易出的就是这种错（把 level 记成 severity）。
+    """
+    from app.orchestration.definition import DefinitionError
+
+    with pytest.raises(DefinitionError) as exc:
+        compile_definition(
+            {
+                "entry": "a",
+                "nodes": [
+                    {"id": "a", "agent": "ops", "task": "t",
+                     "emit": {"field": "level"},
+                     "next": [
+                         {"when": {"key": "severity", "op": "eq", "value": "高"},
+                          "to": "b"},
+                         {"when": None, "to": "b"},
+                     ]},
+                    {"id": "b", "kind": "compose", "task": "done", "next": []},
+                ],
+            }
+        )
+
+    assert exc.value.code == "WORKFLOW_UNKNOWN_CONDITION_KEY"
+    # 拒绝理由要说出「现在有哪些键可用」，否则只能靠猜。
+    assert "level" in exc.value.message
+    assert exc.value.node == "a"
+
+
+def test_condition_key_may_come_from_a_parallel_branch():
+    """并行分支的 emit 也算来源：它会被并进并行节点的 keys。"""
+    plan = compile_definition(
+        {
+            "entry": "fan",
+            "nodes": [
+                {"id": "fan", "kind": "parallel", "task": "",
+                 "branches": [
+                     {"id": "left", "agent": "ops", "task": "查", "emit": {"field": "hit"}},
+                 ],
+                 "next": [
+                     {"when": {"key": "hit", "op": "eq", "value": "有"}, "to": "b"},
+                     {"when": None, "to": "b"},
+                 ]},
+                {"id": "b", "kind": "compose", "task": "done", "next": []},
+            ],
+        }
+    )
+
+    assert plan.entry == "fan"
+
+
 def test_pick_edge_returns_none_when_no_condition_matches():
     """条件全不命中且没有兜底 → None。
 
@@ -511,6 +565,101 @@ async def test_emit_values_falls_back_to_truncated_text_when_nothing_matches():
     # 兜底边生效：没有走 urgent。
     assert [c[0] for c in recorder.calls] == ["classify"]
     assert outcome.blackboard["classify"]["keys"]["category"] == "无法判断，需要现场确认"
+
+
+def test_condition_value_outside_the_enum_is_rejected():
+    """`emit.values` 是「严重 / 超压」，条件却比较「高危」：这条分支几乎不会命中。
+
+    运行期 `condition_holds` 的 `eq` 是字符串比较，`gt/lt` 还要先 `float()`——
+    转换失败就 `return False`，既不报错也没有日志。分流节点看着在跑，实际每次
+    都走兜底边，直到有人对着运行记录数一遍才发现「分级从来没生效过」。
+    """
+    from app.orchestration.definition import DefinitionError
+
+    with pytest.raises(DefinitionError) as exc:
+        compile_definition(
+            {
+                "entry": "a",
+                "nodes": [
+                    {"id": "a", "agent": "ops", "task": "t",
+                     "emit": {"field": "level", "values": ["严重", "轻微"]},
+                     "next": [
+                         {"when": {"key": "level", "op": "eq", "value": "高危"}, "to": "b"},
+                         {"when": None, "to": "b"},
+                     ]},
+                    {"id": "b", "kind": "compose", "task": "done", "next": []},
+                ],
+            }
+        )
+
+    assert exc.value.code == "WORKFLOW_CONDITION_NEVER_TRUE"
+    # 理由里要说清「能取哪些值」，否则改哪一边只能靠猜。
+    assert "严重" in exc.value.message
+    assert exc.value.node == "a"
+
+
+def test_numeric_comparison_on_a_label_enum_is_rejected():
+    """`level gt 5` 落在「严重 / 轻微」这种枚举上：这是把两套分流方式混用。"""
+    from app.orchestration.definition import DefinitionError
+
+    with pytest.raises(DefinitionError) as exc:
+        compile_definition(
+            {
+                "entry": "a",
+                "nodes": [
+                    {"id": "a", "agent": "ops", "task": "t",
+                     "emit": {"field": "level", "values": ["严重", "轻微"]},
+                     "next": [
+                         {"when": {"key": "level", "op": "gt", "value": 5}, "to": "b"},
+                         {"when": None, "to": "b"},
+                     ]},
+                    {"id": "b", "kind": "compose", "task": "done", "next": []},
+                ],
+            }
+        )
+
+    assert exc.value.code == "WORKFLOW_CONDITION_NEVER_TRUE"
+    assert "gt" in exc.value.message
+
+
+def test_numeric_enum_still_allows_numeric_comparison():
+    """枚举里就是数字（85 / 90）时，`gt` 是合理用法，不能拦。"""
+    plan = compile_definition(
+        {
+            "entry": "a",
+            "nodes": [
+                {"id": "a", "agent": "ops", "task": "t",
+                 "emit": {"field": "score", "values": ["85", "90"]},
+                 "next": [
+                     {"when": {"key": "score", "op": "gt", "value": 88}, "to": "b"},
+                     {"when": None, "to": "b"},
+                 ]},
+                {"id": "b", "kind": "compose", "task": "done", "next": []},
+            ],
+        }
+    )
+
+    assert plan.entry == "a"
+
+
+def test_conditions_on_a_free_text_emit_are_not_checked():
+    """纯截断 / 正则抽出来的键，静态上说不清能取什么值，不能硬判。"""
+    plan = compile_definition(
+        {
+            "entry": "a",
+            "nodes": [
+                {"id": "a", "agent": "ops", "task": "t",
+                 "emit": {"field": "level", "pattern": r"等级[:：](\S+)"},
+                 "next": [
+                     {"when": {"key": "level", "op": "eq", "value": "高危"}, "to": "b"},
+                     {"when": None, "to": "b"},
+                 ]},
+                {"id": "b", "kind": "compose", "task": "done", "next": []},
+            ],
+        }
+    )
+
+    assert plan.entry == "a"
 
 
 def test_emit_values_prefers_the_longer_label_at_the_same_position():

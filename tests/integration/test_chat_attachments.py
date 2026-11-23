@@ -386,7 +386,7 @@ async def test_second_turn_does_not_reuse_previous_ocr_result(
     set_planner_for_tests(planner)
 
     async def fake_ocr(file_path, *, timeout=None):  # noqa: ANN001, ARG001
-        return "调压箱/柜现场记录表 出口压力 2.3kPa 编号 50430371639-100001"
+        return "调压箱/柜现场记录表 出口压力 2.3kPa 编号 00000000000-000001"
 
     monkeypatch.setattr(ocr_tools, "_call_ocr_mcp", fake_ocr)
 

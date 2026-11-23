@@ -88,12 +88,34 @@ class ConversationContextSummary(APIModel):
         return as_utc(value)
 
 
+class ConversationContextCleared(APIModel):
+    """`/clear` 的清空点。
+
+    `through_message_id` 是清空时那条回复的消息 id：前端要「插在它之后」，
+    而消息表没有自增序号，只能靠 id 定位。
+
+    为什么要回给前端：历史确实还在（那是审计），但已经不参与推断了。
+    界面上不标注的话，唯一的解读就是「清空没生效」——用户会再点一次，
+    然后发现还是这样。
+    """
+
+    at: datetime
+    through_message_id: uuid.UUID
+
+    @field_validator("at")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        return as_utc(value)
+
+
 class ConversationDetailResponse(APIModel):
     conversation: ConversationSummary
     messages: list[ConversationMessage] = Field(default_factory=list)
     # 没压过就是空数组，前端据此不插分隔条。默认值必须有：
     # 少数字段让老前端整页报错，比少一条分隔条严重得多。
     summaries: list[ConversationContextSummary] = Field(default_factory=list)
+    # 没清过就是 None。同理，必须给默认值。
+    context_cleared: ConversationContextCleared | None = None
 
 
 class ConversationRenameRequest(APIModel):

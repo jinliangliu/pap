@@ -289,3 +289,84 @@ def test_no_note_when_station_list_is_really_empty() -> None:
     )
 
     assert "不是没有站点授权" not in summary
+
+
+def test_query_object_and_count_are_not_rendered_as_answers() -> None:
+    """`resource` / `total` 是入参回显与计数，不是结果。
+
+    线上真出现过答案后面跟着两行「resource：tool」「total：99」——
+    读者只会以为报文被截断了，而真正的内容就在上面那句里。
+    """
+    summary = _summarize_result(
+        _result(
+            result={"resource": "tool", "total": 99},
+            message="当前可调用 99 个工具：builtin 24 个、mcp 75 个。",
+        )
+    )
+
+    assert summary == "当前可调用 99 个工具：builtin 24 个、mcp 75 个。"
+
+
+def test_approval_card_shows_what_will_happen_before_the_ask() -> None:
+    """确认卡正文：摘要排在「尚未执行」之前。
+
+    线上出现过「新建流程」的卡片只有一行工具名 + 一份折叠 JSON，用户直接点了
+    确认——他批的是自己没看过的东西。把步骤与角色写进正文，才谈得上核对。
+    """
+    from app.agents.nodes import _approval_message
+
+    text = _approval_message(
+        "待确认操作：新建或修改编排流程",
+        "步骤：check（field-ops） → advise（field-ops） → report（汇总）",
+    )
+
+    assert text.index("check（field-ops）") < text.index("尚未执行")
+
+
+def test_approval_card_reads_normally_without_a_summary() -> None:
+    """没有摘要的工具不该多出空行——卡片还是原来那两句。"""
+    from app.agents.nodes import _approval_message
+
+    assert _approval_message("待确认操作：删除流程", "") == (
+        "待确认操作：删除流程\n\n该操作尚未执行。请确认或取消本次操作。"
+    )
+
+
+def test_result_graph_is_taken_from_the_tool_result() -> None:
+    """结果气泡里那张图：工具把图放在 `result["graph"]`，节点侧只认这一个键。"""
+    from app.agents.nodes import _result_graph
+    from app.tools.types import ToolExecutionResult
+
+    payload = {"graph": {"entry": "a", "nodes": [{"id": "a"}], "edges": []}}
+    result = ToolExecutionResult(success=True, result=payload)
+
+    assert _result_graph(result) == {"graph": payload["graph"]}
+
+
+def test_result_graph_ignores_malformed_payloads() -> None:
+    """宁可少一张图，也不能因为格式不对整条消息渲染不出来。"""
+    from app.agents.nodes import _result_graph
+    from app.tools.types import ToolExecutionResult
+
+    assert _result_graph(None) == {}
+    assert _result_graph(ToolExecutionResult(success=True, result={})) == {}
+    assert _result_graph(ToolExecutionResult(success=True, result={"graph": "x"})) == {}
+    assert _result_graph(ToolExecutionResult(success=True, result={"graph": {"nodes": []}})) == {}
+
+
+def test_graph_never_leaks_into_the_answer_text() -> None:
+    """图是给界面画的，混进正文会变成一整段 JSON，把结论埋掉。"""
+    from app.agents.nodes import _summarize_result
+    from app.tools.types import ToolExecutionResult
+
+    result = ToolExecutionResult(
+        success=True,
+        result={
+            "graph": {"entry": "a", "nodes": [{"id": "a"}], "edges": []},
+            "note": "已保存",
+        },
+        message="已新建流程「巡检」。",
+    )
+
+    assert "graph" not in _summarize_result(result)
+    assert "已新建流程" in _summarize_result(result)

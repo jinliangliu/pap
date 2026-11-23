@@ -22,6 +22,60 @@ ToolVerifier = Callable[
 # 审批前预检：返回拒绝理由，None 表示放行。
 ToolPreflight = Callable[["ToolExecutionContext", dict[str, Any]], Awaitable[str | None]]
 
+
+@dataclass(frozen=True, slots=True)
+class BackupSpec:
+    """写之前要留下的那份原件。由工具自己给出，网关不猜。
+
+    为什么要工具声明而不是网关推断：只有工具知道「哪个参数指认目标」、
+    「哪些字段足以重建它」。网关按参数名猜，猜错的代价是备份里存着
+    一段与这次写无关的内容——事后要恢复时才发现拿到的是别人家的数据。
+
+    `payload` 必须是**原件**而不是摘要。备份的价值在于「还能拿它回去」，
+    摘要只能回答「原来是什么」，回答不了「怎么变回去」。
+    """
+
+    resource_type: str
+    resource_id: str
+    payload: dict[str, Any]
+    note: str = ""
+
+
+# 写前备份钩子：返回 None 表示「这次没有可备份的东西」（例如新建而非覆盖）。
+#
+# 返回 None 与抛异常必须分开：前者是正常结论（新建时本来就没有旧状态），
+# 后者是故障。混成一种，新建类写操作就会因为「备不了」而被拦下。
+ToolBackup = Callable[
+    ["ToolExecutionContext", dict[str, Any]],
+    Awaitable["BackupSpec | None"],
+]
+
+@dataclass(frozen=True, slots=True)
+class ToolBrief:
+    """确认卡正文 + 可选结构图（`preview.graph`）。
+
+    图只是**陈述形状**：节点、边、每条边上那个条件。它不参与校验、不进审计
+    判定，也不影响参数——画错一张图最多是难看，画错一个参数才是事故。
+    """
+
+    text: str = ""
+    # {entry, nodes: [{id, kind, agent?, sub?}], edges: [{from, to, when, label}]}
+    graph: dict[str, Any] | None = None
+
+
+# 确认卡的「这次要做什么」摘要：返回一段人能核对的话（可多行），空串表示不额外说明。
+#
+# 与 `verification_hint` 同属「给人看的」一类，区别在时间点：这个在**动手之前**，
+# 让审批人看懂将要发生什么；那个在**动手之后**，说明怎么确认已经发生。
+#
+# 也可以返回一份 `ToolBrief`：正文之上再加一张结构图。图只由**工具自己**给结构，
+# 不让模型现场生成 SVG——那既是注入面，也让「图对不对」变成没法断言的问题。
+ToolSummary = Callable[
+    ["ToolExecutionContext", dict[str, Any]],
+    Awaitable["str | ToolBrief"],
+]
+
+
 ToolKind = Literal[
     "python",
     "http",
@@ -154,7 +208,7 @@ class ToolExecutionContext:
     # 因为它们是**执行纪律**，与「模型看到了什么」无关；
     # 混进 state 的可见部分会让模型多出一堆看不懂的字段。
     # 但子调用是一个新的执行图，跨图只能走 state——所以 state 里也存一份，
-    # 由 `_context` 还原到这里（见 `docs/AGENT_CONNECT.md` §5）。
+    # 由 `_context` 还原到这里。
     delegation_path: tuple[str, ...] = ()
     delegation_count: int = 0
 
@@ -172,6 +226,16 @@ class ToolExecutionContext:
     # 发起方所在的会话线程。子调用跑在自己的线程上，而写操作的结论要回到
     # 用户看得见的那个会话——两者都要留，且要沿着委派链一路传下去。
     delegation_origin_thread: str = ""
+
+    # 本次调用所依据的平台策略版本（`runtime_settings.current_revision()`）。
+    #
+    # 0 = 没有钉版本，执行时取当前值。这是一个**合法的默认**：0 恰好表示
+    # 「从未改过配置，全按 .env 默认」，与空库环境里第一次调用的处境一致。
+    #
+    # 为什么钉在上下文里而不是执行时再读：一轮对话可能跨几跳，中间管理员
+    # 按一下开关，两跳就活在不同的策略下，而审计里两条记录各自成立。
+    # 钉住之后，至少「这一跳按哪版跑的」可回答。
+    policy_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +306,21 @@ class ToolDefinition:
     # 只在写路径（`check_resource_access`）调用，报错文案会原样给用户看。
     preflight: ToolPreflight | None = None
 
+    # 确认卡正文里的操作摘要。适用于「参数是一整份结构、审批人光看参数名
+    # 判断不了要发生什么」的工具：编排流程的 `definition` 就是最典型的一个
+    # ——一张折叠的 JSON，审批人不会被要求去读它，于是他其实是在闭眼确认。
+    #
+    # 只负责**陈述已经定下来的参数**，不做校验、不改参数：这里写错一个字，
+    # 确认卡与真正执行的就不是同一件事。
+    summarize: ToolSummary | None = None
+
+    # 写前备份钩子。声明了它，写操作被放行后**先备份再执行**；
+    # 备份失败（钩子抛异常）时本次写入不执行——「备不下来就别写」是这条
+    # 机制的语义，否则它只是给自己留个心安。
+    #
+    # 只有写类工具会用它；只读工具声明了也不会调用。
+    backup: ToolBackup | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class ToolPublicView:
@@ -298,3 +377,12 @@ class ToolCallPlan:
 
     requires_approval: bool
     verification_hint: str | None = None
+
+    # 确认卡正文的摘要（空串 = 该工具没有可补充的）。
+    summary: str = ""
+
+    # 确认卡上的结构图（`preview.graph`）。空 = 这个工具没有形状可画。
+    #
+    # 与 `summary` 分开两个字段而不是塞进一个对象：现有的摘要钩子只返回字符串，
+    # 让每个工具都去改一遍返回值没有必要；图只有真能画图的工具才给。
+    graph: dict[str, Any] | None = None

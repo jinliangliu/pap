@@ -133,6 +133,29 @@ def _is_reasoning_effort_rejected(exc: Exception) -> bool:
     )
 
 
+# 模型没按约定回 ActionPlan、而是直接按名字调了清单里的工具时的纠正语。
+#
+# 这不是「模型不够聪明」，是结构化输出的固有缝隙：我们要求它必须调用
+# `ActionPlan` 这个函数，可提示词里又列着 30 多个真实工具名，供应商一旦
+# 不严格守 tool_choice，它就会照着更眼熟的那个名字去调。实测 DeepSeek 上
+# 同一句「帮我建个流程」重放四次，两次回 `studio_describe` 的 tool_call，
+# 解析器只认 `ActionPlan`，直接报 Unknown tool type。
+STRUCTURED_OUTPUT_NUDGE = (
+    "上一轮回复不符合约定：工具清单里的名字只能写进 ActionPlan 的 tool_name 字段，"
+    "**不要直接调用** studio_describe / studio_workflow_save 这类工具——"
+    "你只负责规划，执行由服务端完成。请重新输出一个 ActionPlan。"
+)
+
+
+def _is_structured_output_conflict(exc: Exception) -> bool:
+    """模型回了一个「真实工具」的 tool_call，而不是 ActionPlan。
+
+    只认这个特征串：别的解析失败多半是输出被截断或字段写错，重试一次也是白重试，
+    还会把真正该报的错掩盖成「重试后仍失败」。
+    """
+    return "unknown tool type" in str(exc).lower()
+
+
 async def get_planner() -> PlannerProtocol:
     """按当前生效的文字模型配置构造规划器。
 
@@ -296,7 +319,7 @@ async def create_action_plan(
         span_attrs["tools.names_cut"] = True
 
     # 用量收集器：只在调用方要的时候挂。它收集的是「这一轮模型实际看到了多少
-    # token」，下一轮据此决定要不要压缩上下文（docs/CONTEXT.md §2.4）。
+    # token」，下一轮据此决定要不要压缩上下文。
     collector = UsageCollector() if usage_sink is not None else None
 
     try:
@@ -332,6 +355,33 @@ async def create_action_plan(
                 raise
             except Exception as retry_exc:
                 # 重试也失败：用这一次的错误做归类，别把裸异常漏给上层。
+                exc = retry_exc
+
+        # 模型把「真实工具」当成要调的函数，而不是用 ActionPlan 描述它。
+        # 规划调用没有副作用，重试一次不会写两遍；纠正语放进 system 而不是
+        # 追加一条 human——同一句话出现在「用户说的」位置，下一轮会被当作用户
+        # 的抱怨引用进历史。
+        if _is_structured_output_conflict(exc):
+            corrected = [
+                ("system", f"{system_prompt}\n\n{STRUCTURED_OUTPUT_NUDGE}"),
+                *messages[1:],
+            ]
+            try:
+                async with span(
+                    "llm.call", "llm", attrs={**span_attrs, "attempt": 2}
+                ) as retry_span:
+                    retry_span.content(input=_messages_for_obs(corrected))
+                    retry_plan = await _invoke_planner(planner, corrected, collector)
+                    retry_span.content(output=_plan_for_obs(retry_plan))
+                    _flush_usage(usage_sink, collector)
+                    logger.info(
+                        "规划器没按约定回 ActionPlan，纠正后重试成功。",
+                        extra={"event": "planner_schema_retry"},
+                    )
+                    return retry_plan
+            except (ModelNotConfiguredError, ModelInvocationError):
+                raise
+            except Exception as retry_exc:
                 exc = retry_exc
 
         category = classify_model_error(exc)

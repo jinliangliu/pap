@@ -37,30 +37,30 @@ PATROL_COMPARE = SkillTemplate(
     description="把本轮巡检读数与基准值、上一次读数对比，标出越限与漂移，产出可核对的结论。",
     trigger_keywords=("巡检比对", "对比巡检", "核对巡检数据"),
     allowed_tools=(
-        "prv_list_stations",
-        "prv_station_overview",
-        "prv_query_pressure",
-        "prv_pressure_trend",
-        "prv_query_alarms",
-        "prv_station_profile",
+        "fc_liststations",
+        "fc_getstationoverview",
+        "fc_querypressure",
+        "fc_querypressuretrend",
+        "fc_queryalarms",
+        "fc_getstationprofile",
     ),
     priority=80,
     instruction="""## 比对口径
 
 一次巡检要回答三个问题，缺一个都不算完成：
 
-1. **现在多少** —— 用 `prv_query_pressure` 取实时读数，并写明采样时间。
-2. **和谁比** —— 优先和用户给的基准值比；没给基准就取 `prv_pressure_trend` 里上一次读数。
+1. **现在多少** —— 用 `fc_querypressure` 取实时读数，并写明采样时间。
+2. **和谁比** —— 优先和用户给的基准值比；没给基准就取 `fc_querypressuretrend` 里上一次读数。
    两条都没有时，明确说「没有可比基准」，不要自己编一个「正常范围」。
 3. **差多少算异常** —— 压力偏差超过 10% 或报警通道有未处理项，判为需关注；否则为正常。
 
 ## 顺序
 
-1. 站点不确定先调 `prv_list_stations` 取准确标识。
-2. `prv_station_overview` 拿站点整体状态，`prv_query_pressure` 拿进出口压力。
-3. 需要看趋势时才调 `prv_pressure_trend`，别每轮都拉一天的数据。
-4. `prv_query_alarms` 检查同期报警，有报警时优先呈现报警而不是压力。
-5. 需要设备档案（量程、调压器型号）时调 `prv_station_profile`。
+1. 站点不确定先调 `fc_liststations` 取准确标识。
+2. `fc_getstationoverview` 拿站点整体状态，`fc_querypressure` 拿进出口压力。
+3. 需要看趋势时才调 `fc_querypressuretrend`，别每轮都拉一天的数据。
+4. `fc_queryalarms` 检查同期报警，有报警时优先呈现报警而不是压力。
+5. 需要设备档案（量程、调压器型号）时调 `fc_getstationprofile`。
 
 ## 输出格式
 
@@ -78,10 +78,10 @@ REPORT_FORMAT = SkillTemplate(
     description="把查询结果整理成固定口径的报表：表头、单位、时间范围、异常标注，必要时导出文件。",
     trigger_keywords=("出报表", "整理报表", "报表排版", "导出报表"),
     allowed_tools=(
-        "prv_relief_report",
-        "prv_relief_samples",
-        "prv_export_records",
-        "prv_download_report_pdf",
+        "fc_queryreliefreport",
+        "fc_queryreliefsamples",
+        "fc_exportstationrecords",
+        "fc_downloadreportpdf",
         "get_platform_time",
     ),
     priority=80,
@@ -95,8 +95,8 @@ REPORT_FORMAT = SkillTemplate(
 
 ## 顺序
 
-1. `prv_relief_report` 取汇总，`prv_relief_samples` 取明细；只取需要的范围。
-2. 用户要文件时才调 `prv_export_records` 或 `prv_download_report_pdf`，
+1. `fc_queryreliefreport` 取汇总，`fc_queryreliefsamples` 取明细；只取需要的范围。
+2. 用户要文件时才调 `fc_exportstationrecords` 或 `fc_downloadreportpdf`，
    并回一个可点击的结果；用户只要看数就不要导出。
 3. 报表落款时间用 `get_platform_time` 取，不要用你推断的日期。
 

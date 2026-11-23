@@ -45,6 +45,7 @@ from app.models.conversation import Message, MessageRole
 from app.models.custom_tool import CustomTool
 from app.models.document import DocumentStatus
 from app.models.mcp_registered import McpRegisteredTool
+from app.models.skill import Skill
 from app.models.workflow import WorkflowRunStatus
 from app.schemas.custom_tool import CustomToolCreate
 from app.services import attachment_store, skill_service
@@ -67,10 +68,13 @@ from app.tools.builtins.studio_tools import (
     _audit_mutation,
     _check_grantable,
     _fail,
+    _norm_list,
 )
 from app.tools.custom_http import CustomToolConfigError
 from app.tools.gateway import ToolGatewayError
 from app.tools.types import (
+    BackupSpec,
+    ToolBrief,
     ToolDefinition,
     ToolExecutionContext,
     ToolExecutionResult,
@@ -210,13 +214,13 @@ async def studio_skill_save(
                 view = _skill_view(row)
                 result = ToolExecutionResult(
                     success=True,
-                    verified=True,
                     result={"skill": view},
                     message=(
                         f"已新建技能「{view['display_name']}」（{view['name']}）："
                         f"{'启用' if view['enabled'] else '停用'} · 工具：{_tools_label(view)}。"
                     ),
-                    verification={"source": "skills_table", "ref": view["name"]},
+                    # 只交出标识：核验另起会话回读，不在这个事务里自己盖章。
+                    external_operation_id=view["name"],
                 )
 
                 await _audit_admin(
@@ -258,13 +262,12 @@ async def studio_skill_save(
             changed = {key for key in view if before.get(key) != view[key]}
             result = ToolExecutionResult(
                 success=True,
-                verified=True,
                 result={"skill": view},
                 message=(
                     f"已更新技能「{view['display_name']}」（{view['name']}）："
                     f"{'启用' if view['enabled'] else '停用'} · 工具：{_tools_label(view)}。"
                 ),
-                verification={"source": "skills_table", "ref": view["name"]},
+                external_operation_id=view["name"],
             )
 
             if changed:
@@ -334,10 +337,9 @@ async def studio_skill_delete(
 
             result = ToolExecutionResult(
                 success=True,
-                verified=True,
                 result={"deleted": name, "display_name": display, "referenced_by": users},
                 message=message,
-                verification={"source": "skills_table", "absent": name},
+                external_operation_id=skill_id,
             )
 
             await _audit_admin(
@@ -538,14 +540,13 @@ async def _save_http_tool(
 
     result = ToolExecutionResult(
         success=True,
-        verified=True,
         result={"tool": view},
         message=(
             f"已{'新建' if mode == 'create' else '更新'}工具「{view['display_name']}」"
             f"（{view['name']}）：{view['method']} {view['url']} · "
             f"风险 {view['risk_level']} · {'启用' if view['enabled'] else '停用'}。"
         ),
-        verification={"source": "tool_registry", "ref": view["name"]},
+        external_operation_id=view["name"],
     )
 
     await _audit_admin(
@@ -654,14 +655,13 @@ async def _save_mcp_tool(
 
     result = ToolExecutionResult(
         success=True,
-        verified=True,
         result={"tool": view},
         message=(
             f"已接入 MCP 工具「{view['display_name']}」：本地名 {view['local_name']}，"
             f"远端名 {view['remote_name']}，端点 {view['server_url'] or '默认端点'}，"
             f"风险 {view['risk_level']}。"
         ),
-        verification={"source": "tool_registry", "ref": view["local_name"]},
+        external_operation_id=view["local_name"],
     )
 
     await _audit_admin(
@@ -729,10 +729,9 @@ async def studio_tool_delete(
 
     result = ToolExecutionResult(
         success=True,
-        verified=True,
         result={"deleted": name, "kind": kind, "display_name": display},
         message=f"已移除{view_kind(kind)}「{display}」（{name}）。",
-        verification={"source": "tool_registry", "absent": name},
+        external_operation_id=tool_id,
     )
 
     await _audit_admin(
@@ -1750,7 +1749,6 @@ async def studio_connector_save(
 
     return ToolExecutionResult(
         success=True,
-        verified=True,
         result={"connector": snapshot, "changed": sorted(after) if mode == "update" else None},
         message=(
             f"连接器 {row.name} 已保存。"
@@ -1761,6 +1759,7 @@ async def studio_connector_save(
                 else "这个连接器不需要凭据，配好工具后即可调用。"
             )
         ),
+        external_operation_id=snapshot["name"],
     )
 
 
@@ -1815,9 +1814,9 @@ async def studio_connector_delete(
 
     return ToolExecutionResult(
         success=True,
-        verified=True,
         result={"deleted": name},
         message=f"连接器 {name} 已删除。远端服务不受影响。",
+        external_operation_id=str(connector_id),
     )
 
 
@@ -1827,14 +1826,371 @@ async def studio_connector_delete(
 # 模型对工具说明的服从度高于系统提示词，而它只在真要写图时才需要这段。
 
 
-def _workflow_shape(row: Any) -> tuple[int, int]:
-    """(节点数, 跳数)。取不到（坏图）时返回 (0, 0)。"""
+def _workflow_plan(row: Any) -> Any:
+    """把一行流程编译成 plan；图坏了返回 None（列表里照样要能显示，不能抛）。"""
     from app.services import workflow_service
 
-    plan = workflow_service.plan_of(row)
+    return workflow_service.plan_of(row)
+
+
+def _workflow_shape(row: Any) -> tuple[int, int, list[str]]:
+    """(节点数, 跳数, 拓扑序的节点 id)。取不到（坏图）时返回 (0, 0, [])。
+
+    一次编译取三样：`plan_of` 每次都要重新解析整张图，为了拼两行字编译两遍
+    没有意义。
+    """
+    plan = _workflow_plan(row)
     if plan is None:
-        return 0, 0
-    return plan.size, plan.depth_hops
+        return 0, 0, []
+    return plan.size, plan.depth_hops, list(plan.order)
+
+
+def _edge_short_label(edge: Any) -> str:
+    """边上那行字。图里只有窄窄一条，写不下 `alarm_level = 严重`。
+
+    条件键只在同一节点有多条边时才有信息量，而图上一眼就能看到「从哪分出去的」，
+    所以**只写值**：`严重` / `> 0.15` / `其余`。键留给下面那行「分流：」文字，
+    两处各说一半比两处都说全更容易读。
+    """
+    if edge.when is None:
+        return "其余"
+    op = edge.when.op
+    if op == "gt":
+        return f"> {edge.when.value}"
+    if op == "lt":
+        return f"< {edge.when.value}"
+    if op == "neq":
+        return f"≠ {edge.when.value}"
+    if op == "in":
+        values = edge.when.value if isinstance(edge.when.value, list) else [edge.when.value]
+        return "属于 " + "/".join(str(item) for item in values[:3])
+    return str(edge.when.value)
+
+
+def _workflow_graph(plan: Any) -> dict[str, Any]:
+    """把编译过的图摊成界面能画的形状。
+
+    只给**形状**：节点、边、每条边上那个条件。不分层、不算坐标——排版是界面的事，
+    服务端存坐标就等于把「画多大、几列」写进数据里，换个屏幕就得重算。
+
+    不画 `inputs` 里的模板引用：那些是数据流，而这张图回答的是「谁在第几步」。
+    把两类边画在一起，读的人会以为两个节点之间有一条「控制」关系。
+    """
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+
+    for node_id in plan.order:
+        node = plan.node(node_id)
+        item: dict[str, Any] = {"id": node_id, "kind": node.kind}
+        if node.kind == "compose":
+            item["sub"] = "汇总"
+        elif node.kind == "parallel":
+            item["sub"] = f"并行 {len(node.branches)} 路"
+            item["agents"] = [branch.agent for branch in node.branches]
+        elif node.agent:
+            item["agent"] = node.agent
+        nodes.append(item)
+
+        for edge in node.next:
+            edges.append(
+                {
+                    "from": node_id,
+                    "to": edge.to,
+                    "when": edge.when.as_json() if edge.when else None,
+                    "label": _edge_short_label(edge),
+                }
+            )
+
+    return {"entry": plan.entry, "nodes": nodes, "edges": edges}
+
+
+def _step_label(node: Any) -> str:
+    """一步在摘要里怎么写：`check（field-ops）` / `report（汇总）`。
+
+    角色必须进这一步，不能只列节点 id：实测出现过「用户说让 ops 判断，
+    图里全程是 field-ops」，而当时的结果只写了 `check → advise → report`，
+    换个角色这件事在对话里完全看不见。
+    """
+    if node.kind == "compose":
+        return f"{node.id}（汇总）"
+    if node.kind == "parallel":
+        names = "、".join(branch.agent for branch in node.branches) or "未指定"
+        return f"{node.id}（并行：{names}）"
+    return f"{node.id}（{node.agent or '未指定智能体'}）"
+
+
+def _condition_label(edge: Any) -> str:
+    if edge.when is None:
+        return f"其余 → {edge.to}"
+    symbol = {"eq": "=", "neq": "≠", "gt": ">", "lt": "<", "in": "属于"}.get(
+        edge.when.op, edge.when.op
+    )
+    return f"{edge.when.key} {symbol} {edge.when.value} → {edge.to}"
+
+
+def _workflow_roles(plan: Any) -> tuple[dict[str, list[str]], int]:
+    """(每个智能体负责的节点, 不调智能体的节点数)。"""
+    roles: dict[str, list[str]] = {}
+    silent = 0
+    for node_id in plan.order:
+        node = plan.node(node_id)
+        if not node.invokes_agent:
+            silent += 1
+            continue
+        if node.kind == "parallel":
+            for branch in node.branches:
+                roles.setdefault(branch.agent, []).append(f"{node_id}/{branch.id}")
+            continue
+        roles.setdefault(node.agent or "未指定", []).append(node_id)
+    return roles, silent
+
+
+def _roles_line(roles: dict[str, list[str]], silent: int) -> str:
+    parts = [f"{agent}（{'、'.join(node_ids)}）" for agent, node_ids in roles.items()]
+    if silent:
+        parts.append(f"{silent} 个汇总节点不调智能体")
+    return "角色：" + "；".join(parts) if parts else ""
+
+
+def _summarize_workflow(
+    plan: Any,
+    mode: str,
+    name: str,
+    display_name: str,
+    *,
+    with_steps: bool = True,
+) -> str:
+    """确认卡正文：几步、什么顺序、每步谁做、按什么分流。
+
+    这段以前不存在：卡片上只有一行「新建或修改编排流程」和一份折叠的
+    `definition`，审批人要么闭眼确认，要么自己去读 JSON——而 `definition`
+    折起来正是因为没人读得动它。
+
+    `with_steps=False` 用于「图已经跟着卡片一起给出」的情形：这时那行
+    `步骤：a → b → c` 与图说的是同一件事，而且图还能表达分叉，文字不能。
+    把它留在卡上，读者要在两处读同一份顺序。
+    """
+    lines = [f"{mode}流程「{name}」{f'（{display_name}）' if display_name and display_name != name else ''}"]
+    if with_steps:
+        steps = " → ".join(_step_label(plan.node(node_id)) for node_id in plan.order)
+        lines.append(f"步骤：{steps}")
+
+    # 分流只列「有条​件的边」：兜底边写出来只是噪音，人要看的是「什么情况下
+    # 走另一条路」。一个分流都没有的图不用这一行。
+    decision: list[str] = []
+    for node_id in plan.order:
+        node = plan.node(node_id)
+        conditional = [edge for edge in node.next if edge.when is not None]
+        if not conditional:
+            continue
+        joins = "；".join(_condition_label(edge) for edge in conditional)
+        fallback = next((edge for edge in node.next if edge.when is None), None)
+        if fallback is not None:
+            joins = f"{joins}；其余 → {fallback.to}"
+        decision.append(f"{node_id} 判 {joins}")
+    if decision:
+        lines.append("分流：" + "；".join(decision))
+
+    roles, silent = _workflow_roles(plan)
+    roles_line = _roles_line(roles, silent)
+    if roles_line:
+        lines.append(roles_line)
+
+    return "\n".join(lines)
+
+
+async def _summarize_workflow_call(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolBrief:
+    """`ToolDefinition.summarize` 的入口：只按参数说话，不查库、不校验。
+
+    图不成立时不去猜顺序（`compile_definition` 抛了就直说编译不过），
+    因为确认卡上的顺序与实际执行的顺序不一致，比不写顺序更糟——同样地，
+    编译不过就不给图：一张靠猜画出来的图会被当成「存进去的就是这样」。
+    """
+    definition = arguments.get("definition")
+    if not isinstance(definition, dict):
+        # 只改显示名/说明/启停：没有图要说，卡片上那一行参数就够。
+        return ToolBrief()
+
+    mode = "新建" if str(arguments.get("mode") or "") == "create" else "修改"
+    name = str(arguments.get("name") or "").strip()
+    display_name = str(arguments.get("display_name") or "").strip()
+
+    from app.orchestration.definition import DefinitionError, compile_definition
+
+    try:
+        plan = compile_definition(definition)
+    except DefinitionError as exc:
+        return ToolBrief(
+            text=f"{mode}流程「{name}」：这张图现在编译不过（{exc.code}），保存会被拒绝。"
+        )
+
+    graph = _workflow_graph(plan)
+    return ToolBrief(
+        # 图给得出来就不写「步骤：」那行：卡片上已经画了顺序，还多一行文字
+        # 等于让人在两处读同一件事，而文字那行表达不了分叉。
+        text=_summarize_workflow(plan, mode, name, display_name, with_steps=graph is None),
+        graph=graph,
+    )
+
+
+async def _preflight_workflow(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str | None:
+    """图能不能编译，在生成审批单之前就问一遍。
+
+    与 `save_workflow` 里的校验不是重复：那边是权威判定（还要查智能体在不在），
+    这边只回答「该不该让用户看到这张卡」。让人对着一张注定被拒的卡点确认，
+    训练出来的是闭眼确认——与凭据预检同一条理由。
+    """
+    definition = arguments.get("definition")
+    if not isinstance(definition, dict):
+        return None
+
+    from app.orchestration.definition import DefinitionError, compile_definition
+
+    try:
+        compile_definition(definition)
+    except DefinitionError as exc:
+        where = f"节点「{exc.node}」" if getattr(exc, "node", None) else "整张图"
+        return f"{where}没过校验（{exc.code}）：{exc.message}"
+    return None
+
+
+async def verify_workflow_saved(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """流程回读：另起一个会话按标识再查一遍。
+
+    为什么不能用 handler 的返回值：那是「我刚写完」的自述，与写入同一个事务。
+    换一个连接重新查，才有资格在审批卡上标 VERIFIED。
+
+    能核到的是具体的三件事：行在、图与提交的一致（节点 id 集合）、启停是提交
+    的那个值。三条任一不成立都算没核验——「接口返回成功」不是结论。
+    """
+    name = str(context.external_operation_id or arguments.get("name") or "").strip()
+
+    if not name:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次保存没有留下可回读的流程标识。",
+            verification={"verified": False, "reason": "no_ref"},
+        )
+
+    from app.services import workflow_service
+
+    row = await workflow_service.get_workflow(context.tenant_id, name)
+
+    if row is None:
+        # 保存说成功了、库里查不到：只能是不在同一张表/同一租户，或事务没提交。
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message="回读不到刚保存的流程，不能视为已保存。",
+            error_code="VERIFY_WORKFLOW_MISSING",
+            verification={"verified": False, "reason": "missing", "ref": name},
+        )
+
+    node_count, _, order = _workflow_shape(row)
+    definition = arguments.get("definition")
+
+    if isinstance(definition, dict):
+        expected = [
+            str(node.get("id"))
+            for node in definition.get("nodes") or []
+            if isinstance(node, dict)
+        ]
+        if set(expected) != set(order):
+            # 库里的图不是提交的那张：最常见的原因是同名流程在别处被改过，
+            # 而这次保存落到了旧版本上。批准的是一个，实际是另一个。
+            return ToolExecutionResult(
+                success=False,
+                verified=False,
+                message="库里的图与提交的不是同一张（节点对不上），不能视为已保存。",
+                error_code="VERIFY_WORKFLOW_MISMATCH",
+                verification={
+                    "verified": False,
+                    "reason": "mismatch",
+                    "ref": name,
+                    "expected": sorted(expected),
+                    "actual": sorted(order),
+                },
+            )
+
+    if "enabled" in arguments and bool(row.enabled) != bool(arguments["enabled"]):
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=(
+                f"流程在库里，但启停状态是"
+                f"「{'启用' if row.enabled else '停用'}」，与这次提交的不一致。"
+            ),
+            error_code="VERIFY_WORKFLOW_STATE",
+            verification={"verified": False, "reason": "enabled", "ref": name},
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={
+            "workflow": name,
+            "revision": int(row.revision or 0),
+            "node_count": node_count,
+            "enabled": bool(row.enabled),
+        },
+        message=(
+            f"回读确认：流程在库里，{node_count} 个节点，"
+            f"v{int(row.revision or 0)}，{'启用' if row.enabled else '停用'}。"
+        ),
+        verification={"source": "workflows_table", "ref": name},
+    )
+
+
+async def _backup_workflow(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> BackupSpec | None:
+    """保存流程之前，把库里那张图原样留一份。
+
+    `mode=create` 返回 None：新建没有旧状态会被覆盖，那不是「备份失败」，
+    而是本来就没有东西可备。把这两种情况混在一起，新建类写操作就会因为
+    「备不了」被拦下。
+
+    备的是 `definition` 原件而不是摘要：流程的价值全在那张图上，而图被
+    覆盖之后就只剩「跑起来不对」这一个现象，没有原件无法回答「原来是哪条边
+    接错了」。节点数之类的统计量只能描述形状，重建不了。
+    """
+    if str(arguments.get("mode") or "").strip() != "update":
+        return None
+
+    name = str(arguments.get("name") or "").strip()
+    if not name:
+        return None
+
+    from app.services import workflow_service
+
+    row = await workflow_service.get_workflow(context.tenant_id, name)
+    if row is None:
+        return None
+
+    return BackupSpec(
+        resource_type="workflow",
+        resource_id=str(row.id),
+        payload={
+            "name": row.name,
+            "display_name": row.display_name,
+            "description": row.description,
+            "definition": row.definition,
+            "enabled": bool(row.enabled),
+            "revision": int(row.revision or 0),
+        },
+        note=f"保存前的第 {int(row.revision or 0)} 版",
+    )
 
 
 async def studio_workflow_save(
@@ -1865,7 +2221,14 @@ async def studio_workflow_save(
     if mode == "create" and existing is not None:
         return _fail(f"流程「{name}」已经存在，要改它请用 mode=update。")
     if mode == "update" and existing is None:
-        return _fail(f"没有找到标识为「{name}」的流程，要新建请用 mode=create。")
+        # 名字建好之后不能改（它出现在 `/workflow <标识>` 与审计里）。用户说
+        # 「把 triage 改名成巡检」时模型最容易在这里踩空：拿新名字来 update，
+        # 被告知「没有这个流程」，然后顺手 create 出一张重复的图。
+        return _fail(
+            f"没有找到标识为「{name}」的流程。"
+            "流程标识建好之后不能改——只换显示名请用 mode=update 传 display_name；"
+            "要换标识则新建一张（mode=create）。"
+        )
 
     definition = arguments.get("definition")
     if definition is None:
@@ -1901,19 +2264,52 @@ async def studio_workflow_save(
             enabled=enabled,
         )
     except workflow_service.WorkflowError as exc:
-        where = f"节点「{exc.node}」" if exc.node else "整张图"
+        # 「整张图不成立」不适合名字不合法：它一个字都还没画。
+        if exc.code == "WORKFLOW_BAD_NAME":
+            where = "流程标识"
+        elif exc.node:
+            where = f"节点「{exc.node}」"
+        else:
+            where = "整张图"
         return _fail(
-            f"{where}不成立（{exc.code}）：{exc.message}"
+            f"{where}没过校验（{exc.code}）：{exc.message}"
             "改好这一处再保存——存进库的必须是能跑的图。"
         )
 
-    node_count, depth_hops = _workflow_shape(row)
+    plan = _workflow_plan(row)
+    node_count, depth_hops, order = _workflow_shape(row)
+    # 「check → judge → report」这一行要让人一眼核对**顺序对不对**：两个数字看不出
+    # 「先查压力还是先下结论」。图按拓扑序存，与实际执行顺序一致（分支处只表示
+    # 先后，不表示互斥）。
+    steps = list(order)
+    roles, silent = _workflow_roles(plan) if plan is not None else ({}, 0)
     created = existing is None
     action = "新建" if created else "更新"
 
+    lines = [
+        f"已{action}流程「{row.display_name}」（{row.name}）：{node_count} 个节点 / "
+        f"{depth_hops} 跳 · {'启用' if row.enabled else '停用'} · v{row.revision}。"
+    ]
+    if steps:
+        lines.append(f"步骤：{' → '.join(steps)}")
+    # 角色单独一行，而不是只把 id 串成一串：用户可能点名过某个角色（「让 ops
+    # 判断」），而图里用的是另一个。只说 id 时这种替换在对话里完全看不出来。
+    roles_line = _roles_line(roles, silent)
+    if roles_line:
+        lines.append(roles_line)
+    lines.append(
+        f"触发：到「对话」页发「/workflow {row.name} 要做的事」，或在输入框的下拉里选它。"
+        "（不要在这个助手面板里发：流程每一步都按发起方的边界判定，助手没有那些工具。）"
+    )
+    if depth_hops > 0:
+        # 这是开跑前唯一会拦住整张图的条件（`workflow_service.start` 的深度预检）：
+        # 发起方不允许转交时，图再对也跑不起来，而错误出现在触发那一刻。
+        lines.append(
+            "发起它的智能体要允许转交（最大转交深度 ≥ 1），否则开跑前就会被拒。"
+        )
+
     result = ToolExecutionResult(
         success=True,
-        verified=True,
         result={
             "workflow": {
                 "name": str(row.name),
@@ -1922,15 +2318,20 @@ async def studio_workflow_save(
                 "enabled": bool(row.enabled),
                 "node_count": node_count,
                 "depth_hops": depth_hops,
-            }
+                "steps": steps,
+                "roles": roles,
+            },
+            # 结果气泡里那张图（`nodes._result_graph` 按顶层 `graph` 键取）。
+            # 与确认卡上那张同源，但**按落库后的 plan 重算**：卡上画的是「提交的
+            # 那张图」，气泡里是「存下来、以后真会跑的那张」。
+            **({"graph": _workflow_graph(plan)} if plan is not None else {}),
         },
-        message=(
-            f"已{action}流程「{row.display_name}」（{row.name}）：{node_count} 个节点 / "
-            f"{depth_hops} 跳 · {'启用' if row.enabled else '停用'} · v{row.revision}。"
-            f"触发方式：对话里发「/workflow {row.name} 要做的事」，"
-            "或在对话窗口的下拉里选这张流程。"
-        ),
+        message="\n".join(lines),
         verification={"source": "workflows_table", "ref": str(row.name)},
+        # 回读核验的落点：verifier 另起会话按这个名字再查一遍。
+        # 这里不写 verified=True——那是「我刚写完」的自述，与写入同一个事务，
+        # 提交失败也读得到。审批卡上的 VERIFIED 只能由 `verify_workflow_saved` 给。
+        external_operation_id=str(row.name),
     )
 
     await _audit_admin(
@@ -2018,9 +2419,945 @@ async def studio_workflow_delete(
 
     return ToolExecutionResult(
         success=True,
-        verified=True,
         result={"deleted": name, "open_runs": len(open_runs)},
         message=message,
+        verification={"source": "workflows_table", "ref": workflow_id},
+        # 回读核验的落点：verifier 另起会话**按 id** 再查一遍。这里交给它的是
+        # id 而不是名字——名字可能从头到尾就不存在，按名字查分不清「删掉了」
+        # 与「本来就没这个名」。也不写 verified=True：那是与删除同一个事务里的
+        # 自述，审批卡上的 VERIFIED 只能由 `verify_workflow_deleted` 给。
+        external_operation_id=workflow_id,
+    )
+
+
+async def _admin_deleted_audited(tenant_id: str, resource_id: str, operation: str) -> bool:
+    """这个资源 id 上有没有一条「已删除」的审计。
+
+    用来给「查不到」补一个**正向**证据：审计是删成功之后才写、且自己开会话
+    提交的，跑到核验时还看得见它，就说明这次确实删掉了。没有它的时候「查不到」
+    只能说明这一侧读不到东西（`skills` 挂 RLS，空集不报错）。
+    """
+    from app.models.audit import AuditLog
+
+    with tenant_scope(tenant_id):
+        async with async_session_factory() as session:
+            rows = await session.scalars(
+                select(AuditLog)
+                .where(AuditLog.resource_id == resource_id)
+                .order_by(AuditLog.created_at.desc())
+                .limit(20)
+            )
+            # 在 Python 侧比 metadata，不用 `.astext`：本地用例跑 SQLite。
+            return any(
+                (row.metadata_json or {}).get("operation") == operation for row in rows
+            )
+
+
+async def _workflow_deleted_audited(tenant_id: str, workflow_id: str) -> bool:
+    """流程删除审计。走通用的那条，别在这里再写一遍查询。"""
+    return await _admin_deleted_audited(tenant_id, workflow_id, "workflow_deleted")
+
+
+async def verify_workflow_deleted(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """删除回读：另起会话按 id 再查一遍，确认流程真的不在了。
+
+    与保存那条**反过来**：保存要核「在」，删除要核「不在」。难点也在这里——
+    「查不到」本身什么都不能说明：名字打错、租户上下文没绑上、库被人换过，
+    查出来都是空集，而且 `workflows` 挂 RLS，空集连报错都没有。把「空」当成
+    成功，核验就成了一条永远绿的线，比没有核验更糟。
+
+    所以两条一起看：
+
+    1. 按 **id** 查（不是名字）。id 是执行那一刻从库里读出来的，能排除
+       「本来就没这个名」；
+    2. 按 id 找那条 `workflow_deleted` 审计，作为正向证据。
+
+    两条都成立才标 VERIFIED。只剩空集、没有审计时如实说「核不出结论」——
+    删除很可能已经生效，只是这一侧看不见；停在 EXECUTED 等一个人看一眼，
+    比在卡上写「已验证」安全。
+    """
+    workflow_id = str(context.external_operation_id or "").strip()
+    name = str(arguments.get("name") or "").strip()
+
+    if not workflow_id:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次删除没有留下可回读的流程标识。",
+            verification={"verified": False, "reason": "no_ref", "ref": name},
+        )
+
+    from app.services import workflow_service
+
+    row = await workflow_service.get_workflow(context.tenant_id, workflow_id)
+
+    if row is not None:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"流程「{row.name}」（{workflow_id}）在库里还在，不能视为已删除。",
+            error_code="VERIFY_WORKFLOW_PRESENT",
+            verification={"verified": False, "reason": "present", "ref": workflow_id},
+        )
+
+    if not await _workflow_deleted_audited(context.tenant_id, workflow_id):
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message=(
+                f"库里已经查不到流程「{name}」，但也没找到这次删除的记录，核不出结论。"
+            ),
+            verification={"verified": False, "reason": "no_evidence", "ref": workflow_id},
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"deleted": name, "workflow_id": workflow_id},
+        message=f"回读确认：流程「{name}」已不在库里，删除记录对得上。",
+        verification={
+            "source": "workflows_table+audit_logs",
+            "ref": workflow_id,
+            "check": "absent",
+        },
+    )
+
+
+# ---------------- 回读核验：技能 / 工具 / 连接器 ----------------
+#
+# 这六个写工具以前各自在 handler 里写 `verified=True`：那次读回跟写入在同一个
+# 会话里，提交失败也读得到，而 `skills` 挂 RLS——租户上下文没绑上就是空集，
+# 连报错都没有。审批卡上的 VERIFIED 因此只是一个自我判断。
+#
+# 现在 handler 只交出标识（`external_operation_id`），核验另起会话按标识重读：
+# 保存核「在 **且** 字段与提交一致」，删除核「按 id 不在 **且** 有一条删除审计」。
+# 只核「行在 / 行没了」都不够——前者漏掉并发改回去，后者漏掉「这一侧根本读不到」。
+
+
+async def _read_skill(tenant_id: str, ref: str) -> Any | None:
+    """另起会话按 id 或名字读一行技能（id 优先：名字可以被重建复用）。"""
+    text = str(ref or "").strip()
+    if not text:
+        return None
+
+    with tenant_scope(tenant_id):
+        async with async_session_factory() as session:
+            try:
+                return await session.get(Skill, uuid.UUID(text))
+            except (ValueError, AttributeError, TypeError):
+                return await skill_service.get_by_name(session, text)
+
+
+def _skill_mismatch(row: Any, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """提交了哪些字段就比哪些。没传的不比——「没改」不该被判成不一致。
+
+    `allowed_tools` 的 `None`（不收窄）与 `[]`（一个都不给）是两种语义，
+    所以走 `_norm_list` 而不是 `or []`。
+    """
+    checks: dict[str, tuple[Any, Any]] = {}
+
+    if arguments.get("display_name"):
+        # 空值在 handler 里表示「用标识兜底」，结果取决于 create/update，不拿来判。
+        checks["display_name"] = (row.display_name, str(arguments["display_name"]))
+    if "description" in arguments:
+        checks["description"] = (row.description, str(arguments["description"] or ""))
+    if "instruction" in arguments:
+        checks["instruction"] = (row.instruction, str(arguments["instruction"] or ""))
+    if "trigger_keywords" in arguments:
+        checks["trigger_keywords"] = (
+            _norm_list(row.trigger_keywords) or [],
+            _norm_list(arguments["trigger_keywords"]) or [],
+        )
+    if "allowed_tools" in arguments:
+        checks["allowed_tools"] = (
+            _norm_list(row.allowed_tools),
+            _norm_list(arguments["allowed_tools"]),
+        )
+    if "priority" in arguments:
+        checks["priority"] = (int(row.priority), int(arguments["priority"]))
+    if "enabled" in arguments:
+        checks["enabled"] = (bool(row.enabled), bool(arguments["enabled"]))
+
+    diff = {
+        field: {"expected": expected, "actual": actual}
+        for field, (actual, expected) in checks.items()
+        if expected != actual
+    }
+    return diff or None
+
+
+async def verify_skill_saved(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """技能保存回读：另起会话按标识再读一遍，字段与提交的对得上才算数。
+
+    为什么不只核「行在」：技能的价值全在 `instruction` 与 `allowed_tools` 上，
+    而一次并发保存或一次归一化都可能让库里的那份与批的那份不是同一个东西。
+    """
+    name = str(context.external_operation_id or arguments.get("name") or "").strip()
+
+    if not name:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次保存没有留下可回读的技能标识。",
+            verification={"verified": False, "reason": "no_ref"},
+        )
+
+    row = await _read_skill(context.tenant_id, name)
+
+    if row is None:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message="回读不到刚保存的技能，不能视为已保存。",
+            error_code="VERIFY_SKILL_MISSING",
+            verification={"verified": False, "reason": "missing", "ref": name},
+        )
+
+    diff = _skill_mismatch(row, arguments)
+    if diff:
+        fields = "、".join(sorted(diff))
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"库里这个技能的字段与这次提交的不一致（{fields}），不能视为已保存。",
+            error_code="VERIFY_SKILL_MISMATCH",
+            verification={"verified": False, "reason": "mismatch", "ref": name, "diff": diff},
+        )
+
+    view = _skill_view(row)
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"skill": view},
+        message=(
+            f"回读确认：技能「{row.display_name}」（{row.name}）在库里，"
+            f"{'启用' if row.enabled else '停用'} · 工具：{_tools_label(view)}。"
+        ),
+        verification={"source": "skills_table", "ref": row.name},
+    )
+
+
+async def verify_skill_deleted(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """技能删除回读：按 id 查不到，且找得到那条删除审计。
+
+    「查不到」本身什么都不说明——名字不对、租户上下文没绑上、库被换过，都是
+    空集且不报错。留一条正向证据，才敢在卡上写「已验证」。
+    """
+    skill_id = str(context.external_operation_id or "").strip()
+    name = str(arguments.get("name") or "").strip()
+
+    if not skill_id:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次删除没有留下可回读的技能标识。",
+            verification={"verified": False, "reason": "no_ref", "ref": name},
+        )
+
+    row = await _read_skill(context.tenant_id, skill_id)
+
+    if row is not None:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"技能「{row.name}」在库里还在，不能视为已删除。",
+            error_code="VERIFY_SKILL_PRESENT",
+            verification={"verified": False, "reason": "present", "ref": skill_id},
+        )
+
+    if not await _admin_deleted_audited(context.tenant_id, skill_id, "skill_deleted"):
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message=(
+                f"库里已经查不到技能「{name}」，但也没找到这次删除的记录，核不出结论。"
+            ),
+            verification={"verified": False, "reason": "no_evidence", "ref": skill_id},
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"deleted": name, "skill_id": skill_id},
+        message=f"回读确认：技能「{name}」已不在库里，删除记录对得上。",
+        verification={"source": "skills_table+audit_logs", "ref": skill_id, "check": "absent"},
+    )
+
+
+def _tool_mismatch(kind: str, row: Any, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """提交了哪些字段就比哪些。MCP 接入项只看「接的是哪个远端工具、什么风险级」。
+
+    端点地址不比：不传 `server_url` 时它落到 `.env` 的默认端点，期望值要读配置
+    才能算出来，比出来的是「配置有没有变」而不是「这次保存有没有生效」。
+    """
+    checks: dict[str, tuple[Any, Any]] = {}
+
+    if arguments.get("display_name"):
+        checks["display_name"] = (row.display_name, str(arguments["display_name"]))
+
+    if kind == "mcp":
+        checks["remote_name"] = (row.remote_name, str(arguments.get("remote_name") or ""))
+        if arguments.get("risk_level"):
+            checks["risk_level"] = (row.risk_level.value, str(arguments["risk_level"]))
+    else:
+        if "method" in arguments:
+            checks["method"] = (row.method, str(arguments["method"]).upper())
+        if "url" in arguments:
+            checks["url"] = (row.url, str(arguments["url"] or "").strip())
+        if arguments.get("risk_level"):
+            checks["risk_level"] = (row.risk_level.value, str(arguments["risk_level"]))
+        if "enabled" in arguments:
+            checks["enabled"] = (bool(row.enabled), bool(arguments["enabled"]))
+        if "params" in arguments:
+            checks["params"] = (
+                sorted(str(entry.get("name")) for entry in (row.params or [])),
+                sorted(str(entry.get("name")) for entry in (arguments["params"] or [])),
+            )
+
+    diff = {
+        field: {"expected": expected, "actual": actual}
+        for field, (actual, expected) in checks.items()
+        if expected != actual
+    }
+    return diff or None
+
+
+async def verify_tool_saved(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """工具保存回读：库里的行与提交一致，**且**它在网关目录里。
+
+    两件都核，因为这正好对着两条不同的失败：库里写进去了但注册失败（这次调用
+    拿不到它），以及注册成功但库里那份被改过（以后重启就没了）。
+    """
+    kind = str(arguments.get("kind") or "").strip()
+    name = str(context.external_operation_id or arguments.get("name") or "").strip()
+
+    if kind not in {"http", "mcp"} or not name:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次保存没有留下可回读的工具标识或来源。",
+            verification={"verified": False, "reason": "no_ref", "ref": name, "kind": kind},
+        )
+
+    async with async_session_factory() as session:
+        if kind == "mcp":
+            row = await session.scalar(
+                select(McpRegisteredTool).where(McpRegisteredTool.local_name == name)
+            )
+        else:
+            row = await session.scalar(select(CustomTool).where(CustomTool.name == name))
+
+    if row is None:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"回读不到刚保存的工具「{name}」，不能视为已保存。",
+            error_code="VERIFY_TOOL_MISSING",
+            verification={"verified": False, "reason": "missing", "ref": name, "kind": kind},
+        )
+
+    diff = _tool_mismatch(kind, row, arguments)
+    if diff:
+        fields = "、".join(sorted(diff))
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=f"库里这个工具的定义与这次提交的不一致（{fields}），不能视为已保存。",
+            error_code="VERIFY_TOOL_MISMATCH",
+            verification={
+                "verified": False,
+                "reason": "mismatch",
+                "ref": name,
+                "kind": kind,
+                "diff": diff,
+            },
+        )
+
+    from app.tools.dependencies import get_tool_gateway
+
+    catalog = {tool.name for tool in get_tool_gateway().list_tools(include_disabled=True)}
+    if name not in catalog:
+        return ToolExecutionResult(
+            success=False,
+            verified=False,
+            message=(
+                f"工具「{name}」已经写进库，但不在当前进程的工具目录里，"
+                "这次调用拿不到它。重启会重建目录，也可以到「工具」页重新接入。"
+            ),
+            error_code="VERIFY_TOOL_NOT_REGISTERED",
+            verification={"verified": False, "reason": "not_registered", "ref": name, "kind": kind},
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"name": name, "kind": kind},
+        message=f"回读确认：工具「{name}」在库里，也已在工具目录中。",
+        verification={"source": "tool_table+tool_registry", "ref": name, "kind": kind},
+    )
+
+
+async def verify_tool_deleted(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """工具删除回读：按 id 在**对应的那张表**里查不到，且有删除审计。
+
+    `kind` 必填，理由与删除 handler 一致：http 与 mcp 是两张表，按名字只查一边
+    会把「另一边还在」当成删干净了。
+    """
+    kind = str(arguments.get("kind") or "").strip()
+    tool_id = str(context.external_operation_id or "").strip()
+    name = str(arguments.get("name") or "").strip()
+
+    if kind not in {"http", "mcp"} or not tool_id:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次移除没有留下可回读的工具标识或来源。",
+            verification={"verified": False, "reason": "no_ref", "ref": name, "kind": kind},
+        )
+
+    model = CustomTool if kind == "http" else McpRegisteredTool
+
+    async with async_session_factory() as session:
+        try:
+            row = await session.get(model, uuid.UUID(tool_id))
+        except (ValueError, AttributeError, TypeError):
+            # id 解析不出来时不必猜：交给下面的审计判断，核不出就说核不出。
+            row = None
+        if row is not None:
+            still = getattr(row, "local_name", None) or getattr(row, "name", tool_id)
+            return ToolExecutionResult(
+                success=False,
+                verified=False,
+                message=f"工具「{still}」在库里还在，不能视为已移除。",
+                error_code="VERIFY_TOOL_PRESENT",
+                verification={"verified": False, "reason": "present", "ref": tool_id},
+            )
+
+    if not await _admin_deleted_audited(
+        context.tenant_id, tool_id, f"{kind}_tool_deleted"
+    ):
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message=(
+                f"库里已经查不到工具「{name}」，但也没找到这次移除的记录，核不出结论。"
+            ),
+            verification={"verified": False, "reason": "no_evidence", "ref": tool_id},
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"deleted": name, "kind": kind, "tool_id": tool_id},
+        message=f"回读确认：工具「{name}」已不在库里，移除记录对得上。",
+        verification={"source": "tool_table+audit_logs", "ref": tool_id, "check": "absent"},
+    )
+
+
+def _connector_mismatch(row: Any, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """提交了哪些字段就比哪些，且期望值走服务层自己的归一化。
+
+    `base_url` 对 HTTP 连接器会去掉尾斜杠、`auth_header_name` 只在 header 认证下
+    保存（其余存空串）——这两条如果在这里另写一份，就会出现「保存成功但核验报
+    不一致」，而且改一处忘一处。
+    """
+    from app.models.connector import ConnectorAuthType
+    from app.services import connector_service
+
+    checks: dict[str, tuple[Any, Any]] = {}
+
+    if arguments.get("display_name"):
+        checks["display_name"] = (row.display_name, str(arguments["display_name"]))
+    if "description" in arguments:
+        checks["description"] = (row.description, str(arguments["description"] or "").strip())
+    if "kind" in arguments:
+        checks["kind"] = (row.kind.value, str(arguments["kind"]))
+    if "base_url" in arguments:
+        try:
+            wanted = connector_service.validate_base_url(
+                row.kind, str(arguments["base_url"] or "")
+            )
+        except connector_service.ConnectorConfigError:
+            wanted = str(arguments["base_url"] or "")
+        checks["base_url"] = (row.base_url, wanted)
+    if "auth_type" in arguments:
+        checks["auth_type"] = (row.auth_type.value, str(arguments["auth_type"]))
+    if "auth_header_name" in arguments:
+        wanted = (
+            str(arguments["auth_header_name"] or "").strip()
+            if row.auth_type == ConnectorAuthType.HEADER
+            else ""
+        )
+        checks["auth_header_name"] = (row.auth_header_name, wanted)
+    if "timeout_seconds" in arguments:
+        checks["timeout_seconds"] = (
+            int(row.timeout_seconds),
+            max(1, min(int(arguments["timeout_seconds"]), 300)),
+        )
+    if "enabled" in arguments:
+        checks["enabled"] = (bool(row.enabled), bool(arguments["enabled"]))
+
+    diff = {
+        field: {"expected": expected, "actual": actual}
+        for field, (actual, expected) in checks.items()
+        if expected != actual
+    }
+    return diff or None
+
+
+async def verify_connector_saved(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """连接器保存回读：定义与提交的一致。
+
+    比定义而不是「行在」，是因为这里最容易出的错是**静默改指向**：端点或认证
+    方式没跟着改，界面显示新地址，模型还在调旧地址，只有等到调用失败才显形。
+    """
+    name = str(context.external_operation_id or arguments.get("name") or "").strip()
+
+    if not name:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次保存没有留下可回读的连接器标识。",
+            verification={"verified": False, "reason": "no_ref"},
+        )
+
+    from app.services import connector_service
+
+    async with async_session_factory() as session:
+        with tenant_scope(context.tenant_id):
+            row = await connector_service.get_connector(session, name)
+
+        if row is None:
+            return ToolExecutionResult(
+                success=False,
+                verified=False,
+                message=f"回读不到连接器「{name}」，不能视为已保存。",
+                error_code="VERIFY_CONNECTOR_MISSING",
+                verification={"verified": False, "reason": "missing", "ref": name},
+            )
+
+        diff = _connector_mismatch(row, arguments)
+        if diff:
+            fields = "、".join(sorted(diff))
+            return ToolExecutionResult(
+                success=False,
+                verified=False,
+                message=(
+                    f"库里这个连接器的定义与这次提交的不一致（{fields}），不能视为已保存。"
+                ),
+                error_code="VERIFY_CONNECTOR_MISMATCH",
+                verification={"verified": False, "reason": "mismatch", "ref": name, "diff": diff},
+            )
+
+        snapshot = {
+            "name": row.name,
+            "kind": row.kind.value,
+            "base_url": row.base_url,
+            "auth_type": row.auth_type.value,
+            "enabled": bool(row.enabled),
+        }
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"connector": snapshot},
+        message=(
+            f"回读确认：连接器 {snapshot['name']} 在库里，"
+            f"{snapshot['kind']} · {snapshot['base_url'] or '（未配端点）'} · "
+            f"认证 {snapshot['auth_type']} · {'启用' if snapshot['enabled'] else '停用'}。"
+        ),
+        verification={"source": "connectors_table", "ref": snapshot["name"]},
+    )
+
+
+async def verify_connector_deleted(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> ToolExecutionResult:
+    """连接器删除回读：按 id 查不到，且有 `connector_deleted` 审计。
+
+    连接器这张表没有 RLS，空集确实更可信一些；但「按 id 查不到」仍然可能是
+    id 传错，所以照样要求那条正向证据。
+    """
+    from app.models.audit import AuditLog
+    from app.models.connector import Connector
+
+    raw_id = str(context.external_operation_id or "").strip()
+    name = str(arguments.get("name") or "").strip()
+
+    if not raw_id:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message="这次删除没有留下可回读的连接器标识。",
+            verification={"verified": False, "reason": "no_ref", "ref": name},
+        )
+
+    async with async_session_factory() as session:
+        with tenant_scope(context.tenant_id):
+            try:
+                row = await session.get(Connector, int(raw_id))
+            except (ValueError, TypeError):
+                row = None
+
+            if row is not None:
+                return ToolExecutionResult(
+                    success=False,
+                    verified=False,
+                    message=f"连接器 {row.name} 在库里还在，不能视为已删除。",
+                    error_code="VERIFY_CONNECTOR_PRESENT",
+                    verification={"verified": False, "reason": "present", "ref": raw_id},
+                )
+
+            audited = await session.scalar(
+                select(AuditLog.id)
+                .where(
+                    AuditLog.resource_id == raw_id,
+                    AuditLog.event_type == AuditEventType.CONNECTOR_DELETED,
+                )
+                .limit(1)
+            )
+
+    if audited is None:
+        return ToolExecutionResult(
+            success=True,
+            verified=False,
+            message=(
+                f"库里已经查不到连接器「{name}」，但也没找到这次删除的记录，核不出结论。"
+            ),
+            verification={"verified": False, "reason": "no_evidence", "ref": raw_id},
+        )
+
+    return ToolExecutionResult(
+        success=True,
+        verified=True,
+        result={"deleted": name, "connector_id": raw_id},
+        message=f"回读确认：连接器 {name} 已不在库里，删除记录对得上。",
+        verification={"source": "connectors_table+audit_logs", "ref": raw_id, "check": "absent"},
+    )
+
+
+# ---------------- 其余写工具的确认卡正文 ----------------
+#
+# 与 `_summarize_workflow_call` 同一条理由：确认卡的正文只能由
+# `interrupt(message=…)` 给，同轮那段助手文字会被整段顶掉。没有摘要时，卡上
+# 只剩工具名与一份折叠参数——审批人批的是他没看过的东西。
+#
+# 两条纪律：
+# 1. **只陈述参数**，不查库、不校验。摘要是让人看懂，不是判定；查库的活归
+#    `preflight`（出卡前）与 `verifier`（执行后）。
+# 2. **没传的字段写「沿用现有」**，不按默认值猜。update 时模型往往只传一个字段，
+#    摘要若照整份新配置写，人会以为别的都变了——猜错的卡片比没有卡片更糟。
+
+
+def _one_line(value: Any, limit: int = 80) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _names(items: Any, limit: int = 5) -> str:
+    values = [str(item) for item in (items or [])]
+    if not values:
+        return "无"
+    head = "、".join(values[:limit])
+    return head if len(values) <= limit else f"{head} 等 {len(values)} 个"
+
+
+_SCOPE_LABEL = {"public": "公开", "internal": "内部", "confidential": "机密"}
+
+
+async def _summarize_skill_save(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    creating = str(arguments.get("mode") or "") == "create"
+    name = _one_line(arguments.get("name"), 64) or "（未命名）"
+    display = _one_line(arguments.get("display_name"), 64)
+    lines = [
+        f"新建技能「{display or name}」（{name}）"
+        if creating
+        else f"修改技能「{display or name}」（{name}）"
+    ]
+
+    facts: list[str] = []
+    if "instruction" in arguments:
+        text = str(arguments.get("instruction") or "")
+        facts.append(f"指令 {len(text)} 字" if text else "指令清空")
+    if "trigger_keywords" in arguments:
+        words = arguments.get("trigger_keywords") or []
+        facts.append(
+            f"触发词 {len(words)} 个（{_names(words, 4)}）" if words else "触发词清零"
+        )
+    if "allowed_tools" in arguments:
+        tools = arguments.get("allowed_tools")
+        if tools is None:
+            facts.append("工具不限（不额外收窄）")
+        elif not tools:
+            facts.append("工具白名单为空（一个都调不动）")
+        else:
+            facts.append(f"工具 {len(tools)} 个（{_names(tools)}）")
+    if "priority" in arguments:
+        facts.append(f"优先级 {arguments.get('priority')}")
+    if "enabled" in arguments:
+        facts.append("启用" if arguments.get("enabled") else "停用")
+
+    if facts:
+        lines.append(("本次改动：" if not creating else "") + " · ".join(facts))
+    else:
+        lines.append("本次改动：无（只传了标识，没有任何字段会变）")
+    lines.append("技能不授予权限：allowed_tools 只会在人已有的权限里收窄。")
+    return "\n".join(lines)
+
+
+async def _summarize_skill_delete(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    name = _one_line(arguments.get("name"), 64) or "（未指定）"
+    return "\n".join(
+        [
+            f"删除技能「{name}」，连同它的指令、触发词与工具白名单。",
+            "仍被智能体引用的技能会照删，结果里会点名是哪些——"
+            "那些智能体下次运行就没有这条技能了。",
+        ]
+    )
+
+
+async def _summarize_tool_save(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    kind = str(arguments.get("kind") or "").strip()
+    name = _one_line(arguments.get("name"), 64) or "（未命名）"
+    display = _one_line(arguments.get("display_name"), 128)
+
+    if kind == "python":
+        return "Python 工具由代码注册，这次会被直接拒绝（没有运行时的新增或修改入口）。"
+
+    if kind == "mcp":
+        remote = _one_line(arguments.get("remote_name"), 128) or "（未指定）"
+        endpoint = _one_line(arguments.get("server_url"), 90) or "默认 MCP 端点"
+        risk = str(arguments.get("risk_level") or "read")
+        return "\n".join(
+            [
+                f"接入 MCP 工具：本地名 {name} ← 远端 {remote}"
+                f"（{display or remote}）",
+                f"端点 {endpoint} · 风险 {risk}",
+                "只增加本地的接入与白名单，不动远端服务；凭据不经过这次操作。",
+            ]
+        )
+
+    creating = str(arguments.get("mode") or "") == "create"
+    lines = [
+        f"新建自定义工具「{display or name}」（{name}）"
+        if creating
+        else f"修改自定义工具「{display or name}」（{name}）"
+    ]
+
+    facts: list[str] = []
+    method = str(arguments.get("method") or "").upper()
+    url = _one_line(arguments.get("url"), 100)
+    if method or url:
+        facts.append(" ".join(part for part in (method, url) if part))
+    if "risk_level" in arguments:
+        facts.append(f"风险 {arguments.get('risk_level')}")
+    if "params" in arguments:
+        params = [item for item in (arguments.get("params") or []) if isinstance(item, dict)]
+        required = [str(item.get("name")) for item in params if item.get("required")]
+        label = f"参数 {len(params)} 个"
+        if required:
+            label += f"（必填：{_names(required, 3)}）"
+        facts.append(label)
+    if "headers" in arguments:
+        facts.append(f"自定义请求头 {len(arguments.get('headers') or {})} 个（值不回显）")
+    if "timeout_seconds" in arguments:
+        facts.append(f"超时 {arguments.get('timeout_seconds')} 秒")
+    if "enabled" in arguments:
+        facts.append("启用" if arguments.get("enabled") else "停用")
+
+    if facts:
+        lines.append(("本次改动：" if not creating else "") + " · ".join(facts))
+    else:
+        lines.append("本次改动：无（只传了标识，没有任何字段会变）")
+    lines.append("凭据不在这次操作里：鉴权走租户凭据引用，值不进对话与审批卡。")
+    return "\n".join(lines)
+
+
+async def _summarize_tool_delete(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    kind = str(arguments.get("kind") or "").strip()
+    name = _one_line(arguments.get("name"), 64) or "（未指定）"
+    label = {"http": "自定义 HTTP 工具", "mcp": "MCP 接入项"}.get(kind, "工具")
+    lines = [f"移除{label}「{name}」（{kind}）"]
+    if kind == "mcp":
+        lines.append("只取消本地的接入与白名单，远端 MCP 服务不受影响。")
+    else:
+        lines.append("删掉的是本地工具定义，远端接口不受影响。")
+    lines.append("边界里写着它的智能体会失去这个工具——工具清单是运行时读的。")
+    return "\n".join(lines)
+
+
+async def _summarize_knowledge_add(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    title = _one_line(arguments.get("title"), 80) or "（无标题）"
+    content = str(arguments.get("content") or "")
+    scope = str(arguments.get("access_scope") or "internal")
+    return "\n".join(
+        [
+            f"往知识库写一份文档「{title}」：正文 {len(content)} 字，"
+            f"分级 {_SCOPE_LABEL.get(scope, scope)}（{scope}）。",
+            "同一份正文重复写是幂等的，不会产生两份；写完会切片并进入检索。",
+        ]
+    )
+
+
+async def _summarize_knowledge_delete(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    document_id = _one_line(arguments.get("document_id"), 64) or "（未给 id）"
+    title = _one_line(arguments.get("confirm_title"), 80) or "（标题未填）"
+    return "\n".join(
+        [
+            f"下架知识库文档「{title}」（id {document_id}）。",
+            "这是软删除：文档与切片不再出现在检索里，记录与审计保留，不做物理删除。",
+        ]
+    )
+
+
+async def _summarize_import(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    file_id = _one_line(arguments.get("file_id"), 40) or "（未给附件）"
+    target = str(arguments.get("target") or "auto")
+    filename = _one_line(arguments.get("filename"), 80)
+    head = f"导入附件 {file_id}"
+    if filename:
+        head += f"（{filename}）"
+    head += f" → {_IMPORT_LABEL.get(target, target)}"
+    lines = [head]
+
+    facts: list[str] = []
+    if arguments.get("title"):
+        facts.append(f"标题 {_one_line(arguments.get('title'), 60)}")
+    if arguments.get("access_scope"):
+        facts.append(f"分级 {arguments.get('access_scope')}")
+    if arguments.get("name"):
+        facts.append(f"标识 {_one_line(arguments.get('name'), 60)}")
+    if arguments.get("mode"):
+        facts.append(f"同名处理 {arguments.get('mode')}")
+    if facts:
+        lines.append(" · ".join(facts))
+
+    if target == "auto":
+        lines.append(
+            "自动识别只看内容：带 front matter 的 Markdown 判技能，"
+            "OpenAPI / 工具导出 JSON 判工具，其余进知识库；判不出会拒绝，不会猜。"
+        )
+    return "\n".join(lines)
+
+
+async def _summarize_connector_save(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    creating = str(arguments.get("mode") or "create") == "create"
+    name = _one_line(arguments.get("name"), 64) or "（未命名）"
+    kind = str(arguments.get("kind") or "mcp")
+    auth = str(arguments.get("auth_type") or "none")
+    auth_label = {
+        "none": "不需要凭据",
+        "bearer": "Bearer 令牌",
+        "header": "自定义请求头",
+        "basic": "用户名 + 密码",
+    }.get(auth, auth)
+
+    lines = [
+        f"新建连接器 {name}"
+        if creating
+        else f"修改连接器 {name}"
+    ]
+    facts: list[str] = []
+    # `kind` 在 update 且没传时是「沿用现有」，不能按默认值 mcp 写——那会让人
+    # 以为这次把类型改了。
+    if creating or "kind" in arguments:
+        facts.append(f"类型 {kind}")
+    if creating or "base_url" in arguments:
+        facts.append(f"端点 {_one_line(arguments.get('base_url'), 90) or '（空）'}")
+    if creating or "auth_type" in arguments:
+        facts.append(f"认证 {auth_label}")
+    if "auth_header_name" in arguments and auth == "header":
+        facts.append(f"请求头名 {_one_line(arguments.get('auth_header_name'), 40)}")
+    if "timeout_seconds" in arguments:
+        facts.append(f"超时 {arguments.get('timeout_seconds')} 秒")
+    if "enabled" in arguments:
+        facts.append("启用" if arguments.get("enabled") else "停用")
+    if facts:
+        lines.append(("本次改动：" if not creating else "") + " · ".join(facts))
+    else:
+        lines.append("本次改动：无（只传了标识，没有任何字段会变）")
+
+    if creating or "auth_type" in arguments:
+        if auth == "none":
+            lines.append("这个连接器不需要凭据，保存后配好工具即可调用。")
+        else:
+            lines.append(
+                "凭据不在这次操作里：保存后请到控制台「连接器」页填写，值不要发在对话里。"
+            )
+    else:
+        lines.append("认证方式与凭据沿用现有配置，这次不动。")
+    return "\n".join(lines)
+
+
+async def _summarize_connector_delete(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    name = _one_line(arguments.get("name"), 64) or "（未指定）"
+    return "\n".join(
+        [
+            f"删除连接器 {name}。",
+            "下面还挂着工具时会被拒绝——先把它们取消接入或删掉，"
+            "否则那些工具的凭据来源会被静默换掉。",
+            "远端服务不受影响，只是平台不再接入它；凭据随这条记录一起删除。",
+        ]
+    )
+
+
+async def _summarize_workflow_delete(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> str:
+    name = _one_line(arguments.get("name"), 64) or "（未指定）"
+    return "\n".join(
+        [
+            f"删除流程「{name}」。",
+            "历史运行记录与未完结的运行都保留（它们按冻结的图走），删的只是这份配置。",
+            "只是暂时不想被触发的话，用「修改流程」把 enabled 设为 false 更合适。",
+        ]
     )
 
 
@@ -2065,7 +3402,9 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             },
             handler=studio_skill_save,
             preflight=_preflight_credentials,
-            verification_hint="保存后回读技能，给出启用状态与工具数量。",
+            summarize=_summarize_skill_save,
+            verifier=verify_skill_saved,
+            verification_hint="保存后另起会话回读技能，字段与提交的一致才算数。",
         ),
         ToolDefinition(
             name="studio_skill_delete",
@@ -2088,7 +3427,9 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                 "additionalProperties": False,
             },
             handler=studio_skill_delete,
-            verification_hint="删除后回读，确认已不存在。",
+            summarize=_summarize_skill_delete,
+            verifier=verify_skill_deleted,
+            verification_hint="删除后按 id 回读查不到，且找得到这次删除的审计。",
         ),
         ToolDefinition(
             name="studio_tool_save",
@@ -2134,7 +3475,9 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             },
             handler=studio_tool_save,
             preflight=_preflight_tool,
-            verification_hint="保存后确认已注册进网关目录。",
+            summarize=_summarize_tool_save,
+            verifier=verify_tool_saved,
+            verification_hint="保存后回读库里的定义，并确认它已在工具目录中。",
         ),
         ToolDefinition(
             name="studio_tool_delete",
@@ -2159,7 +3502,9 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             },
             handler=studio_tool_delete,
             preflight=_preflight_tool_delete,
-            verification_hint="移除后确认网关目录里已经没有它。",
+            summarize=_summarize_tool_delete,
+            verifier=verify_tool_deleted,
+            verification_hint="移除后按 id 在对应表里查不到，且有这次移除的审计。",
         ),
         ToolDefinition(
             name="studio_knowledge_add",
@@ -2191,6 +3536,7 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             },
             handler=studio_knowledge_add,
             preflight=_preflight_credentials,
+            summarize=_summarize_knowledge_add,
             verifier=verify_ingested_document,
             verification_hint="另起一个会话按文档 id 回读：文档在、状态 ready、切片数大于 0。",
         ),
@@ -2215,6 +3561,7 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                 "additionalProperties": False,
             },
             handler=studio_knowledge_delete,
+            summarize=_summarize_knowledge_delete,
             verifier=verify_document_retired,
             verification_hint="另起会话回读：状态是 deleted，且活跃切片归零。",
         ),
@@ -2286,6 +3633,7 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             },
             handler=studio_import,
             preflight=_preflight_import,
+            summarize=_summarize_import,
             verifier=verify_ingested_document,
             verification_hint=(
                 "导入后另起会话回读知识库文档（在库、ready、有切片）；"
@@ -2328,7 +3676,9 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             },
             handler=studio_connector_save,
             preflight=_preflight_credentials,
-            verification_hint="保存后确认连接器出现在列表里，并提示用户去配凭据。",
+            summarize=_summarize_connector_save,
+            verifier=verify_connector_saved,
+            verification_hint="保存后回读连接器定义，端点与认证方式与提交的一致。",
         ),
         ToolDefinition(
             name="studio_connector_delete",
@@ -2352,7 +3702,9 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                 "additionalProperties": False,
             },
             handler=studio_connector_delete,
-            verification_hint="删除后确认不再出现在连接器列表里。",
+            summarize=_summarize_connector_delete,
+            verifier=verify_connector_deleted,
+            verification_hint="删除后按 id 回读查不到，且有 connector_deleted 审计。",
         ),
         ToolDefinition(
             name="studio_workflow_save",
@@ -2360,19 +3712,38 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             description=(
                 "新建或修改一张编排流程（workflow）。mode=create 新建（必须给 definition），"
                 "mode=update 只改传入的字段（不给 definition 就只改说明与启停）。"
-                "definition 是一张有向无环图："
-                '{"entry": "起点节点id", "nodes": [{"id", "kind"?, "agent"?, "task", '
-                '"emit"?: {"field", "values"?/"pattern"?}, "next": [{"when": ...|null, "to": "节点id"}]}]}。'
+                "name 建好之后不能改（它出现在「/workflow」后面与审计里），换名字只能新建一张；"
+                "只换显示名改 display_name。"
+                "**建图前先 studio_describe resource=agent 看有哪些智能体**："
+                "agent 只能填那份清单里存在、且状态是启用中（active）的标识，保存时会逐个核对，"
+                "填错会被拒（拒绝理由里带可用名单）——不要凭印象编一个名字。"
+                "definition 是一张有向无环图，最小可用形状："
+                '{"entry": "check", "nodes": ['
+                '{"id": "check", "agent": "field-ops", "task": "查压力：{{input.text}}", '
+                '"emit": {"field": "level", "values": ["正常", "超压"]}, '
+                '"next": [{"when": {"key": "level", "op": "eq", "value": "超压"}, "to": "act"}, '
+                '{"when": null, "to": "report"}]}, '
+                '{"id": "act", "agent": "field-ops", "task": "按超压处置：{{nodes.check.level}}", '
+                '"next": [{"when": null, "to": "report"}]}, '
+                '{"id": "report", "kind": "compose", "task": "结论：{{upstream}}", "next": []}]}。'
                 "kind 省略即 agent 节点（调 agent 指定的智能体）；kind=compose 只汇总不调人；"
                 "kind=parallel 用 branches[{id,agent,task}] 并行再汇总。"
                 "task 里可用的占位符只有 {{input.text}}（用户那句话）、{{nodes.<id>}}、"
                 "{{nodes.<id>.<field>}}、{{inputs.<name>}}、{{upstream}}（已跑过的汇总）。"
                 "next 的 when 为 null 是兜底边：**除终点（next: []）外每条分支都必须有一条**，"
                 "否则条件全不命中时流程静默死掉。when 的写法 {key, op, value}，"
-                "op 只有 eq/neq/in/gt/lt；key 必须是上游 emit.field 产出的。"
+                "op 只有 eq/neq/in/gt/lt。"
+                "**条件的 key 必须是某个节点 emit.field 产出的那个名字**（保存时核对），"
+                "value 要从该节点 emit.values 里原样抄一个——写错不会报错，"
+                "那条分支只会永远不命中、每次都走兜底边，看起来在工作其实没分流。"
                 "节点数上限 20，id 用小写字母开头。保存即编译，图不成立会被拒绝并指出哪个节点——"
                 "照它改，不要为了过校验把边改成兜底边。"
-                "流程是租户级配置，触发只有「/workflow <标识> <要做的事>」或对话窗口的下拉。"
+                "**用户点名的角色要当真**：他说「让 ops 判断」，图里就必须有 ops。"
+                "清单里没有这个名字时不要默默换成别的——先用 studio_agent_save 建出来，"
+                "或者用现有角色但在调用保存**之前**说明「没有 ops，这一步我用 field-ops」，"
+                "让他有机会拦住。确认卡上会列出每一步的角色，换过的人一眼就能看出来。"
+                "流程是租户级配置，触发只有「/workflow <标识> <要做的事>」或对话窗口的下拉——"
+                "在「对话」页触发，不在这个助手面板里（助手没有节点要用的那些工具）。"
             ),
             kind="python",
             risk_level=RiskLevel.WRITE,
@@ -2397,7 +3768,15 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                 "additionalProperties": False,
             },
             handler=studio_workflow_save,
+            # 三步齐全：卡之前问能不能编译（别让人确认一张注定被拒的卡）、
+            # 卡上写清几步与谁做、卡之后另起会话回读。
+            preflight=_preflight_workflow,
+            summarize=_summarize_workflow_call,
+            verifier=verify_workflow_saved,
             verification_hint="保存后回读这张流程，给出节点数、跳数与版本号。",
+            # 覆盖式写入：`definition` 是整张图，存进去就没有旧版了
+            # （修订号只加一，不留历史）。写前先留原件。
+            backup=_backup_workflow,
         ),
         ToolDefinition(
             name="studio_workflow_delete",
@@ -2421,6 +3800,11 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                 "additionalProperties": False,
             },
             handler=studio_workflow_delete,
-            verification_hint="删除后回读，确认列表里已经没有它。",
+            summarize=_summarize_workflow_delete,
+            # 删除类的核验是「确认它不在」，比保存更难：查不到可能是删掉了，
+            # 也可能是这一侧读不到（名字不对、租户上下文没绑上）。见
+            # `verify_workflow_deleted`——按 id 查 + 找删除审计，两条都成立才算。
+            verifier=verify_workflow_deleted,
+            verification_hint="删除后按流程 id 回读，确认库里已经没有它、删除记录也在。",
         ),
     ]

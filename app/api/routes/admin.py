@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+from dataclasses import replace
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -28,6 +30,7 @@ from app.core.config import settings
 from app.db.session import async_session_factory
 from app.integrations.mcp_client import McpError
 from app.models.audit import AuditLog
+from app.models.connector import Connector, ConnectorCredential
 from app.models.mcp_registered import McpRegisteredTool
 from app.models.tenant import Tenant
 from app.observability.writer import get_writer as get_obs_writer
@@ -41,8 +44,10 @@ from app.schemas.admin import (
     McpRemoteTool,
     McpRuntimeResponse,
     McpToolRegisterRequest,
+    McpToolUpdateRequest,
     MemberResponse,
     MemberUpsertRequest,
+    PolicySnapshotResponse,
     QuotaRequest,
     QuotaResponse,
     RuntimeSettingsResponse,
@@ -62,7 +67,7 @@ from app.schemas.model_provider import (
     ProviderResponse,
     ProviderUpdate,
 )
-from app.services import runtime_settings
+from app.services import connector_service, runtime_settings
 from app.services.audit_service import write_admin_action
 from app.services.mcp_tool_service import (
     McpToolNameError,
@@ -76,7 +81,7 @@ from app.services.model_service import invalidate_model_cache, resolve_text_mode
 from app.services.tenant_service import get_tenant_service
 from app.tenancy.context import platform_admin_tenant_scope
 from app.tools.dependencies import get_tool_gateway
-from app.tools.gateway import risk_override_error
+from app.tools.gateway import is_write_risk, risk_override_error
 from app.tools.mcp_tools import (
     McpConfigError,
     code_local_names,
@@ -162,6 +167,30 @@ async def update_runtime_settings(
             payload.knowledge_max_chunks, actor=identity.subject
         )
 
+    # 备份三项：各自独立落审计。塞进同一条会让「谁把阈值调小了」查不出来。
+    backup_changes: list[tuple[str, Any]] = []
+    if payload.tool_backup_enabled is not None:
+        if await runtime_settings.set_backup_enabled(
+            payload.tool_backup_enabled, actor=identity.subject
+        ):
+            backup_changes.append(
+                (runtime_settings.TOOL_BACKUP_ENABLED, payload.tool_backup_enabled)
+            )
+    if payload.tool_backup_threshold_mb is not None:
+        if await runtime_settings.set_backup_threshold_mb(
+            payload.tool_backup_threshold_mb, actor=identity.subject
+        ):
+            backup_changes.append(
+                (runtime_settings.TOOL_BACKUP_THRESHOLD_MB, payload.tool_backup_threshold_mb)
+            )
+    if payload.tool_backup_max_size_mb is not None:
+        if await runtime_settings.set_backup_max_size_mb(
+            payload.tool_backup_max_size_mb, actor=identity.subject
+        ):
+            backup_changes.append(
+                (runtime_settings.TOOL_BACKUP_MAX_SIZE_MB, payload.tool_backup_max_size_mb)
+            )
+
     with platform_admin_tenant_scope("platform"):
         async with async_session_factory() as session:
             async with session.begin():
@@ -192,8 +221,50 @@ async def update_runtime_settings(
                             "knowledge_max_chunks": payload.knowledge_max_chunks,
                         },
                     )
+                for key, value in backup_changes:
+                    await _audit(
+                        session,
+                        identity=identity,
+                        target_tenant="platform",
+                        operation="runtime_settings_updated",
+                        resource_type="runtime_settings",
+                        resource_id=key,
+                        metadata={key: value},
+                    )
 
+    # 返回的是**改完之后**的快照：页面拿它直接回填，且能看见新的 revision。
+    # 不传 revision 让人自己去查，会让「刚才那次保存到底生效了没有」变成
+    # 一次额外请求。
     return RuntimeSettingsResponse(**runtime_settings.snapshot())
+
+
+@router.get(
+    "/runtime-settings/snapshots/{revision}",
+    response_model=PolicySnapshotResponse,
+)
+async def get_policy_snapshot(
+    revision: int,
+    identity: Identity = Depends(require_platform_admin),
+) -> PolicySnapshotResponse:
+    """按号取回**当时**的完整生效配置。
+
+    存在的意义是「事后能回答这一版是什么」：工具审计里记了 `policy_revision`，
+    人拿着那个号就能在这里取回同一份值，而不是凭现在的配置去猜当时。
+
+    沙箱侧**不需要**回头调这里：每次执行时那一份完整策略是随请求推过去的
+    （见 `app/integrations/sandbox_client.py` 的模块文档），执行中途不再二次
+    读取——否则两次读取之间管理员按一下开关，执行就跨越了两个策略。
+
+    revision=0 永远有内容——它表示「从未改过配置，全按 .env 默认」，
+    由代码合成而非落库。查不到时返回 `found=false` 而不是 404：
+    「这一版不存在」与「这个接口不存在」对调用方是两个完全不同的处置。
+    """
+    snapshot = await runtime_settings.snapshot_at(revision)
+
+    if snapshot is None:
+        return PolicySnapshotResponse(revision=revision, settings={}, found=False)
+
+    return PolicySnapshotResponse(revision=revision, settings=snapshot, found=True)
 
 
 @router.get("/tenants", response_model=list[TenantResponse])
@@ -845,8 +916,10 @@ MCP_TRANSPORT = "streamable-http"
 def _registered_remote_map() -> dict[str, str]:
     """远端工具名 → 本地工具名。只有登记过的才会出现在模型目录里。
 
-    注意映射的权威来源是 mcp_tools 里的 _REMOTE_BY_LOCAL：McpToolSpec
-    上没有 remote_name 字段（留空是历史原因），别照 dataclass 猜。
+    映射的权威来源是 mcp_tools 里的 `_REMOTE_BY_LOCAL`。代码白名单现在为空
+    （prv_ 那批下线，改由 FioCloud 连接器提供 fc_*），所以这张表通常也是空的：
+    「已接入」由 `mcp_registered_tools` 决定。保留这个入口是为了以后再把工具
+    登记回代码时，发现弹窗仍能认出「这个远端工具已经在代码里接过了」。
     """
     return remote_to_local_map()
 
@@ -977,6 +1050,66 @@ async def discover_mcp_tools(
 _MCP_SCOPE = "platform"
 
 
+async def _mcp_tool_responses(
+    rows: list[McpRegisteredTool],
+    *,
+    gateway,
+    tenant_id: str | None,
+) -> list[McpRegisteredToolResponse]:
+    """接入项 → 响应，顺带说清「令牌从哪来」。
+
+    经连接器接入的行上 `token` 永远是空的：端点取 `connectors.base_url`、
+    凭据按租户现取（`connector_service` 里"连接器完全接管"那条）。只回
+    `token_set` 会把设计如此显示成「未配置」，而它和「连接器停用 / 本租户
+    没配凭据」长得一模一样——后者是真的调不通。
+
+    凭据状态按**调用方所在租户**（`identity.tenant_id`）算，与连接器列表页的
+    `credential_set` 同一口径：同一份列表，A 看到已配置、B 看到未配置，这是对的。
+
+    `tenant_id` 必须由调用方传，不能读上下文：`require_platform_admin` 会把
+    上下文租户固定成平台租户。凭据表还挂着 RLS——事务开始时按上下文租户
+    `set_config('app.tenant_id', ...)`，所以照上下文查会**一行都读不到**，
+    而 RLS 的拒绝和「没配凭据」在代码里长得一模一样，界面就成了「全都没配」。
+    读凭据要显式以该租户身份进入作用域。
+    """
+    connector_ids = {row.connector_id for row in rows if row.connector_id}
+    connectors: dict[int, Connector] = {}
+    credential_ids: set[int] = set()
+
+    if connector_ids:
+        async with async_session_factory() as session:
+            found = (
+                await session.scalars(select(Connector).where(Connector.id.in_(connector_ids)))
+            ).all()
+            connectors = {item.id: item for item in found}
+
+        if tenant_id:
+            with platform_admin_tenant_scope(tenant_id):
+                async with async_session_factory() as session:
+                    credential_rows = (
+                        await session.scalars(
+                            select(ConnectorCredential).where(
+                                ConnectorCredential.tenant_id == tenant_id
+                            )
+                        )
+                    ).all()
+                    credential_ids = {item.connector_id for item in credential_rows}
+
+    return [
+        row_to_response(
+            row,
+            gateway=gateway,
+            connector=connectors.get(row.connector_id) if row.connector_id else None,
+            credential_set=(
+                row.connector_id in credential_ids
+                if row.connector_id and tenant_id
+                else None
+            ),
+        )
+        for row in rows
+    ]
+
+
 @router.get("/mcp/tools", response_model=McpRegisteredToolListResponse)
 async def list_registered_mcp_tools(
     identity: Identity = Depends(require_platform_admin),
@@ -990,8 +1123,129 @@ async def list_registered_mcp_tools(
         ).all()
 
     return McpRegisteredToolListResponse(
-        items=[row_to_response(row, gateway=gateway) for row in rows]
+        items=await _mcp_tool_responses(
+            list(rows), gateway=gateway, tenant_id=identity.tenant_id
+        )
     )
+
+
+@router.patch("/mcp/tools/{local_name}", response_model=McpRegisteredToolResponse)
+async def update_registered_mcp_tool(
+    local_name: str,
+    payload: McpToolUpdateRequest,
+    identity: Identity = Depends(require_platform_admin),
+) -> McpRegisteredToolResponse:
+    """改接入项的风险等级与展示文案。
+
+    接入是批量做的（连接器「发现工具」一次接进几十个），那时只能给一个统一的
+    保守值，于是「查一次压力」「列一下站点」也全成了 `write`——每问一句都弹
+    审批单，平台等于不可用。风险等级得能按工具逐个调回来。
+
+    审批由风险级**推导**（表里不存 `requires_approval`），所以这里必须同时
+    改注册表里的那份定义：只改库会导致界面显示「读取」而实际照样弹审批单，
+    两边不一致时人只会相信自己看到的那份。
+
+    代码白名单里的同名工具不许改：那份风险级写在代码里，是要改代码的事。
+    """
+    if local_name in code_local_names():
+        raise HTTPException(
+            status_code=400,
+            detail=f"{local_name} 由代码注册，风险等级写在代码里，不经由此接口修改。",
+        )
+
+    data = payload.model_dump(exclude_unset=True)
+    # `None` 表示「这次不动」，空串是「清空说明」，两者不能混为一谈。
+    data = {key: value for key, value in data.items() if value is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="没有要修改的字段。")
+
+    gateway = get_tool_gateway()
+
+    with platform_admin_tenant_scope(_MCP_SCOPE):
+        async with async_session_factory() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(McpRegisteredTool).where(
+                        McpRegisteredTool.local_name == local_name
+                    )
+                )
+                if row is None:
+                    raise HTTPException(status_code=404, detail="该工具没有接入记录。")
+
+                before = {
+                    "risk_level": row.risk_level.value,
+                    "display_name": row.display_name,
+                    "timeout_seconds": int(row.timeout_seconds or 60),
+                }
+
+                if "risk_level" in data:
+                    row.risk_level = data["risk_level"]
+                if "display_name" in data:
+                    row.display_name = data["display_name"]
+                if "description" in data:
+                    row.description = data["description"]
+                if "timeout_seconds" in data:
+                    row.timeout_seconds = data["timeout_seconds"]
+                await session.flush()
+
+                await _audit(
+                    session,
+                    identity=identity,
+                    target_tenant=_MCP_SCOPE,
+                    operation="mcp_tool_updated",
+                    resource_type="mcp_registered_tool",
+                    resource_id=str(row.id),
+                    metadata={
+                        "local_name": row.local_name,
+                        "before": before,
+                        "after": {
+                            "risk_level": row.risk_level.value,
+                            "display_name": row.display_name,
+                            "timeout_seconds": int(row.timeout_seconds or 60),
+                        },
+                    },
+                )
+
+    synced = _resync_mcp_definition(gateway, row)
+    if not synced:
+        # 没在注册表里（停用中或上次注册失败）：库里已是对的，重启/重新接入时生效。
+        logger.warning(
+            "接入项已更新，但它当前不在注册表里，本次只改了库。",
+            extra={"event": "mcp_tool_update_not_registered", "tool_name": row.local_name},
+        )
+
+    return (
+        await _mcp_tool_responses([row], gateway=gateway, tenant_id=identity.tenant_id)
+    )[0]
+
+
+def _resync_mcp_definition(gateway, row: McpRegisteredTool) -> bool:
+    """把库里的改动同步到注册表里那份定义。
+
+    用 `replace` 而不是重新 `register_row`：后者要再拉一次远端 schema，
+    而这次改动只涉及风险级与展示文案，不该为了改一个枚举值去联网。
+    """
+    if not gateway.has_tool(row.local_name):
+        return False
+
+    existing = gateway.get_tool(row.local_name)
+    if existing.source != "mcp":
+        return False
+
+    gateway.register_tool(
+        replace(
+            existing,
+            display_name=row.display_name,
+            description=row.description or "",
+            risk_level=row.risk_level,
+            # 审批是「风险级 + 显式声明」的或；只换风险级会被旧的
+            # requires_approval=True 顶回来，表现成「降成读取了还是要审批」。
+            requires_approval=is_write_risk(row.risk_level),
+            timeout_seconds=int(row.timeout_seconds or 60),
+        ),
+        replace=True,
+    )
+    return True
 
 
 @router.post("/mcp/tools", response_model=McpRegisteredToolResponse, status_code=201)
@@ -1098,7 +1352,9 @@ async def register_mcp_tool(
             extra={"event": "mcp_registered_tool_failed", "tool_name": row.local_name},
         )
 
-    return row_to_response(row, gateway=gateway)
+    return (
+        await _mcp_tool_responses([row], gateway=gateway, tenant_id=identity.tenant_id)
+    )[0]
 
 
 @router.delete("/mcp/tools/{local_name}")

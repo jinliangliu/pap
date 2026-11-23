@@ -91,6 +91,46 @@ def test_generic_error_response_hints_at_gateway() -> None:
     assert "网关" in str(out)
 
 
+def _classify_after(status: int):
+    """分类前先塞入传输层记下的状态码，模拟「SDK 把响应丢了」的真实路径。"""
+    client = _client()
+    client._last_status = status
+    return client._classify(
+        SdkMcpError(code=-32603, message="Server returned an error response")
+    )
+
+
+def test_generic_message_with_401_is_auth_not_gateway() -> None:
+    """同样是那句兜底文案，401 必须是凭据问题。
+
+    线上踩过：连接器凭据被清空后点「发现工具」，远端回 401（body 是
+    `{"error": "invalid_token"}`，不是 JSON-RPC），SDK 把状态码丢了，
+    平台照着「网关/反向代理拦下了请求」报错。人于是去查隧道，而真正要做的是
+    把凭据填回去。这条断言盯的就是这个方向性错误。
+    """
+    out = _classify_after(401)
+
+    assert isinstance(out, McpAuthError)
+    assert "401" in str(out)
+    assert "凭据" in str(out)
+    assert "网关" not in str(out)
+
+
+def test_generic_message_with_502_points_at_the_gateway() -> None:
+    out = _classify_after(502)
+
+    assert isinstance(out, McpUnavailableError)
+    assert "502" in str(out)
+    assert "网关" in str(out)
+
+
+def test_generic_message_with_404_points_at_the_path() -> None:
+    out = _classify_after(404)
+
+    assert isinstance(out, McpUnavailableError)
+    assert "/mcp" in str(out)
+
+
 def test_terminated_session_is_retryable() -> None:
     out = _classify(SdkMcpError(code=-32600, message="Session terminated"))
 

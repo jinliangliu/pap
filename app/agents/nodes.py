@@ -229,11 +229,18 @@ _META_KEYS = frozenset(
         "note",
         "scope",
         "query",
+        # 查询对象（agent / tool / run …）：这是工具的入参回显，不是结果。
+        # 漏在这里的代价是用户会看到「resource：tool」「total：99」这种内部字段，
+        # 混在答案后面像半截报文。
+        "resource",
         # 权限元数据：回答的是「你的授权怎么配的」，不是「你查到了什么」。
         # 需要解释可见范围时，由 message 用自然语言说明，不列字段名。
         "total_authorized",
         "visible_to_identity",
         "identity_station_filter",
+        # 结构图是给界面画的，不是给人读的：混进 _render_payload 会变成
+        # 「graph：{entry: check, nodes: [...]}」这种整段 JSON，把结论埋掉。
+        "graph",
     }
 )
 
@@ -423,7 +430,6 @@ def _render_payload(data: dict[str, Any]) -> str:
         for key, value in data.items()
         if isinstance(value, list) and value
     ]
-    has_items = bool(filled)
     # 只有一个列表时，条数由 headline 说，这里不再重复标签。
     needs_label = len(filled) > 1
 
@@ -433,8 +439,9 @@ def _render_payload(data: dict[str, Any]) -> str:
         if key in _META_KEYS:
             continue
 
-        # 有列表时 count 与列表长度重复，没必要两处都说。
-        if key == "count" and has_items:
+        # 计数类字段一律不渲染：有列表时它与列表长度重复，没有列表时它也不构成答案
+        # （「total：99」单独一行，读者只会以为报文被截断了）。
+        if key in _COUNT_KEYS:
             continue
 
         if isinstance(value, list):
@@ -509,6 +516,20 @@ def _empty_result_note(data: Any) -> str:
         return ""
 
     return f"注意：该身份可见 {visible} 个站点，本次是查询条件没有匹配到，不是没有站点授权。"
+
+
+def _result_graph(result: ToolExecutionResult | None) -> dict[str, Any]:
+    """工具若要「把结果画出来」，就把图放在 `result["graph"]` 这个固定键上。
+
+    约定这一个键而不是让每个工具各起名字：气泡那侧只有一份渲染代码，键名一分叉
+    就变成「有的工具能画、有的画不出来」，而这种不一致没人会去报 bug。
+    非 dict 一律当没给——气泡宁可少一张图，也不能因为格式不对整条消息渲染失败。
+    """
+    if result is None:
+        return {}
+
+    graph = (result.result or {}).get("graph")
+    return {"graph": graph} if isinstance(graph, dict) and graph.get("nodes") else {}
 
 
 def _summarize_result(result: ToolExecutionResult) -> str:
@@ -1293,6 +1314,20 @@ async def retrieve_knowledge(state: AgentState) -> dict[str, Any]:
     }
 
 
+def _approval_message(headline: str, summary: str) -> str:
+    """确认卡正文：先说这次要做什么，再说「还没做」。
+
+    顺序不能反：摘要（几步、每步谁做、按什么分流）排在「尚未执行」之后，
+    读到那句的人已经准备点确认了。这一段以前没有，于是「新建流程」的卡上
+    只有一行工具名与一份折叠的 JSON，用户批的其实是他没看过的东西。
+    """
+    parts = [headline]
+    if summary:
+        parts.append(summary)
+    parts.append("该操作尚未执行。请确认或取消本次操作。")
+    return "\n\n".join(parts)
+
+
 @_tenant_bound
 async def create_and_wait_approval(state: AgentState) -> dict[str, Any]:
     gateway = get_tool_gateway()
@@ -1345,6 +1380,17 @@ async def create_and_wait_approval(state: AgentState) -> dict[str, Any]:
         "notice": "尚未执行，确认后才会提交。",
         "created_at": datetime.now(UTC).isoformat(),
     }
+
+    # 摘要必须同时进正文与 preview：正文是用户真正读的那段话，preview 给界面
+    # 与控制台留一份结构化副本（翻审批记录时不必去解析 parameters）。
+    if plan.summary:
+        preview["summary"] = plan.summary
+
+    # 结构图只进 preview，不进正文：正文是文字，图由界面按这份数据画。
+    # 放 preview 而不是随响应一次性给出，是为了刷新后还在——卡片是从审批单
+    # 重新取的，只放在响应里，刷新一次图上就只剩一行「步骤：a → b」。
+    if plan.graph:
+        preview["graph"] = plan.graph
 
     # 委派链：空表示这张单子由用户直接对话的那个 Agent 开出。
     #
@@ -1411,10 +1457,7 @@ async def create_and_wait_approval(state: AgentState) -> dict[str, Any]:
             "operation": plan.display_name,
             "preview": preview,
             "expires_at": approval.expires_at.isoformat(),
-            "message": (
-                f"{headline}\n\n"
-                "该操作尚未执行。请确认或取消本次操作。"
-            ),
+            "message": _approval_message(headline, plan.summary),
         }
     )
 
@@ -1482,6 +1525,10 @@ async def create_and_wait_approval(state: AgentState) -> dict[str, Any]:
             "already_processed": result.already_processed,
             "result": (tool_result.result if tool_result else None),
             "verification": (tool_result.verification if tool_result else None),
+            # 结果气泡里的结构图。与确认卡上那张是同一份数据，但走的是另一条
+            # 路径：卡从审批单取（刷新也在），气泡从这一轮的 metadata 取。
+            # 只放响应不给落库，刷新一次图就没了，只剩「步骤：a → b」那行字。
+            **_result_graph(tool_result),
         },
         "error_category": None if result.success else "write_failed",
     }

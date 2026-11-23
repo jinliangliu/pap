@@ -10,7 +10,12 @@
         --tenant default --user <user-uuid>
 
 保存即编译：图不合法会在这里被拒，错误码与接口层一致（`WORKFLOW_*`）。
-同名重复执行会 +1 修订号——在飞的 run 不受影响，它们读自己那份图副本。
+**图里用到的智能体必须已存在且处于启用状态**——这条校验在 `save_workflow` 里
+（`_ensure_agents_available`），装之前先把 `docs/examples/workflow-dispatch.json`
+里的 `Gas_Industry_Knowledge` / `field-ops` 建出来，否则会报 `WORKFLOW_UNKNOWN_AGENT`
+并列出当前租户可用的标识。
+同名重复执行：**图变了才 +1 修订号**（只改说明不计）——在飞的 run 不受影响，
+它们读自己那份图副本。
 """
 
 from __future__ import annotations

@@ -82,6 +82,33 @@ class McpToolDescriptor:
     input_schema: dict[str, Any]
 
 
+class _StatusRecorder(httpx2.AsyncBaseTransport):
+    """传输层留一份「最后一次响应的状态码」。
+
+    MCP SDK 在非 2xx 且响应体不是 JSON-RPC 错误时会丢掉状态码，
+    只抛一句 `Server returned an error response`（见 mcp/client/streamable_http.py
+    里 `if response.status_code == 404 ... else: ErrorData(code=INTERNAL_ERROR,
+    message="Server returned an error response")`）。于是 401（凭据无效）和
+    502（网关挡了）在平台侧长得一模一样，提示语只能二选一，猜错就把人送去
+    查隧道——线上真发生过：连接器凭据被清空后点「发现工具」，报的是
+    「网关拦下了请求」，而实际是远端 401。
+
+    这里不做任何改写，只记状态码，分类时按它给结论。
+    """
+
+    def __init__(self, inner: httpx2.AsyncBaseTransport) -> None:
+        self._inner = inner
+        self.last_status: int | None = None
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        response = await self._inner.handle_async_request(request)
+        self.last_status = response.status_code
+        return response
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 def _flatten(exc: BaseException) -> BaseException:
     """
     anyio 的 TaskGroup 会把异常包成 ExceptionGroup。
@@ -242,6 +269,9 @@ class McpToolClient:
         self._token = token
         self._connect_timeout = connect_timeout_seconds
         self._call_timeout = call_timeout_seconds
+        # 最近一次 HTTP 响应的状态码，由 _StatusRecorder 在传输层写入。
+        # 只用于错误分类，不参与任何业务判断。
+        self._last_status: int | None = None
 
     # ---------------- 会话 ----------------
 
@@ -259,11 +289,13 @@ class McpToolClient:
         # 若进程环境里存在 HTTP_PROXY，默认行为会把内网调用也交给代理，
         # 表现为莫名其妙的 502/超时，而同一条 curl 加 --noproxy 又是通的。
         headers = {} if self._token is None else {"Authorization": f"Bearer {self._token}"}
+        recorder = _StatusRecorder(httpx2.AsyncHTTPTransport())
         http = httpx2.AsyncClient(
             headers=headers,
             timeout=timeout,
             follow_redirects=False,
             trust_env=False,
+            transport=recorder,
         )
 
         try:
@@ -274,6 +306,9 @@ class McpToolClient:
                     await session.initialize()
                     yield session
         except Exception as exc:  # noqa: BLE001 - 统一在下面分类
+            # 先落状态码再分类：SDK 已经把非 2xx 的响应丢掉了，
+            # 这是唯一还能拿到「到底是 401 还是 502」的地方。
+            self._last_status = recorder.last_status
             raise self._classify(exc) from exc
         finally:
             # 关闭动作自己出错时不能盖掉上面刚分类好的异常——
@@ -320,8 +355,7 @@ class McpToolClient:
 
         return McpProtocolError(f"MCP 交互失败：{type(root).__name__}: {root}")
 
-    @staticmethod
-    def _classify_remote_error(error: SdkMcpError) -> McpError:
+    def _classify_remote_error(self, error: SdkMcpError) -> McpError:
         """把服务端的 JSON-RPC 错误翻成平台的四类语义。"""
         code = getattr(error, "code", None)
         message = str(getattr(error, "message", "") or "").strip() or str(error)
@@ -347,11 +381,36 @@ class McpToolClient:
                 "或在服务端放宽支持的协议版本。"
             )
 
-        # SDK 在非 2xx 且错误体不是 JSON-RPC 时自己编的兜底文案。
-        # 这种情况通常是中间有网关/反代，而不是 MCP 服务本身出错。
+        # SDK 在非 2xx 且错误体不是 JSON-RPC 时自己编的兜底文案。它把状态码
+        # 丢了，所以这句话得靠传输层记下的 `_last_status` 才能说对：401 是凭据
+        # 问题，502 才是网关。分不清的代价是排障方向整个反了——线上有人照着
+        # 「网关拦下了请求」去查隧道，而实际连接器根本没配凭据、远端回的是 401。
         if message == "Server returned an error response":
+            status = self._last_status
+
+            if status in (401, 403):
+                return McpAuthError(
+                    f"远端返回 HTTP {status}：凭据被拒绝或未携带。"
+                    "请到「配置凭据」检查令牌，而不是改端点地址。"
+                )
+
+            if status == 404:
+                return McpUnavailableError(
+                    "MCP 端点不存在（HTTP 404）。请确认地址里的路径，"
+                    "例如别漏了末尾的 /mcp。"
+                )
+
+            if status is not None and status >= 500:
+                return McpUnavailableError(
+                    f"远端返回 HTTP {status}：请求被中间的网关或反向代理挡下了，"
+                    "对端 MCP 服务本身可能没收到请求。请检查隧道/反代是否在跑、"
+                    "以及鉴权头是否被它改写。"
+                )
+
+            where = f"（HTTP {status}）" if status is not None else ""
             return McpProtocolError(
-                "MCP 服务返回了无法解析的错误响应，通常是网关或反向代理拦下了请求。"
+                f"MCP 服务返回了无法解析的错误响应{where}，"
+                "通常是网关或反向代理拦下了请求。"
                 "请检查地址是否正确、鉴权头是否被网关改写。"
             )
 

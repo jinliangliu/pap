@@ -17,6 +17,17 @@ RUN node --version && python3 --version
 COPY runner.py /opt/pap/runner.py
 RUN chmod 0555 /opt/pap/runner.py
 
+# 删除护栏：`sitecustomize` 由解释器在启动时自动导入，比用户代码早，
+# 于是模型写的 `os.remove(...)` 拿到的是已经换成「进回收站」的版本，
+# 它不需要知道这层存在。实现来自 app/sandbox_guard/safe_delete.py，
+# 由 build-image.sh 拷进构建上下文（Docker 不能 COPY 上下文之外的文件）。
+#
+# 只能放 site-packages：入口带 `-I`（隔离模式），PYTHONPATH 与脚本目录
+# 都被忽略，site-packages 是唯一一定在 sys.path 上的位置。
+# 两个文件必须同目录——钩子用 `Path(__file__).with_name("safe_delete.py")`
+# 按路径加载，不依赖包结构，也不把 PAP 的业务代码带进沙箱。
+COPY sitecustomize.py safe_delete.py /usr/local/lib/python3.12/site-packages/
+
 # 运行时由宿主侧 --user 65534:65534 覆盖，这里再声明一次做兜底：
 # 即使有人手工 docker run 忘带 --user，也不是 root。
 USER 65534:65534

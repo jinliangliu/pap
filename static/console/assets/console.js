@@ -1158,9 +1158,28 @@
       "</details>";
   }
 
+  /* ---- 清空点的分隔条 ----
+   *
+   * 布局判断与文案都在 `render.js`（与 `foldSeam` 同一处）：两者都是
+   * 「这条消息之后插一条分隔」，分开放会出现「一个按 id 找、一个按标记找」
+   * 的口径漂移。
+   *
+   * 这里只负责调用。与压缩分隔条的区别是刻意的：压缩点开有摘要，
+   * 清空点开什么都没有——做成一样的话，用户会以为上下文能从这儿恢复。
+   */
   function chatLogHtml() {
     var seam = ctxSeam();
     var msgs = state.chat.messages;
+
+    var clearAt = PAPRender.clearSeams ? PAPRender.clearSeams(msgs) : {};
+    var clearHtml = PAPRender.clearSeamHtml ? PAPRender.clearSeamHtml() : "";
+
+    /* 清空点在最新一份摘要的水位之后 → 那份摘要已经不作数了（后端按生成时刻
+       过滤，见 CONTEXT.md §5.7）。这时还画「更早的 N 轮已折叠为摘要」，
+       等于告诉用户「它其实还记得」，与下一条虚线自相矛盾。 */
+    if (seam && PAPRender.clearSuppressesSeam && PAPRender.clearSuppressesSeam(clearAt, seam.index)) {
+      seam = null;
+    }
 
     /* 追问卡片一旦"过去"了就不能再点：这条之后出现过用户消息，说明那一轮
        已经被回答（或用户直接打字跳过了）。判据只用消息顺序，不另存状态——
@@ -1177,6 +1196,7 @@
       parts.push(chatBubble(msg, i, closedAt[i]));
       // 插在水位那条**之后**：它本身属于被折叠的那一段。
       if (seam && seam.index === i) parts.push(ctxSeamHtml(seam));
+      if (clearAt[i] && clearHtml) parts.push(clearHtml);
     });
     return parts.join("");
   }
@@ -1272,9 +1292,16 @@
       if (msg.text) mine += '<div class="body">' + esc(msg.text) + "</div>";
       return mine + "</div>";
     }
-    var out = '<div class="msg" data-idx="' + idx + '">' + msgWho("Agent", msg.at) +
-      '<div class="body rich' +
-      (msg.status === "error" ? " muted" : "") + '">' + richText(msg.text) + "</div>";
+    /* 这条消息带卡、而卡已经把话说全时，不再铺一遍正文。
+       正文是平台按同一份 `preview` 生成的「待确认操作／步骤／角色」，
+       与卡上的抬头、结构图、参数逐句对应——两份并排出现，读的人得先分辨
+       哪一份是新的。卡的正文块（摘要）已经把该读的话收进去了。 */
+    var covered = Boolean(msg.approval) && window.PAPRender.approvalCoversMessage(msg.approval);
+    var out = '<div class="msg" data-idx="' + idx + '">' + msgWho("Agent", msg.at);
+    if (!covered) {
+      out += '<div class="body rich' +
+        (msg.status === "error" ? " muted" : "") + '">' + richText(msg.text) + "</div>";
+    }
     // 追问卡片紧跟在正文之后：正文说「需要你定一下哪一项」，卡片就是那几项。
     // 它比识别原文和 meta 行都更该被先看到。
     if (msg.clarify && msg.clarify.length && window.PAPClarify) {
@@ -1287,7 +1314,7 @@
     if (msg.ocrText) {
       out += ocrFold(msg.ocrText);
     }
-    if (msg.meta) {
+    if (msg.meta && !covered) {
       out += '<div class="meta-line">' + esc(msg.meta) + "</div>";
     }
     /* 实际送进检索的那句话。规划器会做最小改写，用户看到的是自己那句原话；
@@ -1973,7 +2000,16 @@
      刷新后凭空消失的话。 */
   function conclusionMessage(r, wasOpen) {
     if (!wasOpen || !r || !r.message) return null;
-    return { role: "agent", text: r.message, at: new Date().toISOString(), status: "ok" };
+    /* 结论这条**不带图**：它上面那张审批卡里已经有同一份图，而且刷新后还在
+       （卡是从审批单重新取的，`graph` 在预览白名单里）。两条消息各画一遍，
+       滚动时看到的是"同一张图又出现了一次"。
+       顺序信息不会丢：结论正文自己带着「步骤：a → b」，那是工具写的，与图无关。 */
+    return {
+      role: "agent",
+      text: r.message,
+      at: new Date().toISOString(),
+      status: "ok"
+    };
   }
 
   async function resolveApproval(id, action, index, btn) {
@@ -2357,6 +2393,10 @@
             : null,
           // 时间取服务端记录的创建时刻（UTC → 浏览器本地时区显示）。
           at: m.created_at || null,
+          /* `/clear` 那条回复自带这个标记，聊天记录据此在它下面画一条分隔。
+             不另存一份「清空点」状态：消息本身就是清空点，多存一份就多一处
+             会和气泡对不上的地方（压缩水位也是这么处理的）。 */
+          contextCleared: !!(m.metadata && m.metadata.context_cleared),
           // 停在审批上的那条消息，刷新后靠审批号把卡拼回来。
           // 不拼的话，那条消息读起来像结论，其实还在等人点。
           // 只拼在「发起」那条上：结论消息带着同一个审批号，也拼就会重一张。
@@ -3041,6 +3081,10 @@
       placeholder.meta = meta.join(" · ");
       placeholder.status = r.status === "error" ? "error" : "ok";
       if (r.approval) placeholder.approval = r.approval;
+      // `/clear` 的回复由平台生成，带着清空标记回来 —— 立刻在它下面画分隔条。
+      // 不认这个标记的话，用户发完 `/clear` 看到的还是原样的历史，
+      // 第一反应就是「没生效」，然后一直点。
+      if (r.metadata && r.metadata.context_cleared) placeholder.contextCleared = true;
       // 追问卡片：这一轮若是反问，就地带选项，用户不用自己组织一句话。
       if (r.metadata && r.metadata.clarify && window.PAPClarify) {
         var ask = window.PAPClarify.normalize(r.metadata.clarify);
@@ -3185,6 +3229,33 @@
     return '<span class="chip">' + esc(RISK_LABEL[risk] || risk || "—") + "</span>";
   }
 
+  // 接入项的风险等级下拉。默认值按用途给：查询类降到「读取」就不再弹审批单，
+  // 但下发指令必须留在「写入」——这一档降下去，写入口就对模型敞开了。
+  function mcpRiskSelect(mcp) {
+    var options = Object.keys(RISK_LABEL).map(function (key) {
+      return '<option value="' + esc(key) + '"' +
+        (mcp.risk_level === key ? " selected" : "") + ">" + esc(RISK_LABEL[key]) + "</option>";
+    }).join("");
+    return '<select data-mcp-risk="' + esc(mcp.local_name) + '">' + options + "</select>";
+  }
+
+  async function updateMcpRisk(localName, risk, select) {
+    select.disabled = true;
+    try {
+      await api("/api/v1/admin/mcp/tools/" + encodeURIComponent(localName),
+        { method: "PATCH", body: { risk_level: risk } });
+      toast("已改为「" + (RISK_LABEL[risk] || risk) + "」：" + localName, "ok");
+      // 列表与详情都读 risk_level，重拉一次（refreshTools 内部会重载接入项），
+      // 别只改眼前这一个控件：界面上写着「读取」而网关里还是「写入」，
+      // 是最难查的一类不一致。
+      await refreshTools(toolUI.selected);
+    } catch (e) {
+      toast("修改失败：" + errText(e), "err");
+      select.disabled = false;
+      if (toolUI.selected) renderToolBody();
+    }
+  }
+
   function sourceChip(source) {
     var cls = source === "custom" ? " ok" : (source === "mcp" ? "" : "");
     return '<span class="chip' + cls + '">' + esc(SOURCE_LABEL[source] || source || "内置") + "</span>";
@@ -3277,6 +3348,34 @@
       "</div></div>";
   }
 
+  /**
+   * 令牌来源，四种取值来自后端 `token_source_of`：
+   *   connector —— 端点与凭据都由连接器接管（这种行上的 token 永远是空的）
+   *   row       —— 这条接入项自带令牌（v1 的外部端点）
+   *   env       —— 没自带，运行时按租户取 .env 的 MCP 令牌
+   *   none      —— 该端点不带鉴权
+   * `connector_credential_set` 为 null 表示没算出来（没有租户上下文），
+   * 这时既不猜「有」也不猜「没有」。
+   */
+  function tokenCell(mcp) {
+    var source = mcp.token_source || (mcp.token_set ? "row" : "env");
+    if (source === "connector") {
+      var name = esc(
+        mcp.connector_name ? "由连接器「" + mcp.connector_name + "」提供" : "由连接器提供"
+      );
+      if (mcp.connector_credential_set === true) {
+        return name + ' <span class="chip ok">本租户已配置</span>';
+      }
+      if (mcp.connector_credential_set === false) {
+        return name + ' <span class="chip err">本租户未配置凭据</span>';
+      }
+      return name + ' <span class="chip">凭据在连接器页维护</span>';
+    }
+    if (source === "row") return "已配置（仅该端点）";
+    if (source === "env") return "未自带，沿用 .env 的 MCP 令牌";
+    return "该端点不带鉴权";
+  }
+
   function detailCard(t, custom, mcp) {
     var isCustom = t.source === "custom";
     var isManagedMcp = t.source === "mcp" && !!mcp;
@@ -3332,13 +3431,27 @@
       if (mcp.server_url) {
         pairs.push(["接入端点", '<span class="mono">' + esc(mcp.server_url) + "</span>"]);
       }
-      // 令牌只回「有没有」，与后端一致：明文永远不出库。
-      pairs.push(["端点令牌", esc(mcp.token_set ? "已配置（仅该端点）" : "未配置")]);
+      // 令牌要说清「从哪来」，不能只说有没有。经连接器接入的行上本来就没有
+      // 令牌（端点与凭据都由连接器接管），只写「未配置」会把设计如此显示成
+      // 故障，还会和「连接器停用 / 本租户没配凭据」混成同一句话。
+      pairs.push(["令牌来源", tokenCell(mcp)]);
       pairs.push(["注册状态", mcp.registered
         ? '<span class="chip ok">网关已注册</span>'
         : '<span class="chip err">未注册（远端可能不可达）</span>']);
       if (mcp.created_at) pairs.push(["接入时间", esc(fmtTime(mcp.created_at))]);
       if (mcp.created_by) pairs.push(["接入人", esc(mcp.created_by)]);
+
+      // 风险等级就是「要不要审批」的开关（后端按等级推导，不存额外字段），
+      // 所以它必须能改：连接器「发现工具」一次接几十个，只能填一个统一的保守值，
+      // 之后要按工具逐个调回来，否则连「查一次压力」都弹审批单。只有管理员能改。
+      if (state.admin) {
+        for (var pi = 0; pi < pairs.length; pi += 1) {
+          if (pairs[pi][0] === "风险等级") {
+            pairs[pi] = ["风险等级", mcpRiskSelect(mcp)];
+            break;
+          }
+        }
+      }
     }
 
     var headersBlock = "";
@@ -3623,11 +3736,13 @@
       '<input type="text" data-f="description" maxlength="2000" value="' + esc(description || "") + '">' +
       '<span class="help">模型据这句话判断什么时候该调它。远端给的是英文时建议改写。</span></div>' +
 
+      // 初值与连接器「发现工具」同一套推断：查询类的降到「读取」，
+      // 写着 control/create/delete 的留「写入」。之前这里没写 selected，
+      // 浏览器取第一项，于是每个工具都默认「读取」——远端一个控制接口
+      // 接进来就是免审批直接下发，方向正好反了。
       '<div class="field"><label>风险等级</label><select data-f="risk_level">' +
-      Object.keys(RISK_LABEL).map(function (k) {
-        return '<option value="' + k + '">' + RISK_LABEL[k] + "</option>";
-      }).join("") + "</select>" +
-      '<span class="help">写入及以上强制走审批，没有免审批开关。</span></div>' +
+      riskOptions(suggestToolRisk(toolName)) + "</select>" +
+      '<span class="help">写入及以上强制走审批，没有免审批开关；按工具名推断，接之前请核对。</span></div>' +
 
       '<div class="field"><label>超时（秒）</label>' +
       '<input type="number" data-f="timeout_seconds" min="1" max="300" value="60"></div>' +
@@ -4157,6 +4272,12 @@
       }
     }
 
+    $$("[data-mcp-risk]").forEach(function (select) {
+      select.addEventListener("change", function () {
+        updateMcpRisk(select.getAttribute("data-mcp-risk"), select.value, select);
+      });
+    });
+
     $$("[data-tool-act]").forEach(function (btn) {
       btn.addEventListener("click", function () {
         var act = btn.getAttribute("data-tool-act");
@@ -4472,9 +4593,9 @@
 
   var connUI = {
     items: [],
-    // 当前展开的面板：{ name, kind: "credential" | "discover" | "edit" }
+    // 卡片内展开的面板：{ name, kind: "credential" | "edit" }
+    // 「发现工具」不在这里——它在弹窗里，卡片只有 300px 宽，装不下工具名 + 整段说明。
     panel: null,
-    discovery: null,
     busy: false
   };
 
@@ -4579,56 +4700,12 @@
         "</div>";
     }
 
-    if (connUI.panel.kind === "discover") {
-      var data = connUI.discovery;
-      var body = '<div class="conn-panel-title">发现远端工具</div>';
-
-      if (!data) {
-        body += '<p class="hint">正在从 ' + esc(item.base_url) + " 拉取工具清单…</p>";
-      } else {
-        body += '<p class="hint">端点 <code>' + esc(data.endpoint) + "</code> 提供 " +
-          data.tools.length + " 个工具。勾选后点「接入」，入参结构直接取自远端，本地不编造。</p>";
-        if (!data.tools.length) {
-          body += '<div class="empty">远端没有返回任何工具。</div>';
-        } else {
-          body += '<div class="conn-tools">' + data.tools.map(function (tool) {
-            var bound = !!tool.bound_local_name;
-            return '<label class="conn-tool' + (bound ? " bound" : "") + '">' +
-              '<input type="checkbox" data-remote="' + esc(tool.remote_name) + '"' +
-              (bound ? " checked disabled" : "") + ">" +
-              '<span class="conn-tool-name"><code>' + esc(tool.remote_name) + "</code>" +
-              (bound ? '<span class="chip ok">已接入 · ' + esc(tool.bound_local_name) + "</span>" : "") +
-              "</span>" +
-              (tool.description ? '<span class="conn-tool-desc">' + esc(tool.description) + "</span>" : "") +
-              "</label>";
-          }).join("") + "</div>";
-          body += '<label class="field"><span>接入后的本地名前缀（可留空）</span>' +
-            '<input type="text" id="conn-prefix" placeholder="例如 feishu_，便于在工具页区分来源"></label>';
-          // 默认「写入」而不是「读取」：一次接二十个工具，没人会逐个判断风险。
-          // 默认读取意味着远端某个 delete_* 变成免审批直接执行，代价不对等。
-          body += '<label class="field"><span>这批工具的风险等级</span>' +
-            '<select id="conn-risk">' +
-            ["write", "read", "normal", "execute", "external", "destructive"].map(function (value) {
-              return '<option value="' + value + '"' + (value === "write" ? " selected" : "") + ">" +
-                (RISK_LABEL[value] || value) + "</option>";
-            }).join("") +
-            '</select></label>' +
-            '<p class="hint">写入及以上调用前会走审批。接入后可以在工具页逐个改，但默认值只在这里定一次。</p>';
-        }
-      }
-
-      body += '<div class="conn-panel-ops">' +
-        (data && data.tools.length
-          ? '<button class="btn primary" type="button" data-act="discover-bind" data-name="' + esc(item.name) + '">接入选中</button>'
-          : "") +
-        '<button class="btn" type="button" data-act="panel-close">关闭</button>' +
-        "</div>";
-
-      return '<div class="conn-panel">' + body + "</div>";
-    }
-
     if (connUI.panel.kind === "edit") {
       var draft = connUI.panel.draft || item;
+      // 头名只在「自定义请求头」下有意义。bearer/none 时既禁用也把值清空——
+      // 原来这里会把 auth_header_name 原样填进来，于是「把令牌贴进请求头名」
+      // 那次错误配置在编辑弹窗里长得像一条正常设置，一眼看不出来。
+      var usesHeader = draft.auth_type === "header";
       return '<div class="conn-panel">' +
         '<div class="conn-panel-title">编辑连接器</div>' +
         '<div class="conn-form">' +
@@ -4641,7 +4718,9 @@
           return '<option value="' + value + '"' + (draft.auth_type === value ? " selected" : "") + ">" + label + "</option>";
         }).join("") +
         "</select></label>" +
-        '<label class="field"><span>请求头名（仅「自定义请求头」需要）</span><input type="text" id="conn-header" value="' + esc(draft.auth_header_name || "") + '"></label>' +
+        '<label class="field"><span>请求头名（仅「自定义请求头」需要）</span><input type="text" id="conn-header" value="' +
+        esc(usesHeader ? (draft.auth_header_name || "") : "") + '"' +
+        (usesHeader ? "" : ' disabled placeholder="先选「自定义请求头」"') + "></label>" +
         '<label class="field"><span>超时（秒）</span><input type="number" id="conn-timeout" min="1" max="300" value="' + (draft.timeout_seconds || 30) + '"></label>' +
         '<label class="check"><input type="checkbox" id="conn-enabled"' + (draft.enabled ? " checked" : "") + "><span>启用</span></label>" +
         "</div>" +
@@ -4653,6 +4732,441 @@
     }
 
     return "";
+  }
+
+  /* ---------- 发现 / 管理远端工具（弹窗） ----------
+   *
+   * 原来这块内联在卡片里：卡片只有 300px 宽，工具名和说明上下堆在一列，
+   * 列表再限高 210px——一条带参数的说明（prepareStationControl 那种）就占满
+   * 整个可视区，工具名和后面十几个工具都被挤出去。改成弹窗后名称、说明各成一列，
+   * 说明按窗口宽度排版，一屏能扫完十来个。
+   *
+   * 勾选框表达的是「这个工具应该在不在」：已接入的默认勾选、可以取消，
+   * 保存时新增走 POST、取消走 DELETE。之前已接入的行是 `checked disabled`，
+   * 界面上看得到、点不动——一次性接入三十个之后就再也退不回去。
+   *
+   * 风险等级逐行一个下拉：接了三十个之后要按工具逐个调回来，只给一个
+   * 整批值的话，「查一次压力」和「下发关阀」只能同档，前者天天弹审批。
+   * 已接入的那几行只显示当前档位（改档在工具页的接入项详情里），
+   * 因为这里保存的是「接不接」，不是「接进来之后怎么配」。
+   */
+  function discPlain(text) {
+    // 远端说明常是 FastMCP 从 docstring 取来的，带 **强调** 与反引号。
+    // 只去标记符，一个字都不删——那是判断工具风险的依据。
+    return String(text || "").replace(/\*\*|__|`/g, "").trim();
+  }
+
+  /* 风险等级的可选项与顺序。逐行下拉与「批量设为」共用一份：
+     两处的顺序不一致时，人会把「第二项」当成同一档。 */
+  var RISK_CHOICES = ["read", "normal", "write", "execute", "external", "destructive"];
+
+  var RISK_READ_WORDS = [
+    "query", "get", "list", "read", "search", "lookup", "fetch", "describe",
+    "status", "snapshot", "history", "detail", "info", "view", "preview",
+    "check", "count", "stat", "stats", "summary", "report", "export", "ping",
+    "health", "validate", "resolve", "find", "show"
+  ];
+
+  var RISK_WRITE_WORDS = [
+    "create", "update", "delete", "remove", "set", "apply", "write", "exec",
+    "execute", "control", "command", "start", "stop", "reset", "restart",
+    "bind", "unbind", "attach", "detach", "upload", "send", "submit", "cancel",
+    "clear", "approve", "reject", "confirm", "install", "uninstall", "upgrade",
+    "enable", "disable", "toggle", "add", "edit", "patch", "run", "dispatch",
+    "import", "prepare", "close", "open", "arm"
+  ];
+
+  /* 工具名切成词：远端多为 camelCase（queryIOAlarms）或下划线（fc_querypressure）。 */
+  function riskWords(text) {
+    return String(text || "")
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean);
+  }
+
+  /* 逐行的初值：名字里能看出是「查/列/读」的给「读取」，其余保守留「写入」。
+   *
+   * 只认整词，不做前缀匹配：`settings` 里含 `set`、`getter` 里含 `get`，
+   * 前缀匹配会把查询类误判成写入口，也会把写入口误判成只读。看不出来就按
+   * 「写入」——多点一次确认，好过远端一个 delete_* 免审批直接跑掉。
+   * 这只是初值：每一行都有下拉，接入前可以逐条改。
+   */
+  function suggestToolRisk(remote) {
+    var words = riskWords(remote);
+    var hit = function (list) {
+      return words.some(function (word) { return list.indexOf(word) >= 0; });
+    };
+    if (hit(RISK_WRITE_WORDS)) return "write";
+    return hit(RISK_READ_WORDS) ? "read" : "write";
+  }
+
+  function riskOptions(selected) {
+    return RISK_CHOICES.map(function (key) {
+      return '<option value="' + key + '"' + (key === selected ? " selected" : "") + ">" +
+        esc(RISK_LABEL[key] || key) + "</option>";
+    }).join("");
+  }
+
+  async function openDiscoverModal(item, root) {
+    var mask = document.createElement("div");
+    mask.className = "modal-mask";
+    mask.innerHTML =
+      '<div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="disc-title">' +
+      '<div class="modal-head"><div>' +
+      '<div class="modal-eyebrow">DISCOVER TOOLS</div>' +
+      '<div class="modal-title" id="disc-title">发现远端工具 · ' +
+      esc(item.display_name || item.name) + "</div>" +
+      "</div>" +
+      '<button class="modal-close" type="button" data-disc="close" aria-label="关闭">×</button></div>' +
+      '<div class="modal-body">' +
+      // 停用的连接器照样能发现、能接入，但它下面的工具会从工具目录消失。
+      // 不提示的话，人接完三十个工具去对话里问，会以为「接入没成功」。
+      (item.enabled === false
+        ? '<div class="banner warn">该连接器当前为「已停用」：发现与接入不受影响，' +
+          "但接入的工具不会出现在工具目录与对话中。要启用请点卡片上的「编辑」。</div>"
+        : "") +
+      '<p class="hint" id="disc-sub">正在从 <code>' + esc(item.base_url) + "</code> 拉取工具清单…</p>" +
+      '<div class="disc-bulk" id="disc-bulk" hidden>' +
+      '<button class="btn sm" type="button" data-bulk="all">全选</button>' +
+      '<button class="btn sm" type="button" data-bulk="none">全不选</button>' +
+      '<span class="hint" id="disc-bulk-hint"></span>' +
+      "</div>" +
+      '<div id="disc-list"></div>' +
+      '<div class="disc-opts" id="disc-opts" hidden>' +
+      '<label class="field"><span>接入后的本地名前缀（可留空）</span>' +
+      '<input type="text" id="conn-prefix" placeholder="例如 feishu_，便于在工具页区分来源">' +
+      '<span class="help">只影响本次新增的工具；已接入的保持原名。</span></label>' +
+      // 风险等级逐行一个下拉（见 disc-risk）。这里只留「批量设为」：
+      // 一次接三十个，逐个点开三十次下拉不现实，但整批统一「写入」接进来，
+      // 连「查一次压力」都要审批，那些工具等于没人用——两个都要。
+      '<label class="field"><span>批量设为（可选）</span>' +
+      '<div class="disc-batch">' +
+      '<select id="conn-risk"><option value="">不批量改动</option>' +
+      RISK_CHOICES.map(function (value) {
+        return '<option value="' + value + '">' + esc(RISK_LABEL[value] || value) + "</option>";
+      }).join("") +
+      "</select>" +
+      '<button class="btn sm" type="button" id="disc-risk-apply">应用</button>' +
+      "</div>" +
+      '<span class="help">只改「未接入且已勾选」的行；逐行下拉才是最终值。' +
+      "初值按工具名推断（查/列/读 → 读取，其余 → 写入），接之前照说明核一遍。</span></label>" +
+      "</div>" +
+      "</div>" +
+      '<div class="modal-foot">' +
+      '<span class="hint" id="disc-count">正在读取接入状态…</span>' +
+      '<button class="btn" type="button" data-disc="close">关闭</button>' +
+      '<button class="btn primary" type="button" id="disc-bind" disabled>保存变更</button>' +
+      "</div>" +
+      "</div>";
+
+    document.body.appendChild(mask);
+
+    var list = $("#disc-list", mask);
+    var sub = $("#disc-sub", mask);
+    var opts = $("#disc-opts", mask);
+    var count = $("#disc-count", mask);
+    var bindBtn = $("#disc-bind", mask);
+
+    // 已经接入的本地工具：local_name → remote_name。
+    // 它比 discover 返回的 bound_local_name 更全——远端把某个工具下架后，
+    // 列表里就再也看不到它，只能靠这份本地记录留出一个解除入口。
+    var bound = {};
+    // local_name → risk_level。已接入的行只显示当前档位，不给下拉：
+    // 这里的「保存」接不接，改档在工具页的接入项详情里（PATCH 那条路径）。
+    var boundRisk = {};
+    var totalBound = 0;
+
+    // 逐行下拉的当前取值。按属性名比对取，不拼选择器：
+    // 远端工具名里出现引号或空格时，拼出来的选择器会整个抛错。
+    function riskPicks() {
+      var map = {};
+      $$("select[data-risk]", list).forEach(function (pick) {
+        map[pick.getAttribute("data-risk")] = pick.value;
+      });
+      return map;
+    }
+
+    /* 每行的风险格：未接入的给下拉（初值按名字推断），已接入的只显示当前档位。
+       已接入的不在这里改——这一版「保存」表达的是接不接，不是接进来之后怎么配，
+       两件事混在一个按钮上，解除一条顺带改了它的档位就没人能复原。 */
+    function riskCell(tool) {
+      var local = tool.bound_local_name || "";
+      if (local) {
+        var current = boundRisk[local];
+        return '<span class="disc-risk-cell" title="已接入。改风险等级请到工具页的接入项详情">' +
+          riskChip(current || "") + "</span>";
+      }
+      var guess = suggestToolRisk(tool.remote_name);
+      return '<span class="disc-risk-cell">' +
+        '<select class="disc-risk" data-risk="' + esc(tool.remote_name) + '"' +
+        ' title="按工具名推断的初值，接入前请对照说明改">' +
+        riskOptions(guess) + "</select></span>";
+    }
+
+    function changes() {
+      var add = [];
+      var drop = [];
+      var picks = riskPicks();
+      $$("input[data-tool]", list).forEach(function (box) {
+        var tool = box.getAttribute("data-tool");
+        var local = box.getAttribute("data-local");
+        if (!local && box.checked) {
+          add.push({ remote: tool, risk: picks[tool] || "write" });
+        }
+        if (local && !box.checked) drop.push(local);
+      });
+      return { add: add, drop: drop };
+    }
+
+    function refreshCount() {
+      var diff = changes();
+      var tips = [];
+      if (diff.add.length) {
+        // 把「这一批里有几条真会弹审批」写在计数行上：三十行扫过去看不出
+        // 哪几档还是「写入」，而它决定了下一次调用会不会被拦下来。
+        var tally = {};
+        diff.add.forEach(function (item) {
+          tally[item.risk] = (tally[item.risk] || 0) + 1;
+        });
+        var detail = RISK_CHOICES.filter(function (key) { return tally[key]; })
+          .map(function (key) { return (RISK_LABEL[key] || key) + " " + tally[key]; })
+          .join("、");
+        tips.push("新增 " + diff.add.length + (detail ? "（" + detail + "）" : ""));
+      }
+      if (diff.drop.length) tips.push("解除 " + diff.drop.length);
+
+      count.textContent = "已接入 " + totalBound + " 个" +
+        (tips.length ? " · 本次" + tips.join("、") : " · 勾选状态与当前一致");
+
+      bindBtn.disabled = !(diff.add.length || diff.drop.length);
+      // 按钮说清这一步是加还是减：只写「保存」时，三十个全勾着的样子
+      // 与「我要解除一个」的意图之间没有提示，点错了要等事后才发现。
+      bindBtn.textContent = !diff.drop.length
+        ? "接入选中"
+        : (!diff.add.length ? "解除选中" : "保存变更");
+    }
+
+    function close() {
+      document.removeEventListener("keydown", onKey);
+      mask.remove();
+    }
+
+    function onKey(event) {
+      if (event.key === "Escape") close();
+    }
+
+    document.addEventListener("keydown", onKey);
+    mask.addEventListener("click", function (event) {
+      if (event.target === mask) { close(); return; }
+      var hit = event.target.closest && event.target.closest("[data-disc]");
+      if (hit) close();
+    });
+
+    list.addEventListener("change", refreshCount);
+
+    // 一次接进三十个之后想反悔，逐个点三十下不合理。
+    $("#disc-bulk", mask).addEventListener("click", function (event) {
+      var hit = event.target.closest && event.target.closest("[data-bulk]");
+      if (!hit) return;
+      var want = hit.getAttribute("data-bulk") === "all";
+      $$("input[data-tool]", list).forEach(function (box) {
+        box.checked = want;
+      });
+      refreshCount();
+    });
+
+    // 「批量设为」只在人点「应用」时才落到逐行下拉上：改完还能逐条反悔，
+    // 比把所有行绑到同一个值上可控。没选档位时不动任何行。
+    $("#disc-risk-apply", mask).addEventListener("click", function () {
+      var pick = $("#conn-risk", mask);
+      var risk = (pick && pick.value) || "";
+      if (!risk) {
+        toast("先在上面的下拉里选一个风险等级", "err");
+        return;
+      }
+
+      var touched = 0;
+      $$("select[data-risk]", list).forEach(function (select) {
+        var row = select.closest && select.closest(".disc-row");
+        var box = row && row.querySelector("input[data-tool]");
+        if (!box || !box.checked || box.getAttribute("data-local")) return;
+        select.value = risk;
+        touched += 1;
+      });
+
+      refreshCount();
+      toast(touched
+        ? "已把 " + touched + " 个待接入工具设为「" + (RISK_LABEL[risk] || risk) + "」"
+        : "没有勾选待接入的工具，未改动");
+    });
+
+    bindBtn.addEventListener("click", async function () {
+      var diff = changes();
+      if (!diff.add.length && !diff.drop.length) return;
+
+      // 一次解除十个以上，先把后果说清：解除不可撤销，
+      // 引用这些工具的编排与技能会当场失效，而它们不在这个弹窗里。
+      if (diff.drop.length >= 10 &&
+          !window.confirm("将解除 " + diff.drop.length + " 个工具的接入，引用它们的编排与技能会失效。继续？")) {
+        return;
+      }
+
+      var prefix = ($("#conn-prefix", mask) || {}).value || "";
+      prefix = prefix.trim();
+      // 每条带自己的档位（来自逐行下拉）。取不到就按「写入」：
+      // 与后端 bind_mcp_tools 的默认值保持一致，界面少传一个字段
+      // 不该变成「免审批」。
+      var items = diff.add.map(function (entry) {
+        var local = (prefix + entry.remote).toLowerCase().replace(/[^a-z0-9_]/g, "_");
+        if (!/^[a-z]/.test(local)) local = "t_" + local;
+        return {
+          remote_name: entry.remote,
+          local_name: local.slice(0, 64),
+          risk_level: entry.risk || "write"
+        };
+      });
+
+      bindBtn.disabled = true;
+
+      var failed = [];
+      var dropped = 0;
+      // 先解除再新增：解除失败时至少不会留下「新工具接进来了、旧工具还在」
+      // 这种中间态，本地名撞车时也不会被静默覆盖。
+      for (var i = 0; i < diff.drop.length; i += 1) {
+        var local = diff.drop[i];
+        bindBtn.textContent = "解除 " + (i + 1) + "/" + diff.drop.length + "…";
+        try {
+          await api(
+            "/api/v1/connectors/" + encodeURIComponent(item.name) + "/tools/" +
+              encodeURIComponent(local),
+            { method: "DELETE" }
+          );
+          dropped += 1;
+        } catch (e) {
+          failed.push(local + "：" + errText(e));
+        }
+      }
+
+      var added = 0;
+      if (items.length) {
+        bindBtn.textContent = "接入 " + items.length + " 个…";
+        try {
+          var boundResp = await api(
+            "/api/v1/connectors/" + encodeURIComponent(item.name) + "/tools",
+            { method: "POST", body: { items: items } }
+          );
+          added = (boundResp.bound || []).length || items.length;
+        } catch (e) {
+          failed.push("接入：" + errText(e));
+        }
+      }
+
+      var parts = [];
+      if (added) parts.push("新增 " + added + " 个");
+      if (dropped) parts.push("解除 " + dropped + " 个");
+      var summary = parts.length ? "已" + parts.join("、") : "没有变更落下";
+
+      if (failed.length) {
+        toast(summary + "；" + failed.length + " 项失败：" + failed[0], "err");
+      } else {
+        toast(summary);
+      }
+
+      // 无论成败都关掉重拉：部分成功时卡片上的工具数才是真的。
+      // 失败原因已经进了 toast，弹窗留着只会显示一份过期的勾选状态。
+      close();
+      await loadConnectors(root);
+    });
+
+    // 远端清单决定「有哪些工具」，本地绑定表决定「哪些已在用」。
+    // 后者失败不该让整个弹窗打不开，所以分开取、分别兜底。
+    var data;
+    try {
+      data = await api("/api/v1/connectors/" + encodeURIComponent(item.name) + "/discover", {
+        method: "POST"
+      });
+    } catch (e) {
+      if (!mask.isConnected) return;
+      sub.textContent = "端点 " + (item.base_url || "—");
+      list.innerHTML = '<div class="banner err">拉取失败：' + esc(errText(e)) + "</div>";
+      count.textContent = "无法读取工具清单";
+      return;
+    }
+
+    try {
+      var rows = await api("/api/v1/connectors/" + encodeURIComponent(item.name) + "/tools");
+      (rows || []).forEach(function (row) {
+        bound[row.local_name] = row.remote_name || row.local_name;
+        if (row.risk_level) boundRisk[row.local_name] = row.risk_level;
+      });
+    } catch (e) {
+      // 兜底：discover 已经带了 bound_local_name，只是看不到「远端已下架」的行。
+      data.tools.forEach(function (tool) {
+        if (tool.bound_local_name) {
+          bound[tool.bound_local_name] = tool.remote_name;
+        }
+      });
+    }
+    totalBound = Object.keys(bound).length;
+
+    // 拉清单期间用户可能已经关掉弹窗，别往一个已摘除的节点上写。
+    if (!mask.isConnected) return;
+
+    sub.innerHTML = "端点 <code>" + esc(data.endpoint || item.base_url) + "</code> 提供 " +
+      data.tools.length + " 个工具，其中 " + totalBound + " 个已接入。" +
+      "勾选表示「保留接入」，取消勾选后保存即解除；入参结构直接取自远端，本地不编造。";
+
+    if (!data.tools.length && !totalBound) {
+      list.innerHTML = '<div class="empty">远端没有返回任何工具。</div>';
+      return;
+    }
+
+    var seen = {};
+    var body = data.tools.map(function (tool) {
+      var local = tool.bound_local_name || "";
+      if (local) seen[local] = true;
+      return '<label class="disc-row' + (local ? " bound" : "") + '">' +
+        '<input type="checkbox" data-tool="' + esc(tool.remote_name) +
+        '" data-local="' + esc(local) + '"' + (local ? " checked" : "") + ">" +
+        '<span class="disc-name"><code>' + esc(tool.remote_name) + "</code>" +
+        (local ? '<span class="chip ok">已接入 · ' + esc(local) + "</span>" : "") +
+        "</span>" +
+        '<span class="disc-desc">' +
+        (tool.description ? esc(discPlain(tool.description)) : "（远端未提供说明）") +
+        "</span>" +
+        riskCell(tool) +
+        "</label>";
+    }).join("");
+
+    // 远端已不提供、本地还挂着的工具。不留这一行的话，它既不在清单里，
+    // 也就没有任何入口能摘掉——工具页上看得到，这里永远取消不了。
+    var staleLocals = Object.keys(bound).filter(function (local) {
+      return !seen[local];
+    });
+    body += staleLocals.map(function (local) {
+      return '<label class="disc-row bound stale">' +
+        '<input type="checkbox" data-tool="" data-local="' + esc(local) + '" checked>' +
+        '<span class="disc-name"><code>' + esc(bound[local]) + "</code>" +
+        '<span class="chip warn">已接入 · 远端已不提供</span></span>' +
+        '<span class="disc-desc">本地名 <code>' + esc(local) + "</code>。" +
+        "远端清单里已经没有这个工具了，取消勾选后保存即可解除接入。</span>" +
+        '<span class="disc-risk-cell">' + riskChip(boundRisk[local] || "") + "</span>" +
+        "</label>";
+    }).join("");
+
+    list.innerHTML = '<div class="disc-tools">' +
+      '<div class="disc-head"><span></span><span>工具名称</span><span>说明</span>' +
+      "<span>风险等级</span></div>" +
+      '<div class="disc-rows">' + body + "</div></div>";
+    opts.hidden = false;
+
+    var bulk = $("#disc-bulk", mask);
+    bulk.hidden = false;
+    $("#disc-bulk-hint", mask).textContent =
+      "共 " + (data.tools.length + staleLocals.length) + " 个，已接入 " + totalBound + " 个";
+
+    refreshCount();
   }
 
   function connNewForm() {
@@ -4669,7 +5183,7 @@
       '<option value="bearer">Bearer</option><option value="none">无需凭据</option>' +
       '<option value="header">自定义请求头</option><option value="basic">Basic</option>' +
       "</select></label>" +
-      '<label class="field"><span>请求头名（仅「自定义请求头」需要）</span><input type="text" id="new-header" placeholder="X-Api-Key"></label>' +
+      '<label class="field"><span>请求头名（仅「自定义请求头」需要）</span><input type="text" id="new-header" placeholder="先选「自定义请求头」" disabled></label>' +
       "</div>" +
       '<div class="conn-panel-ops"><button class="btn primary" type="button" data-act="new-save">创建</button></div>' +
       "</div>";
@@ -4712,7 +5226,6 @@
 
   async function mountConnectors(root) {
     connUI.panel = null;
-    connUI.discovery = null;
 
     root.innerHTML = pageHead({
       eyebrow: PAGES.connectors.eyebrow,
@@ -4744,6 +5257,20 @@
       connAction(target.getAttribute("data-act"), target.getAttribute("data-name"), root);
     });
 
+    // 认证方式一改，头名输入框跟着开/关。留着一个「能填但没人读」的框，
+    // 就是让人把令牌贴进去——后果见 connector_service.validate_auth 里的注释。
+    root.addEventListener("change", function (event) {
+      var target = event.target;
+      if (!target || !target.id) return;
+      var pair = { "new-auth": "new-header", "conn-auth": "conn-header" }[target.id];
+      if (!pair) return;
+      var field = $("#" + pair, root);
+      if (!field) return;
+      var usesHeader = target.value === "header";
+      field.disabled = !usesHeader;
+      if (!usesHeader) field.value = "";
+    });
+
     await loadConnectors(root);
   }
 
@@ -4752,7 +5279,6 @@
 
     if (act === "panel-close") {
       connUI.panel = null;
-      connUI.discovery = null;
       renderConnectors(root);
       return;
     }
@@ -4769,7 +5295,7 @@
         kind: $("#new-kind").value,
         base_url: $("#new-base").value.trim(),
         auth_type: $("#new-auth").value,
-        auth_header_name: $("#new-header").value.trim()
+        auth_header_name: $("#new-auth").value === "header" ? $("#new-header").value.trim() : ""
       };
       if (!payload.name) { toast("请填写标识", "err"); return; }
       try {
@@ -4809,14 +5335,16 @@
       var userInput = $("#conn-user");
       if (!value) { toast("请填写凭据", "err"); return; }
       try {
-        await api("/api/v1/connectors/" + encodeURIComponent(name) + "/credential", {
+        var saved = await api("/api/v1/connectors/" + encodeURIComponent(name) + "/credential", {
           method: "PUT",
           body: { secret: value, username: userInput ? userInput.value.trim() : null }
         });
         // 输入框里的值不再保留：即使页面没刷新，也不该在 DOM 里留着明文。
         $("#conn-secret").value = "";
         connUI.panel = null;
-        toast("凭据已保存");
+        // 后端存完凭据会顺带复查一次，结论就在这条消息里。存进去了但对端不通
+        // 要按告警显示——那正是下一步要去修的东西。
+        toast(saved.message || "凭据已保存", saved.health_status === "ok" ? "" : "err");
         await loadConnectors(root);
       } catch (e) {
         toast(errText(e), "err");
@@ -4839,50 +5367,9 @@
     }
 
     if (act === "discover") {
-      connUI.panel = { name: name, kind: "discover" };
-      connUI.discovery = null;
-      renderConnectors(root);
-      try {
-        connUI.discovery = await api("/api/v1/connectors/" + encodeURIComponent(name) + "/discover", {
-          method: "POST"
-        });
-      } catch (e) {
-        connUI.discovery = { endpoint: item.base_url, tools: [] };
-        toast(errText(e), "err");
-      }
-      renderConnectors(root);
-      return;
-    }
-
-    if (act === "discover-bind") {
-      var prefix = ($("#conn-prefix") || {}).value || "";
-      prefix = prefix.trim();
-      // 不填就当「写入」：与后端 bind_mcp_tools 的默认值保持一致，
-      // 界面少传一个字段不该变成「免审批」。
-      var risk = ($("#conn-risk") || {}).value || "write";
-      var picked = $$("#conn-grid input[data-remote]").filter(function (box) {
-        return box.checked && !box.disabled;
-      });
-      if (!picked.length) { toast("没有选择要接入的工具", "err"); return; }
-
-      var items = picked.map(function (box) {
-        var remote = box.getAttribute("data-remote");
-        var local = (prefix + remote).toLowerCase().replace(/[^a-z0-9_]/g, "_");
-        if (!/^[a-z]/.test(local)) local = "t_" + local;
-        return { remote_name: remote, local_name: local.slice(0, 64), risk_level: risk };
-      });
-
-      try {
-        var bound = await api("/api/v1/connectors/" + encodeURIComponent(name) + "/tools", {
-          method: "POST",
-          body: { items: items }
-        });
-        toast(bound.message);
-        connUI.panel = null;
-        await loadConnectors(root);
-      } catch (e) {
-        toast(errText(e), "err");
-      }
+      // 弹窗自己拉清单、自己处理勾选与接入：它的生命周期不跟卡片渲染绑在一起，
+      // 拉取期间重渲染卡片也不会把已勾的选择丢掉。
+      openDiscoverModal(item, root);
       return;
     }
 
@@ -4900,7 +5387,7 @@
             display_name: $("#conn-display").value.trim(),
             base_url: $("#conn-base").value.trim(),
             auth_type: $("#conn-auth").value,
-            auth_header_name: $("#conn-header").value.trim(),
+            auth_header_name: $("#conn-auth").value === "header" ? $("#conn-header").value.trim() : "",
             timeout_seconds: parseInt($("#conn-timeout").value, 10) || 30,
             enabled: $("#conn-enabled").checked
           }
@@ -6757,6 +7244,25 @@
         "</div>"
       : "";
 
+    // 策略版本：一次生效变更 +1，工具审计里记的就是这个号。它是事后唯一能把
+    // 「当时按什么规则跑的」追回来的东西，所以这里既显示当前号，也要能按号
+    // 把那一版**原样取回**——让人凭现在的配置去猜当时，等于没有版本号。
+    var revisionCard = state.admin
+      ? '<div class="card" id="rt-rev-card">' +
+        cardHead("策略版本", "layers", '<span class="chip" id="rt-rev-chip">读取中</span>') +
+        '<p class="card-sub">每项生效配置<strong>真的改变</strong>时 +1，并在库里落一份完整快照；' +
+        "工具调用的审计里记下当时那一版。第 0 版表示从未改过配置、全按 " +
+        '<span class="mono">.env</span> 默认。</p>' +
+        '<div class="rt-cap-row">' +
+        '<label for="rt-rev-input">取回某一版</label>' +
+        '<input type="number" id="rt-rev-input" min="0" step="1" placeholder="例如 3">' +
+        '<button class="btn" type="button" id="rt-rev-load">取回</button>' +
+        "</div>" +
+        '<div id="rt-rev-out"></div>' +
+        '<p class="hint" id="rt-rev-hint">读取中…</p>' +
+        "</div>"
+      : "";
+
     root.innerHTML = pageHead({
       eyebrow: PAGES.runtime.eyebrow,
       title: PAGES.runtime.title,
@@ -6766,6 +7272,7 @@
       modelCard +
       obsCard +
       capacityCard +
+      revisionCard +
       '<div class="card">' +
       cardHead("进程参数", "sliders", '<span class="chip">只读</span>') +
       '<dl class="kv" id="rt-meta"><div class="skeleton" style="width:70%"></div></dl>' +
@@ -6829,6 +7336,16 @@
         });
       }
 
+      var revLoad = $("#rt-rev-load");
+      if (revLoad) revLoad.addEventListener("click", function () { loadRevisionSnapshot(); });
+
+      var revInput = $("#rt-rev-input");
+      if (revInput) {
+        revInput.addEventListener("keydown", function (e) {
+          if (e.key === "Enter") { e.preventDefault(); loadRevisionSnapshot(); }
+        });
+      }
+
       loadRuntimeSettings();
 
       loadProviders();
@@ -6868,11 +7385,75 @@
       var data = await api("/api/v1/admin/runtime-settings");
       applyObsState(data.observability_enabled, data.observability_source);
       applyCapacityState(data.knowledge_max_chunks, data.knowledge_max_chunks_source);
+      applyRevisionState(data.revision);
     } catch (e) {
       var hint = $("#rt-obs-hint");
       if (hint) hint.textContent = "读取失败：" + errText(e);
       var capHint = $("#rt-cap-hint");
       if (capHint) capHint.textContent = "读取失败：" + errText(e);
+      var revHint = $("#rt-rev-hint");
+      if (revHint) revHint.textContent = "读取失败：" + errText(e);
+    }
+  }
+
+  /* ---------------- 运行配置：策略版本 ---------------- */
+
+  function applyRevisionState(revision) {
+    var chip = $("#rt-rev-chip");
+    var input = $("#rt-rev-input");
+    var hint = $("#rt-rev-hint");
+    // 只有「还没人查过」时才填当前版本：填过一次之后就别再覆盖，
+    // 否则保存一次配置会把用户正查的历史版本顶掉。
+    if (input && !input.dataset.touched) input.value = revision;
+
+    if (chip) {
+      chip.textContent = "第 " + revision + " 版";
+      chip.className = "chip" + (revision > 0 ? " ok" : "");
+    }
+
+    if (hint && !($("#rt-rev-out") && $("#rt-rev-out").textContent.trim())) {
+      hint.textContent = revision === 0
+        ? "当前还没有人改过配置：所有项都取 .env 默认值。"
+        : "当前生效的是第 " + revision + " 版。工具审计里的 policy_revision 记的就是这个号。";
+    }
+  }
+
+  async function loadRevisionSnapshot() {
+    var input = $("#rt-rev-input");
+    var out = $("#rt-rev-out");
+    var hint = $("#rt-rev-hint");
+    if (!input || !out) return;
+
+    var raw = String(input.value || "").trim();
+    if (!/^\d+$/.test(raw)) {
+      if (hint) hint.textContent = "请输入一个版本号；0 表示从未改过配置。";
+      input.focus();
+      return;
+    }
+
+    input.dataset.touched = "1";
+    var revision = parseInt(raw, 10);
+
+    try {
+      var data = await api("/api/v1/admin/runtime-settings/snapshots/" + revision);
+      if (!data.found) {
+        out.innerHTML = "";
+        // 查不到是 200 + found=false，不是 404：版本号缺失与接口缺失
+        // 对调用方是两件事，页面上也必须说成两件事。
+        if (hint) hint.textContent = "第 " + revision + " 版不存在。版本号从 0 起连续递增，中间没有跳号。";
+        return;
+      }
+
+      var settings = data.settings || {};
+      var keys = Object.keys(settings).sort();
+      out.innerHTML = keys.length
+        ? '<dl class="kv">' + keys.map(function (key) {
+            return "<dt>" + esc(key) + "</dt><dd>" + esc(String(settings[key])) + "</dd>";
+          }).join("") + "</dl>"
+        : "";
+      if (hint) hint.textContent = "以上是第 " + revision + " 版存下的完整配置（整份，不是增量）。";
+    } catch (e) {
+      if (hint) hint.textContent = "取回失败：" + errText(e);
     }
   }
 
@@ -6933,6 +7514,8 @@
         body: { knowledge_max_chunks: value }
       });
       applyCapacityState(data.knowledge_max_chunks, data.knowledge_max_chunks_source);
+      // 值没变时版本号不会动，所以这里不是「一定 +1」，只是跟上实际值。
+      if (typeof data.revision === "number") applyRevisionState(data.revision);
       toast("单篇切片上限已改为 " + data.knowledge_max_chunks + "，立刻生效");
     } catch (e) {
       input.disabled = false;
@@ -6951,6 +7534,7 @@
         body: { observability_enabled: next }
       });
       applyObsState(data.observability_enabled, data.observability_source);
+      if (typeof data.revision === "number") applyRevisionState(data.revision);
       toast(data.observability_enabled ? "观测已开启，下一轮就会写入" : "观测已关闭，不再新增写入");
     } catch (e) {
       /* 回滚勾选状态：请求失败但开关还停在用户点过的位置，会让人以为改了。 */
@@ -10179,7 +10763,7 @@
         "「链路耗时」里的条从 0 起、宽度是该阶段占总耗时的比例，读的是「谁占得多」；要按时间先后看顺序，看左边的「编排流程」——缩进表示调用关系，重复出现的节点（规划 → 工具 → 再规划）会连着出现并标 ①②。",
         "这一轮里有委派（别的智能体被叫来干活）时，「编排流程」的卡头会多一对「流程 / 泳道」开关：流程看走了哪条路，泳道按智能体分道看谁在什么时候在干。没有委派就没有这对开关——泳道画出来只是一条通到底的横条，不如缩进列表。",
         "右上角「这一次运行」进运行页：把同一次运行的几轮和那张审批单串成一条时间线。历时、其中等人工、实际在跑是三个数，不是一个数的三种说法——等了人两小时五十八分和系统跑了两小时五十八分，要改的地方完全不同。点时间线上任一轮回到那一轮的详情，返回时回到这条运行。",
-        "保留期 14 天，错误 trace 保留 30 天；初始化时没有 observability:read 的库需要手动补一行授权，见 docs/OBSERVABILITY.md 第 16 节。"
+        "保留期 14 天，错误 trace 保留 30 天；初始化时没有 observability:read 的库需要手动补一行授权。"
       ]
     },
     {
@@ -11503,7 +12087,7 @@
     if (input && !input.value) {
       input.placeholder = (studioUI.attachments || []).length
         ? "说说这份文件要做什么：入库做资料、做成技能，还是接成工具…"
-        : "今天帮你做些什么？可创建、配置或排查 Agent…";
+        : "今天帮你做些什么？可建 Agent、技能、编排流程，或排查一次运行…";
     }
     // 托盘变化也会改变发送按钮该不该亮（有附件就算有内容）。
     updateStudioSend();
@@ -11692,14 +12276,28 @@
 
   function studioParamList(params) {
     /* 把参数逐条摊开，而不是丢一段 JSON：确认卡片要让人一眼看出「改了什么」，
-       一坨 JSON 只会被跳过。 */
+       一坨 JSON 只会被跳过。
+
+       对象型参数单独处理：编排流程的 definition 是整张图，挤成一行会把卡片
+       横着撑破，摊成全展开又要滚三屏。折成一段可展开的，平时只显示规模
+       （几个节点），要核对再点开——确认卡首先要能读，然后才是完整。 */
     var keys = Object.keys(params || {});
     if (!keys.length) return "";
     return '<ul class="studio-params">' + keys.map(function (key) {
       var value = params[key];
-      var text = value === null ? "（不限制）"
-        : (typeof value === "object" ? JSON.stringify(value) : String(value));
-      return '<li><span class="mono">' + esc(key) + "</span> " + esc(text) + "</li>";
+      if (value === null) {
+        return '<li><span class="mono">' + esc(key) + "</span> （不限制）</li>";
+      }
+      if (typeof value === "object") {
+        var nodes = value && value.nodes;
+        var label = Array.isArray(nodes)
+          ? "（" + nodes.length + " 个节点，展开看结构）"
+          : "（展开看内容）";
+        return '<li><details><summary><span class="mono">' + esc(key) + "</span> " +
+          esc(label) + "</summary><pre>" + esc(JSON.stringify(value, null, 2)) +
+          "</pre></details></li>";
+      }
+      return '<li><span class="mono">' + esc(key) + "</span> " + esc(String(value)) + "</li>";
     }).join("") + "</ul>";
   }
 
@@ -11722,11 +12320,26 @@
         esc(msg.text) + "</div></div>";
     }
 
-    var out = '<div class="msg">' + msgWho("构建助手", msg.at) +
-      '<div class="body rich' + (msg.status === "error" ? " muted" : "") + '">' +
-      richText(msg.text) + "</div>";
+    /* 和对话台同一条规则：有卡就不铺正文。构建助手的卡还多一层——它自己会把
+       摘要当正文块渲染，所以这里连"少了什么"都不用担心。 */
+    var covered = Boolean(msg.approval) && window.PAPRender.approvalCoversMessage(msg.approval);
+    var out = '<div class="msg">' + msgWho("构建助手", msg.at);
+    if (!covered) {
+      out += '<div class="body rich' + (msg.status === "error" ? " muted" : "") + '">' +
+        richText(msg.text) + "</div>";
+    }
 
-    if (msg.meta) {
+    /* 结果里的结构图（编排流程存下来之后那张）。位置在正文之下：正文说的是
+       「存成了什么」，图说的是「什么形状」，先读结论再核对形状。
+
+       **结论消息不再画图**：确认之后卡片就在上面，卡里那张是同一份
+       `preview.graph`，而且刷新后还在（`studioApprovalCard` 的白名单带 graph）。
+       两条消息各画一遍同一张图，滚动时看到的是"刚才那张图又出现了"。 */
+    if (msg.graph && !covered) {
+      out += PAPRender.flowDiagram(msg.graph);
+    }
+
+    if (msg.meta && !covered) {
       out += '<div class="meta-line">' + esc(msg.meta) + "</div>";
     }
 
@@ -11737,6 +12350,12 @@
         esc(a.title || "待确认") + " · " +
         esc(preview.tool_display_name || preview.operation || preview.tool_name || "变更") +
         "</div>" +
+        /* 摘要在图之前：它说的是「这次要做什么」，图说的是「什么形状」。
+           与对话台同一份实现（`PAPRender.approvalSummary`），两处不各写一遍。 */
+        PAPRender.approvalSummary(preview) +
+        /* 图要在参数之前：审批人第一眼要回答的是「这是什么形状、按什么分流」，
+           而 parameters 里那份 definition 是折叠着的核对材料。 */
+        PAPRender.flowDiagram(preview.graph) +
         studioParamList(preview.parameters) +
         '<div class="a-row">审批 ID <span class="mono">' + esc(a.approval_id) + "</span></div>";
 
@@ -11810,7 +12429,8 @@
     if (!studioUI.messages.length) {
       log.innerHTML = '<div class="studio-intro">' +
         "<strong>构建助手</strong><br>" +
-        "可以让我查看、新建、修改、停用或删除智能体，也能问平台怎么用。" +
+        "可以让我查看、新建、修改、停用或删除智能体、技能、工具与编排流程，也能问平台怎么用。" +
+        "想做一条固定流程（先查什么、谁来判断、异常怎么转、最后汇总），用一段话把过程说清楚就行。" +
         "改动与删除会先给你一张确认卡，点了才执行。<br>" +
         '<span class="muted">改代码、改数据库、拿主机权限这些不在范围内。</span></div>';
       return;
@@ -11970,6 +12590,8 @@
       placeholder.text = r.answer || "（无文本回答）";
       placeholder.ocrText = r.ocr_text || null;
       placeholder.at = r.assistant_message_at || new Date().toISOString();
+      // 结果里的结构图（目前只有编排流程给）。拿不到就不画，不影响这条消息。
+      placeholder.graph = (r.metadata && r.metadata.graph) || null;
 
       var meta = [];
       if (r.status && r.status !== "completed") meta.push("status=" + r.status);
@@ -12018,7 +12640,14 @@
           tool_name: ap.tool_name,
           tool_display_name: ap.tool_display_name,
           parameters: preview.parameters || {},
-          delegation: preview.delegation
+          delegation: preview.delegation,
+          /* 摘要也要带回来：它是卡上的正文块。漏了这一项，刷新之后卡上只剩
+             抬头和参数，而当场那张有那段话——「刷新前后不一样」没人会报成 bug。 */
+          summary: preview.summary,
+          /* 图跟着审批单一起回来。**只挑字段**是这里最容易漏的一处：
+             新加的字段不写进这个白名单，当场那张卡有图，刷新之后就成了
+             一张只有参数文字的卡——而「刷新前后不一样」没人会当成 bug 报。 */
+          graph: preview.graph
         },
         expires_at: ap.expires_at,
         executed_at: ap.executed_at,
@@ -12076,6 +12705,12 @@
           item.status = "error";
           item.meta = "error=" + meta.error_category;
         }
+        /* 结构图随消息入库（`messages.metadata_json.graph`），刷新后照样画得出来。
+           只放在当轮响应里的话，滚一下、刷一次，图上就只剩「步骤：a → b」。
+
+           但**带审批号的消息不画**：那张卡就在上面，卡里同一份图刷新后还在。
+           当场不画、刷新后又画出来，是同一次操作在两种时机长成两个样子。 */
+        if (role === "agent" && meta.graph && !meta.approval_id) item.graph = meta.graph;
         if (role === "agent" && ownsApproval(meta)) {
           item.approval = await studioApprovalCard(meta.approval_id, m.content);
         }
@@ -12634,7 +13269,9 @@
     if (!wfUI.items.length) {
       return '<div class="empty"><strong>还没有配置任何流程</strong>' +
         "流程适合步骤可枚举、顺序有要求、出错要能复盘的活（巡检、工单分派、发布前核验）。" +
-        "开放式问答不要套流程，它只会得到一条走不通的路。</div>";
+        "开放式问答不要套流程，它只会得到一条走不通的路。" +
+        "<br>懒得填表也行：把过程跟右下角的构建助手说一遍（谁先看什么、谁来判断、异常怎么转），" +
+        "它会把步骤拟出来给你确认。</div>";
     }
 
     return '<div class="tbl-scroll"><table class="tbl"><thead><tr>' +
@@ -14102,8 +14739,12 @@
     }
 
     try {
-      await api("/api/v1/workflows", { method: "POST", body: payload });
-      toast(editing ? "已保存（修订号 +1）" : "已创建");
+      var saved = await api("/api/v1/workflows", { method: "POST", body: payload });
+      /* 修订号只在**图**变了时才 +1：改个显示名不该让在飞的 run 换个版本号。
+         所以这里照返回值说事，不自己加一——写「+1」而实际没变，人就再也
+         看不出「这次到底改的是图还是说明」。 */
+      var rev = saved && saved.revision;
+      toast((editing ? "已保存" : "已创建") + (rev ? "（v" + rev + "）" : ""));
       wfUI.form = null;
       wfUI.defError = null;
       wfUI.sel = null;

@@ -1,5 +1,5 @@
 # tests/unit/test_runtime_view.py
-"""运行可视化 V1 的数据基座（docs/RUNTIME_VIEW.md §4）。
+"""运行可视化 V1 的数据基座。
 
 三条必须成立的性质，每条都能被反向改动打红：
 

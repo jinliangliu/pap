@@ -14,7 +14,7 @@
 
 措辞借 A2A 的 TaskState（`input-required` 是**暂停**而不是终态），
 因为那张状态机是公开规范里唯一把「等人」当成一等状态的。
-映射关系见 docs/RUNTIME_VIEW.md §4.3。
+映射关系如下。
 """
 
 from __future__ import annotations
