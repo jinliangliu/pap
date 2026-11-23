@@ -393,3 +393,77 @@ def test_draft_result_does_not_dump_ok_flag() -> None:
     assert "writable_nodes" not in summary
     # 正文与图都在，只是不再重复字段。
     assert "这张图能存" in summary
+
+
+def test_result_stages_are_taken_from_the_tool_result() -> None:
+    """入库那条流水线：六个步骤随结果出去，界面画成节点卡。
+
+    它替代的是正文里那行「加工链路：解析 → 清洗 → …」。替代品少一环，
+    用户就再也看不到那一项——而他不知道少了什么。
+    """
+    from app.agents.nodes import _result_stages
+
+    payload = {
+        "stages": [
+            {"key": "parse", "label": "解析 md", "value": "23,727 字", "status": "done"},
+            {"key": "clean", "label": "清洗 17 张表", "value": "61,047 → 23,727 字",
+             "note": "差额是标签与样式，正文未删减", "status": "done"},
+        ]
+    }
+    result = ToolExecutionResult(success=True, result=payload)
+
+    stages = _result_stages(result)["stages"]
+    assert [stage["key"] for stage in stages] == ["parse", "clean"]
+    # 缺的字段补空串，不让前端去判 undefined。
+    assert stages[0]["note"] == ""
+    assert stages[1]["note"] == "差额是标签与样式，正文未删减"
+
+
+def test_result_stages_come_from_the_nested_import_payload() -> None:
+    """`studio_import` 的结果是导入器那层 payload：界面不该知道它套了几层。"""
+    from app.agents.nodes import _result_stages
+
+    result = ToolExecutionResult(
+        success=True,
+        result={"result": {"stages": [{"key": "parse", "label": "解析", "status": "done"}]}},
+    )
+
+    assert _result_stages(result)["stages"][0]["label"] == "解析"
+
+
+def test_result_stages_ignore_malformed_payloads() -> None:
+    """宁可少一张卡，也不要半张卡：坏一条就当没有。"""
+    from app.agents.nodes import _result_stages
+
+    assert _result_stages(None) == {}
+    assert _result_stages(ToolExecutionResult(success=True, result={})) == {}
+    assert _result_stages(ToolExecutionResult(success=True, result={"stages": "x"})) == {}
+    assert _result_stages(ToolExecutionResult(success=True, result={"stages": []})) == {}
+    # 整条不可用的条目被跳过；一条都不剩时连卡也不出。
+    assert _result_stages(
+        ToolExecutionResult(success=True, result={"stages": [{"status": "done"}, None]})
+    ) == {}
+    # 失败的结果不画「全部完成」的卡。
+    assert _result_stages(
+        ToolExecutionResult(
+            success=False, result={"stages": [{"key": "parse", "label": "解析"}]}
+        )
+    ) == {}
+
+
+def test_stages_never_leak_into_the_answer_text() -> None:
+    """步骤是给界面画的。铺进正文就是一段
+    「stages：[{key: parse, label: 解析 …}]」，同一件事说成了报文。"""
+    result = _result(
+        result={
+            "stages": [
+                {"key": "parse", "label": "解析 md", "value": "23,727 字", "status": "done"}
+            ]
+        },
+        message="已导入知识库《标准》：58 片 · 分级 internal。",
+    )
+
+    text = _summarize_result(result)
+    assert "已导入知识库" in text
+    assert "stages" not in text
+    assert "23,727 字" not in text

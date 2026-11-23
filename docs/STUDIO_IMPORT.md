@@ -163,11 +163,27 @@ PaddleOCR-VL 有时直接吐 `.md`，里面的表格仍是
 （`action` ∈ `created`/`updated`/`unchanged`），技能与工具是
 `{action, created, updated, skipped, items[], message}`。
 
-知识库多出来的三个字段是**同一份入库快照的两个视角**：`cleanup` 是清洗统计，
+知识库多出来的几个字段是**同一份入库快照的不同视角**：`cleanup` 是清洗统计，
 `pipeline` 是完整八阶段快照（与 `documents.metadata_json.pipeline` 同一份，
-治理页读的也是它），`tags` 是打标结果。对话里的工具回复由它们拼成一条
-「加工链路」——`解析 → 清洗 → 结构化 → 切片 → 打标 → 索引`，外加一行标签。
-没有快照时（老行、技能/工具）退回只说片数，不拿 `0 张表` 冒充事实。
+治理页读的也是它），`tags` 是打标结果，`stages` 是给界面画的六个节点。
+
+`stages` 每项是 `{key, label, value, note, status}`：`label` 是这一步叫什么
+（「清洗 17 张表」），`value` 是它的量（`61,047 → 23,727 字`），`note` 是那句
+解释（「差额是标签与样式，正文未删减」），`status` 目前恒为 `done`（预留
+`warn` / `err`：某一步没成就不能报「全部完成」）。
+
+为什么是结构而不是一句话：`解析 md 23,727 字 → 清洗 17 张表（61,047 → 23,727 字，
+差额是标签与样式）→ …` 这段文字，读者要在箭头之间自己数步骤，也看不出哪一步
+真跑过。界面把它画成一张步骤卡（`render.js` 的 `pipelineCard`），工具的文字
+回复只留**结论与标签**——两处说的是同一份快照，不各说一遍。步骤卡随
+`messages.metadata_json.stages` 入库，刷新之后照样在。
+
+`studio_import` 把 `stages` 放在 payload **顶层**（与 `result` 并列），
+`studio_knowledge_add` 放结果顶层；节点侧的 `_result_stages` 也认嵌套的
+`result.stages`——界面不该知道导入器套了几层。
+
+没有快照时（老行、技能/工具）不返回 `stages`，文字退回只说片数，
+不拿 `0 张表` 冒充事实。
 
 导入落在知识库时，工具会把 `document_id` 放进 `external_operation_id`，
 审批确认后的回读核验按它**另起一个会话**再查一遍：文档在、状态 `ready`、

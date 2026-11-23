@@ -1203,6 +1203,76 @@
       paths.join("") + boxes.join("") + labels.join("") + "</svg></div>";
   }
 
+  /* 加工步骤卡：入库这类「一条流水线跑完」的结果。
+   *
+   * 为什么不是一句话：`解析 md 23,727 字 → 清洗 17 张表（61,047 → 23,727 字）
+   * → 结构化 58 节 → 切片 58 片 → 打标 5 项 → 索引已刷新` 这段文字，读的人要
+   * 自己在箭头之间数步骤，也看不出哪一步真的跑过。六个节点的卡片把「每一步
+   * 做了什么、量是多少、成没成」摆在同一个位置，一眼扫完。
+   *
+   * 与 `flowDiagram` 是两张不同的图，不共用实现：那张画的是「谁在第几步、
+   * 按什么分流」（有边、有角色），这张画的是「一条流水线跑到了哪」（有序号、
+   * 有状态点）。共用一套代码就得为两边各留一半分支，改哪边都怕碰坏另一边。
+   *
+   * 入参是 `messages.metadata_json.stages`（服务端从工具的 pipeline 快照派生），
+   * 所以刷新之后照样画得出来——当场渲染的东西刷新后消失，是这里反复踩过的坑。
+   */
+  var PIPE_STATUS = {
+    done: { mark: "✓", cls: "ok" },
+    ok: { mark: "✓", cls: "ok" },
+    warn: { mark: "!", cls: "warn" },
+    err: { mark: "×", cls: "err" },
+    error: { mark: "×", cls: "err" },
+    pending: { mark: "·", cls: "pending" },
+    skipped: { mark: "–", cls: "muted" }
+  };
+
+  function pipelineCard(stages) {
+    if (!Array.isArray(stages) || !stages.length) return "";
+
+    var items = stages.filter(function (stage) {
+      return stage && (stage.label || stage.key);
+    });
+    if (!items.length) return "";
+
+    var doneCount = items.filter(function (stage) {
+      var key = String(stage.status || "done");
+      return key === "done" || key === "ok";
+    }).length;
+
+    /* 头部那行「N 步 · 全部完成」是这张卡唯一的一句话：状态点散在六个节点上，
+       要一眼判断「整条跑完了没有」，得有这行汇总。没全完成时如实写数量，
+       不写「部分完成」这种含糊说法。 */
+    var head = items.length + " 步 · " +
+      (doneCount === items.length ? "全部完成" : doneCount + " 步完成");
+
+    /* 不写序号：顺序由竖排与连线表达，状态点已经占了左侧那一列。
+       再加一列 1…6，窄面板里会挤掉「61,047 → 23,727 字」的位置。 */
+    var rows = items.map(function (stage) {
+      var key = String(stage.status || "done");
+      var state = PIPE_STATUS[key] || PIPE_STATUS.done;
+      var label = String(stage.label || stage.key || "");
+      var value = String(stage.value || "");
+      var note = String(stage.note || "");
+
+      return '<li class="pipe-step ' + state.cls + '">' +
+        '<span class="pipe-mark" aria-hidden="true">' + state.mark + "</span>" +
+        '<span class="pipe-main">' +
+        '<span class="pipe-line">' +
+        '<span class="pipe-label">' + esc(label) + "</span>" +
+        (value ? '<span class="pipe-value">' + esc(value) + "</span>" : "") +
+        "</span>" +
+        (note ? '<span class="pipe-note">' + esc(note) + "</span>" : "") +
+        "</span>" +
+        "</li>";
+    });
+
+    return '<div class="pipe-card" role="group" aria-label="加工步骤">' +
+      '<div class="pipe-head"><span class="pipe-title">加工链路</span>' +
+      '<span class="pipe-meta">' + esc(head) + "</span></div>" +
+      '<ol class="pipe-steps">' + rows.join("") + "</ol></div>";
+  }
+
   /* 这张卡是否已经把那条消息的内容说全了。
    *
    * 审批轮的那条助手消息，正文是平台生成的「待确认操作：X／步骤／角色／
@@ -2447,6 +2517,7 @@
     approvalSummary: approvalSummary,
     approvalCoversMessage: approvalCoversMessage,
     flowDiagram: flowDiagram,
+    pipelineCard: pipelineCard,
     statusChip: statusChip,
     ticketCard: ticketCard,
     textBlocks: textBlocks,

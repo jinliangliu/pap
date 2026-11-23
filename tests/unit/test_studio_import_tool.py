@@ -256,12 +256,26 @@ async def test_ocr_html_table_is_cleaned_and_reported(session):
     assert all("<td" not in chunk.content for chunk in chunks)
 
     assert "已转成 Markdown 表格入库" not in result.message
-    # 有快照时改说完整链路：清洗这一步要带上「几张表、压掉多少字」，
-    # 与旧的单句说的是同一件事，只是不再单列一句。
-    assert "加工链路" in result.message
-    assert "清洗 1 张表" in result.message
-    assert f"{cleanup['chars_after']:,} 字" in result.message
-    assert "切片" in result.message
+
+    # 链路不再是正文里的一句话，而是一组步骤（界面画成节点卡）。
+    # 清洗这一步必须带上「几张表、压掉多少字」，以及那句打消误会的解释——
+    # 文字版有的信息，卡片里不能少。
+    stages = result.result["stages"]
+    assert [stage["key"] for stage in stages] == [
+        "parse",
+        "clean",
+        "structure",
+        "chunk",
+        "tag",
+        "index",
+    ]
+    clean = {stage["key"]: stage for stage in stages}["clean"]
+    assert clean["label"] == "清洗 1 张表"
+    assert f"{cleanup['chars_after']:,} 字" in clean["value"]
+    assert clean["note"] == "差额是标签与样式，正文未删减"
+    assert all(stage["status"] == "done" for stage in stages)
+    # 正文只说结论与标签；链路交给卡片，两处不各说一遍。
+    assert "加工链路" not in result.message
 
 
 async def test_import_reports_metadata_tags(session):
@@ -286,7 +300,9 @@ async def test_import_reports_metadata_tags(session):
     assert result.result["result"]["tags"]
     assert "标签：" in result.message
     assert "GB 27791-2020" in result.message
-    assert "打标" in result.message
+    tag = {stage["key"]: stage for stage in result.result["stages"]}["tag"]
+    assert tag["label"] == "打标"
+    assert tag["value"].endswith("项")
 
 
 # ---------------- 文件名 ----------------

@@ -246,6 +246,9 @@ _META_KEYS = frozenset(
         # 结构图是给界面画的，不是给人读的：混进 _render_payload 会变成
         # 「graph：{entry: check, nodes: [...]}」这种整段 JSON，把结论埋掉。
         "graph",
+        # 加工步骤同理：它由界面画成节点卡，正文里铺成
+        # 「stages：[{key: parse, label: 解析 …}]」只是把同一件事说成报文。
+        "stages",
     }
 )
 
@@ -535,6 +538,42 @@ def _result_graph(result: ToolExecutionResult | None) -> dict[str, Any]:
 
     graph = (result.result or {}).get("graph")
     return {"graph": graph} if isinstance(graph, dict) and graph.get("nodes") else {}
+
+
+def _result_stages(result: ToolExecutionResult | None) -> dict[str, Any]:
+    """工具若要「把过程画出来」，就把步骤放在 `result["stages"]` 上。
+
+    与 `_result_graph` 同一个约定：键名固定、结构固定，气泡那侧只有一份渲染
+    代码。入库是一条六步的流水线（解析 → 清洗 → 结构化 → 切片 → 打标 → 索引），
+    每一步都有各自的量——拼成一句话之后，读者要在箭头之间自己数步骤。
+
+    也认 `result["result"]["stages"]`：`studio_import` 的结果是导入器给的那层
+    payload，界面不该知道它套了几层。字面量一律裁成字符串，脏数据不进 DOM。
+    """
+    if result is None or not result.success:
+        return {}
+
+    data = result.result or {}
+    stages = data.get("stages")
+    if not isinstance(stages, list) or not stages:
+        inner = data.get("result")
+        stages = inner.get("stages") if isinstance(inner, dict) else None
+
+    if not isinstance(stages, list) or not stages:
+        return {}
+
+    cleaned = [
+        {
+            "key": str(item.get("key") or ""),
+            "label": str(item.get("label") or ""),
+            "value": str(item.get("value") or ""),
+            "note": str(item.get("note") or ""),
+            "status": str(item.get("status") or "done"),
+        }
+        for item in stages
+        if isinstance(item, dict) and (item.get("label") or item.get("key"))
+    ]
+    return {"stages": cleaned} if cleaned else {}
 
 
 def _summarize_result(result: ToolExecutionResult) -> str:
@@ -1301,6 +1340,7 @@ async def execute_read_tool(state: AgentState) -> dict[str, Any]:
             # 能画在气泡里，才能「看着图改一句话」。不放到这里，用户看到的只有
             # 「步骤：a → b」那行字，而他要核对的是形状。
             **_result_graph(result),
+            **_result_stages(result),
         },
         "error_category": None if result.success else (result.error_code or "tool_failed"),
     }
@@ -1604,6 +1644,8 @@ async def create_and_wait_approval(state: AgentState) -> dict[str, Any]:
             # 路径：卡从审批单取（刷新也在），气泡从这一轮的 metadata 取。
             # 只放响应不给落库，刷新一次图就没了，只剩「步骤：a → b」那行字。
             **_result_graph(tool_result),
+            # 入库这类「跑完一条流水线」的结果：六个节点各自做完了什么。
+            **_result_stages(tool_result),
         },
         "error_category": None if result.success else "write_failed",
     }

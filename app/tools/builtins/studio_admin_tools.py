@@ -861,15 +861,15 @@ async def studio_knowledge_add(
         )
 
     chunks = row.chunk_count
+    # 与 `studio_import` 同一条：切成几节几片、打了哪些标都要报出来，但链路走
+    # `stages`（界面画成步骤卡），文字里只留结论与标签——两条入库路必须一样。
+    stages = _pipeline_stages({"pipeline": parsed.pipeline, "tags": list(parsed.tags)})
     if action == "unchanged":
         message = f"《{row.title}》内容没有变化，已存在（{chunks} 片），没有重复入库。"
     else:
-        # 与 `studio_import` 说同一件事：正文写进来的这份也能报出
-        # 切成几节几片、打了哪些标。两条入库路共用一个 `_pipeline_lines`，
-        # 否则「上传文件」和「贴正文」得到的回复详略不一样，看着像两个功能。
         message = (
             f"已入库《{row.title}》：{chunks} 片 · 分级 {row.access_scope}。"
-            + "".join(_pipeline_lines({"pipeline": parsed.pipeline, "tags": list(parsed.tags)}))
+            + "".join(_pipeline_tag_lines({"tags": list(parsed.tags)}))
         )
 
     result = ToolExecutionResult(
@@ -886,6 +886,8 @@ async def studio_knowledge_add(
             "action": action,
             "pipeline": parsed.pipeline,
             "tags": list(parsed.tags),
+            # 界面据此画步骤卡；没有快照时是空列表（不猜）。
+            **({"stages": stages} if stages else {}),
         },
         message=message,
         # 与 studio_import 同一条：审批后的回读核验按这个 id 另起会话再查一遍。
@@ -1151,6 +1153,11 @@ async def studio_import(
     result = payload.get("result") or {}
     notes = [str(note) for note in (payload.get("notes") or []) if note]
 
+    # 顶层也带一份步骤：`payload["result"]` 是导入器的话，界面不该知道它套了几层。
+    stages = _pipeline_stages(result)
+    if stages:
+        payload = {**payload, "stages": stages}
+
     message = _import_message(
         label=_IMPORT_LABEL.get(resolved, resolved),
         filename=filename,
@@ -1388,13 +1395,12 @@ def _import_message(
         head = f"已按工具接口导入：{detail or action}。"
 
     parts = [head]
-    pipeline_lines = _pipeline_lines(result)
-    if pipeline_lines:
-        parts.extend(pipeline_lines)
-    else:
+    # 链路（解析 → 清洗 → …）不再拼成文字：它作为 `stages` 随结果返回，由界面
+    # 画成步骤卡。拼成一句话时，读者要在箭头之间自己数步骤，也看不出哪一步
+    # 真跑过；而「N 片 · 分级」这句结论仍然留在正文里。
+    if not _pipeline_stages(result):
         # 没有快照（老行、技能/工具、或入库前就失败了）时才落到这条老文案：
-        # 它只说得出清洗这一环。有快照时由 `_pipeline_lines` 统一说，
-        # 同一件事不说两遍。
+        # 它只说得出清洗这一环。
         cleanup = result.get("cleanup") or {}
         if cleanup.get("chars_before"):
             # 「入库的字数」和「你传的文件字数」差一大截时必须说出来，否则
@@ -1406,6 +1412,7 @@ def _import_message(
                 f"清洗后 {int(cleanup.get('chars_after') or 0):,} 字。"
                 "差额是标签与样式属性，正文没有删减。"
             )
+    parts.extend(_pipeline_tag_lines(result))
     if detected != resolved:
         parts.append(
             f"自动识别原本判成「{_IMPORT_LABEL.get(detected, detected)}」，"
@@ -1426,22 +1433,24 @@ def _import_message(
 _PIPELINE_TAG_LIMIT = 8
 
 
-def _pipeline_lines(result: dict[str, Any]) -> list[str]:
-    """把入库快照说成一条「加工链路」，外加一行标签。
+def _pipeline_stages(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """把入库快照排成一组**步骤**，交给界面画成节点卡。
 
-    为什么要说：入库是一个调用栈里跑完的五步，用户此前在对话里只拿得到
-    「N 片 · 分级」——于是「我传了 56 万字，为什么只有 14 万字」「448 片是不是
-    切碎了」这些问题只能靠人再跳一次控制台。快照本来已经写进库里（治理页读它），
-    这里只是把同一份事实说回给提问的人，不另算一遍、也不做估算。
+    为什么给结构、而不只给一句话：入库是一个调用栈里跑完的六步（解析 → 清洗 →
+    结构化 → 切片 → 打标 → 索引），每一步都有各自的量。拼成
+    「解析 md 23,727 字 → 清洗 17 张表（61,047 → 23,727 字，差额是标签与样式）
+    → …」之后，读者要自己数箭头、也看不出哪一步真跑过。一份
+    `[{key, label, value, note, status}]` 能直接画成步骤卡，卡片和文字也就
+    只有这一份来源。
 
-    没有快照就返回空列表，由调用方回落到老文案：宁可少说一句，
-    也不能拿「0 片」「0 张表」这种数字冒充事实——那和「确实是 0」是两回事。
+    没有快照就返回空列表：宁可少说一句，也不能拿「0 片」「0 张表」这种
+    数字冒充事实——那和「确实是 0」是两回事。
     """
     snapshot = result.get("pipeline") or {}
     if not snapshot:
         return []
 
-    steps: list[str] = []
+    stages: list[dict[str, Any]] = []
 
     parse = snapshot.get("parse") or {}
     if parse:
@@ -1449,52 +1458,101 @@ def _pipeline_lines(result: dict[str, Any]) -> list[str]:
         extractor = str(parse.get("extractor") or "").strip()
         # extractor 是后缀名（pdf / md / docx）；认不出来时只说「解析」。
         named = extractor if extractor and extractor != "unknown" else ""
-        head = f"解析 {named}" if named else "解析"
-        steps.append(f"{head} {chars:,} 字" if chars else head)
+        stages.append(
+            {
+                "key": "parse",
+                "label": f"解析 {named}".strip(),
+                "value": f"{chars:,} 字" if chars else "",
+                "note": "",
+                "status": "done",
+            }
+        )
 
     clean = snapshot.get("clean") or {}
     if clean:
         before = int(clean.get("chars_before") or 0)
         after = int(clean.get("chars_after") or 0)
         tables = int(clean.get("tables") or 0)
-        # 差额这句不能省：字数掉一大截时，人的第一反应是「后半本没进去」，
-        # 「压掉的都是标签和样式，正文没删」才是真正要传达的结论。
-        delta = (
-            f"（{before:,} → {after:,} 字，差额是标签与样式，正文未删减）"
-            if before or after
-            else ""
+        stages.append(
+            {
+                "key": "clean",
+                "label": f"清洗 {tables} 张表" if tables else "清洗",
+                "value": f"{before:,} → {after:,} 字" if (before or after) else "",
+                # 差额这句不能省：字数掉一大截时，人的第一反应是「后半本没进去」，
+                # 「压掉的都是标签和样式，正文没删」才是真正要传达的结论。
+                "note": "差额是标签与样式，正文未删减" if (before or after) else "",
+                "status": "done",
+            }
         )
-        if tables:
-            steps.append(f"清洗 {tables} 张表{delta}")
-        elif delta:
-            steps.append(f"清洗{delta}")
 
     structure = snapshot.get("structure") or {}
     sections = int(structure.get("sections") or 0)
     refs = int(structure.get("section_refs") or 0)
     if sections:
-        steps.append(f"结构化 {sections} 节")
+        stages.append(
+            {
+                "key": "structure",
+                "label": "结构化",
+                "value": f"{sections} 节",
+                "note": "",
+                "status": "done",
+            }
+        )
     elif refs:
         # 没有 Markdown 标题层级的老扫描件走这条：按段落切，不是按章节切。
-        steps.append(f"无标题层级（按 {refs} 段切分）")
+        stages.append(
+            {
+                "key": "structure",
+                "label": "结构化",
+                "value": f"按 {refs} 段切分",
+                "note": "这份文件没有标题层级",
+                "status": "done",
+            }
+        )
 
     chunk = snapshot.get("chunk") or {}
     chunks = int(chunk.get("chunks") or 0)
     if chunks:
         average = int(chunk.get("chars") or 0) // max(chunks, 1)
-        steps.append(f"切片 {chunks} 片（平均 {average} 字）")
+        stages.append(
+            {
+                "key": "chunk",
+                "label": "切片",
+                "value": f"{chunks} 片",
+                "note": f"平均 {average} 字" if average else "",
+                "status": "done",
+            }
+        )
 
     tags = [str(tag).strip() for tag in (result.get("tags") or []) if str(tag).strip()]
-    steps.append(f"打标 {len(tags)} 项" if tags else "未识别出标签")
-    steps.append("索引已刷新")
+    stages.append(
+        {
+            "key": "tag",
+            "label": "打标",
+            "value": f"{len(tags)} 项" if tags else "未识别出标签",
+            "note": "",
+            "status": "done",
+        }
+    )
+    stages.append(
+        {"key": "index", "label": "索引", "value": "已刷新", "note": "", "status": "done"}
+    )
+    return stages
 
-    lines = ["加工链路：" + " → ".join(steps) + "。"]
-    if tags:
-        shown = "、".join(tags[:_PIPELINE_TAG_LIMIT])
-        # 截断要说清是截断：只补一个省略号，看着像抽词抽到一半断了。
-        suffix = f"…（共 {len(tags)} 项）" if len(tags) > _PIPELINE_TAG_LIMIT else ""
-        lines.append(f"标签：{shown}{suffix}。")
-    return lines
+
+def _pipeline_tag_lines(result: dict[str, Any]) -> list[str]:
+    """标签那一行。
+
+    链路不再拼成文字：它由 `_pipeline_stages` 交给界面画成步骤卡，
+    这里只留标签——标签是一串名词，塞进卡片会把一步挤成两行。
+    """
+    tags = [str(tag).strip() for tag in (result.get("tags") or []) if str(tag).strip()]
+    if not tags:
+        return []
+    shown = "、".join(tags[:_PIPELINE_TAG_LIMIT])
+    # 截断要说清是截断：只补一个省略号，看着像抽词抽到一半断了。
+    suffix = f"…（共 {len(tags)} 项）" if len(tags) > _PIPELINE_TAG_LIMIT else ""
+    return [f"标签：{shown}{suffix}。"]
 
 
 # ---------------- 共用 ----------------

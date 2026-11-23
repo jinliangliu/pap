@@ -1318,6 +1318,12 @@
     if (msg.ocrText) {
       out += ocrFold(msg.ocrText);
     }
+    /* 加工步骤卡（入库这类「跑完一条流水线」的写操作）。排在正文之后：
+       正文说「成了什么」，卡片说「怎么跑的、跑到哪一步」，两件事分开读。
+       卡有卡自己的抬头，所以有卡时正文不必再复述一遍链路。 */
+    if (msg.stages && !covered) {
+      out += PAPRender.pipelineCard(msg.stages);
+    }
     if (msg.meta && !covered) {
       out += '<div class="meta-line">' + esc(msg.meta) + "</div>";
     }
@@ -2004,6 +2010,10 @@
      刷新后凭空消失的话。 */
   function conclusionMessage(r, wasOpen) {
     if (!wasOpen || !r || !r.message) return null;
+    /* 步骤卡**要带**，尽管图不带：审批卡上只有「图 + 参数」，没有这条流水线。
+       不带的话，当场只看到一句「已导入《…》58 片」，刷新后才长出六个节点
+       ——同一次操作在两种时机长成两个样子。 */
+    var stages = r.result && Array.isArray(r.result.stages) ? r.result.stages : null;
     /* 结论这条**不带图**：它上面那张审批卡里已经有同一份图，而且刷新后还在
        （卡是从审批单重新取的，`graph` 在预览白名单里）。两条消息各画一遍，
        滚动时看到的是"同一张图又出现了一次"。
@@ -2011,6 +2021,7 @@
     return {
       role: "agent",
       text: r.message,
+      stages: stages,
       at: new Date().toISOString(),
       status: "ok"
     };
@@ -2389,6 +2400,9 @@
           // 检索词随消息入库：刷新后仍能对照「我问的」与「实际检索的」。
           knowledgeQuery:
             m.role === "assistant" && m.metadata ? (m.metadata.knowledge_query || null) : null,
+          /* 入库的加工步骤随消息入库（`metadata.stages`）。不回填的话，
+             刷新之后那条结论只剩「已导入《…》58 片」，当场看到的六个节点没了。 */
+          stages: m.role === "assistant" && m.metadata ? (m.metadata.stages || null) : null,
           /* 追问选项也随消息入库（`metadata.clarify`），刷新后整张卡能原样回来。
              选了什么没有单独存：用户的选择就是紧跟着的那条用户消息，
              多存一份就多一处可能和气泡对不上的地方。 */
@@ -3113,6 +3127,7 @@
       if (r.user_message_at) mine.at = r.user_message_at;
       placeholder.at = r.assistant_message_at || new Date().toISOString();
       placeholder.ocrText = r.ocr_text || null;
+      placeholder.stages = (r.metadata && r.metadata.stages) || null;
       placeholder.citations = r.citations || [];
       placeholder.knowledgeQuery = (r.metadata && r.metadata.knowledge_query) || null;
       var meta = [];
@@ -12411,6 +12426,12 @@
        **结论消息不再画图**：确认之后卡片就在上面，卡里那张是同一份
        `preview.graph`，而且刷新后还在（`studioApprovalCard` 的白名单带 graph）。
        两条消息各画一遍同一张图，滚动时看到的是"刚才那张图又出现了"。 */
+    /* 加工步骤卡：入库是一次六步的流水线，卡片把「每步做了什么、量是多少、
+       成没成」摆在一起。文字版读起来是一串箭头，卡片能一眼扫完。 */
+    if (msg.stages && !covered) {
+      out += PAPRender.pipelineCard(msg.stages);
+    }
+
     if (msg.graph && !covered) {
       out += PAPRender.flowDiagram(msg.graph);
     }
@@ -12701,6 +12722,7 @@
       placeholder.at = r.assistant_message_at || new Date().toISOString();
       // 结果里的结构图（目前只有编排流程给）。拿不到就不画，不影响这条消息。
       placeholder.graph = (r.metadata && r.metadata.graph) || null;
+      placeholder.stages = (r.metadata && r.metadata.stages) || null;
       /* 追问项要留在消息上，否则下一屏重画就没有候选可点了。
          规范化用对话台同一份（clarify.js）：条数、长度、去重在那里已经写死了，
          这里再写一套，两边的上限迟早不一样。 */
@@ -12835,6 +12857,9 @@
            但**带审批号的消息不画**：那张卡就在上面，卡里同一份图刷新后还在。
            当场不画、刷新后又画出来，是同一次操作在两种时机长成两个样子。 */
         if (role === "agent" && meta.graph && !meta.approval_id) item.graph = meta.graph;
+        /* 步骤卡不受「带审批号就不画」那条约束：审批卡上没有这条流水线，
+           结论消息是它唯一的落点。不还原的话，刷新之后卡片就没了。 */
+        if (role === "agent" && meta.stages) item.stages = meta.stages;
         /* 追问项也随消息入库。不回填的话，刷新之后最后那句「这一步由谁做」
            就只剩一行字，而当场它下面是有候选的。 */
         if (role === "agent" && meta.clarify && window.PAPClarify) {

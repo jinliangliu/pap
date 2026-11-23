@@ -864,6 +864,137 @@ a { color: inherit; }
   stroke-width: 3px;
 }
 
+/* ---------------- 加工步骤卡（入库结果 / 结论气泡） ----------------
+
+   和上面那张编排图分开：编排图画的是「谁在第几步、按什么分流」，这张画的是
+   「一条流水线跑到了哪」——有序号感的步骤、每步的量、成没成。共用一套样式
+   的话，改其中一张的间距会顺手把另一张也改掉。
+
+   字号比正文小半号：卡片是让人扫的，不是让人逐字读的；唯一加粗的是步骤名。 */
+
+.pipe-card {
+  margin: 6px 0 8px;
+  padding: 10px 12px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.pipe-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.pipe-title {
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  color: var(--muted);
+}
+
+/* 「6 步 · 全部完成」：状态点散在六个节点上，整条跑完没有要一眼看得出。 */
+.pipe-meta {
+  font-size: 11.5px;
+  color: var(--green);
+}
+
+.pipe-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pipe-step {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 4px 0;
+}
+
+/* 竖线接在两级之间：没有它，六个节点只是六行，读起来像并列而不是先后。
+   用绿色线（不是 --line）：它与状态点的浅绿同一族，整列连起来才有「一条流程」
+   的样子；纯灰细线在 300px 面板里几乎看不见。 */
+.pipe-step + .pipe-step::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: -6px;
+  width: 2px;
+  height: 14px;
+  border-radius: 1px;
+  background: var(--green-line);
+}
+
+.pipe-mark {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  margin-top: 1px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface-2);
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 15px;
+  text-align: center;
+}
+
+/* 完成用绿，出问题用琥珀/红——与卡片其余状态点同一套颜色语义。 */
+.pipe-step.ok .pipe-mark {
+  border-color: var(--green-line);
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.pipe-step.warn .pipe-mark {
+  border-color: var(--amber-line);
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.pipe-step.err .pipe-mark {
+  border-color: var(--red-line);
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.pipe-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* label 与 value 同一行、允许换行：窄面板（300px 的助手面板）里
+   「清洗 17 张表 · 61,047 → 23,727 字」放不下时折成两行，而不是各自截断。 */
+.pipe-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+
+.pipe-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.pipe-value {
+  font: 12px/1.5 var(--mono);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.pipe-note {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
 .topo-legend {
   display: flex;
   flex-wrap: wrap;

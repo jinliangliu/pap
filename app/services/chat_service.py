@@ -923,6 +923,10 @@ class ChatService:
         # 与确认卡上那张同源，但走的是两条路：卡从审批单重新取，气泡从这条消息取
         # ——不落库的话，刷新一次图就没了，只剩「步骤：a → b」那行字。
         result_graph = (result.get("response_metadata") or {}).get("graph")
+        # 过程步骤（入库的解析 → 清洗 → …）：与图同一条道理，界面要画就得随消息
+        # 入库。只放在响应里的话，刷新之后只剩一句「已导入《…》」，而当场那张卡
+        # 已经说清了六个阶段——同一次操作在两种时机长成两个样子。
+        result_stages = (result.get("response_metadata") or {}).get("stages")
 
         async with span("persist.assistant_message", "db", attrs={"table": "messages"}):
             async with async_session_factory() as session:
@@ -948,6 +952,7 @@ class ChatService:
                                 else {}
                             ),
                             **({"graph": result_graph} if result_graph else {}),
+                            **({"stages": result_stages} if result_stages else {}),
                         },
                     )
 
@@ -1547,6 +1552,9 @@ class ChatService:
             # 变成「已处理」），而图正是他核对自己批了什么的东西。不带的话，
             # 刷新之后结论还在、图没了，同一轮对话长成两个样子。
             result_graph = (result.get("response_metadata") or {}).get("graph")
+            # 结论气泡里的步骤卡（入库那条流水线）。与图一起随消息入库，
+            # 否则刷新之后「点了确认做了什么」只剩一句话。
+            result_stages = (result.get("response_metadata") or {}).get("stages")
 
             await self._append_assistant(
                 identity=identity,
@@ -1558,6 +1566,7 @@ class ChatService:
                     "approval_action": action,
                     **({"delegated_to": result.get("agent_name")} if delegated else {}),
                     **({"graph": result_graph} if result_graph else {}),
+                    **({"stages": result_stages} if result_stages else {}),
                 },
             )
 
