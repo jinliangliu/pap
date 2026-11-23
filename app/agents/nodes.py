@@ -249,6 +249,9 @@ _META_KEYS = frozenset(
         # 加工步骤同理：它由界面画成节点卡，正文里铺成
         # 「stages：[{key: parse, label: 解析 …}]」只是把同一件事说成报文。
         "stages",
+        # 草稿图（未保存的那张）：它给下一轮改图用，不是给这一轮读的。
+        # 铺进正文会变成整段 definition JSON，把「能存 / 差在哪」埋掉。
+        "workflow_draft",
     }
 )
 
@@ -538,6 +541,37 @@ def _result_graph(result: ToolExecutionResult | None) -> dict[str, Any]:
 
     graph = (result.result or {}).get("graph")
     return {"graph": graph} if isinstance(graph, dict) and graph.get("nodes") else {}
+
+
+def _result_workflow_draft(result: ToolExecutionResult | None) -> dict[str, Any]:
+    """起草结果里那张「还没落库的图」，随消息一起存下来。
+
+    **为什么草稿要过消息元数据。** 起草与保存拆开之后，中间会隔好几轮：
+    用户看着图说「第二步换成 ops」。那一步如果只能靠模型凭记忆重画，patch
+    就没有底图可叠——重画等于把「改一处」退回成「写整张」。草稿存在消息上，
+    下一轮按会话取最近一份，patch 才有东西可改。
+
+    只留 `name` 与 `definition` 两个键：这是白名单，别把工具内部字段
+    （writable_nodes、errors）一起带进历史。
+    """
+    if result is None or not result.success:
+        return {}
+
+    draft = (result.result or {}).get("workflow_draft")
+    if not isinstance(draft, dict):
+        return {}
+
+    definition = draft.get("definition")
+    if not isinstance(definition, dict) or not isinstance(definition.get("nodes"), list):
+        return {}
+
+    name = draft.get("name")
+    return {
+        "workflow_draft": {
+            "name": str(name).strip() if name else None,
+            "definition": definition,
+        }
+    }
 
 
 def _result_stages(result: ToolExecutionResult | None) -> dict[str, Any]:
@@ -1341,6 +1375,7 @@ async def execute_read_tool(state: AgentState) -> dict[str, Any]:
             # 「步骤：a → b」那行字，而他要核对的是形状。
             **_result_graph(result),
             **_result_stages(result),
+            **_result_workflow_draft(result),
         },
         "error_category": None if result.success else (result.error_code or "tool_failed"),
     }
@@ -1646,6 +1681,7 @@ async def create_and_wait_approval(state: AgentState) -> dict[str, Any]:
             **_result_graph(tool_result),
             # 入库这类「跑完一条流水线」的结果：六个节点各自做完了什么。
             **_result_stages(tool_result),
+            **_result_workflow_draft(tool_result),
         },
         "error_category": None if result.success else "write_failed",
     }

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -312,6 +313,154 @@ def compile_definition(raw: Any) -> WorkflowPlan:
         order=order,
         depth_hops=depth_hops,
     )
+
+
+class PatchError(ValueError):
+    """`patch` 本身不自洽——与「图不成立」是两件事。
+
+    码前缀与 `DefinitionError` 分开（`WORKFLOW_PATCH_*`），因为它们的修法不同：
+    编译错误要改图的内容，patch 错误要先弄清「改的是哪个节点」。
+    """
+
+    def __init__(self, code: str, message: str, node: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.node = node
+
+
+# patch 认识的三个键。少而明确：每多一个键，就多一处「模型以为改了、其实没改」
+# 的可能，而改图这件事的代价是一次审批卡。
+_PATCH_KEYS = ("entry", "set_nodes", "remove_nodes")
+
+
+def apply_patch(base: Any, patch: Any) -> tuple[dict[str, Any], list[str]]:
+    """把一份改动叠在库里的那张图上，返回 (新图, 说给用户听的改动清单)。
+
+    **为什么要有它。** 改一个节点的 `task`，原本要把整张图重打一遍；重写最容易
+    漏节点，而漏掉等于删掉——一次「改一处」换来一次静默删两步。patch 让改动的
+    大小与事情的多少对上。
+
+    三条刻意的取舍：
+
+    1. **删节点不顺手改别人的边**：删掉 X 后若某节点的 `next` 因此变空，这里报错
+       而不是让它变成终点。图从「三步走完」变成「停在第二步」不会报任何异常，
+       只会在某次复盘里被发现那天它其实没干完。
+    2. **被删节点仍出现在别人的 `next` 里就摘掉，并说出来**：这是唯一一处自动改边。
+       不摘的话编译会拒（指向不存在的节点），模型还得回头猜是谁指向它。
+    3. **替换是整节点替换**：`set_nodes` 里那个节点写什么就是什么，不与旧值合并。
+       合并会让「我没写 next，所以它该沿用旧 next」和「我没写 next，所以它没有后继」
+       变成同一个写法，而这两件事的后果完全不同。
+    """
+    if not isinstance(base, dict) or not isinstance(base.get("nodes"), list):
+        raise PatchError(
+            "WORKFLOW_PATCH_NO_BASE",
+            "这份图读不出节点列表，没法在它上面改；请用 definition 给整张图。",
+        )
+    if not isinstance(patch, dict):
+        raise PatchError(
+            "WORKFLOW_PATCH_NOT_OBJECT",
+            'patch 必须是对象：{"set_nodes": [{...}], "remove_nodes": ["id"], "entry": "id"}。',
+        )
+
+    unknown = [key for key in patch if key not in _PATCH_KEYS]
+    if unknown:
+        raise PatchError(
+            "WORKFLOW_PATCH_UNKNOWN_FIELD",
+            f"patch 里没有「{'、'.join(map(str, unknown))}」这个键。能写的是："
+            "set_nodes（按 id 新增或整节点替换）、remove_nodes（按 id 删）、entry（换起点）。",
+        )
+
+    nodes: dict[str, Any] = {}
+    for item in base["nodes"]:
+        if isinstance(item, dict):
+            node_id = str(item.get("id") or "").strip()
+            if node_id:
+                nodes[node_id] = copy.deepcopy(item)
+    if not nodes:
+        raise PatchError(
+            "WORKFLOW_PATCH_NO_BASE",
+            "库里这张图的节点都读不出 id，没法按 id 改；请用 definition 给整张图。",
+        )
+
+    notes: list[str] = []
+
+    set_nodes = patch.get("set_nodes")
+    if set_nodes is not None:
+        if not isinstance(set_nodes, list):
+            raise PatchError("WORKFLOW_PATCH_BAD_NODES", "set_nodes 必须是节点数组。")
+        for item in set_nodes:
+            if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+                raise PatchError(
+                    "WORKFLOW_PATCH_BAD_NODES",
+                    "set_nodes 里每一项都得是一个带 id 的节点对象；没有 id 就不知道该替换谁。",
+                )
+            node_id = str(item["id"]).strip()
+            existed = node_id in nodes
+            nodes[node_id] = copy.deepcopy(item)
+            notes.append(f"{'替换' if existed else '新增'}节点「{node_id}」")
+
+    remove_nodes = patch.get("remove_nodes")
+    if remove_nodes is not None:
+        if not isinstance(remove_nodes, list) or not all(
+            isinstance(item, str) and item.strip() for item in remove_nodes
+        ):
+            raise PatchError(
+                "WORKFLOW_PATCH_BAD_NODES",
+                'remove_nodes 必须是节点 id 的数组，例如 ["old-step"]。',
+            )
+        for raw in remove_nodes:
+            node_id = raw.strip()
+            if node_id not in nodes:
+                raise PatchError(
+                    "WORKFLOW_PATCH_UNKNOWN_NODE",
+                    f"图里没有 id 为「{node_id}」的节点。现有的是：{'、'.join(nodes)}。",
+                    node=node_id,
+                )
+            del nodes[node_id]
+            notes.append(f"删掉节点「{node_id}」")
+            for other_id, other in nodes.items():
+                edges = other.get("next")
+                if not isinstance(edges, list):
+                    continue
+                kept = [e for e in edges if not (isinstance(e, dict) and str(e.get("to") or "") == node_id)]
+                if len(kept) == len(edges):
+                    continue
+                if not kept:
+                    raise PatchError(
+                        "WORKFLOW_PATCH_ORPHAN_EDGE",
+                        f"删掉「{node_id}」会让节点「{other_id}」没有后继（流程会停在它那里）。"
+                        f"patch 里同时给「{other_id}」一条新的 next，或把它一起删掉。",
+                        node=other_id,
+                    )
+                other["next"] = kept
+                notes.append(f"「{other_id}」的 next 里去掉了指向「{node_id}」的那条")
+
+    entry = patch.get("entry")
+    if entry is not None:
+        entry = str(entry).strip()
+        if entry not in nodes:
+            raise PatchError(
+                "WORKFLOW_PATCH_UNKNOWN_NODE",
+                f"起点「{entry}」不在图里。现有的是：{'、'.join(nodes)}。",
+                node=entry,
+            )
+    else:
+        entry = str(base.get("entry") or "").strip()
+        if entry and entry not in nodes:
+            raise PatchError(
+                "WORKFLOW_PATCH_ORPHAN_EDGE",
+                f"起点「{entry}」刚被删掉了，patch 里要给出新的 entry。",
+                node=entry,
+            )
+
+    merged: dict[str, Any] = {"entry": entry or next(iter(nodes)), "nodes": list(nodes.values())}
+    # base 上其余键（`max_nodes` 之类）一并带过去：patch 只负责节点，不该顺带
+    # 把整张图的参数重置成默认值。
+    for key, value in base.items():
+        if key not in {"entry", "nodes"}:
+            merged[key] = copy.deepcopy(value)
+    return merged, notes
 
 
 def _parse_node(item: Any) -> Node:

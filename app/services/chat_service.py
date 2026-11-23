@@ -927,6 +927,9 @@ class ChatService:
         # 入库。只放在响应里的话，刷新之后只剩一句「已导入《…》」，而当场那张卡
         # 已经说清了六个阶段——同一次操作在两种时机长成两个样子。
         result_stages = (result.get("response_metadata") or {}).get("stages")
+        # 起草出来的那张图（还没落库）：存进这一轮的消息，下一轮按会话取回来当
+        # patch 的底图。不存的话，「把第二步换成 ops」只能靠模型凭记忆重画。
+        result_draft = (result.get("response_metadata") or {}).get("workflow_draft")
 
         async with span("persist.assistant_message", "db", attrs={"table": "messages"}):
             async with async_session_factory() as session:
@@ -953,6 +956,7 @@ class ChatService:
                             ),
                             **({"graph": result_graph} if result_graph else {}),
                             **({"stages": result_stages} if result_stages else {}),
+                            **({"workflow_draft": result_draft} if result_draft else {}),
                         },
                     )
 

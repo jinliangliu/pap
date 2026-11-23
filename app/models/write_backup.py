@@ -13,8 +13,10 @@ PAP 的写有相当一部分落在外部系统（连接器、MCP、站点），�
 回滚。能提供的诚实保证只有一条：**原件还在**。至于怎么用它恢复，
 是人事后决定的，平台只负责别让它消失。
 
-表只增不改；`size_bytes` 是为了在写入前算总量（上限语义见
-`write_backup_service`），不是为了统计报表。
+表只增不改——除了保留期：`write_backup_service._prune` 会按「每个资源留最近
+几份 + 只留 90 天内的」删旧行。删的是没有回滚价值的快照，不是最新那份。
+`size_bytes` 是为了在写入前算总量（上限语义见 `write_backup_service`），
+不是为了统计报表。
 """
 
 from __future__ import annotations

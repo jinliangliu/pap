@@ -2158,6 +2158,124 @@ def _workflow_steps_text(
     return lines
 
 
+async def _latest_workflow_draft(context: ToolExecutionContext) -> dict[str, Any] | None:
+    """本会话最近一份草稿的 definition（没有就 None）。
+
+    读的是消息元数据里那一条（`chat_service` 落库时写的 `workflow_draft`）。
+    只扫最近 20 条再在内存里挑，不写 JSON 路径查询：SQLite 与 PG 的 JSON 语法
+    不一样，而「本会话最近改的那张图」本来就在最后几条里——用一个不依赖方言的
+    查法，比让这条路径只在线上成立划算。
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import select
+
+    from app.db.session import async_session_factory
+    from app.models.conversation import Message
+    from app.tenancy.context import tenant_scope
+
+    raw = str(context.conversation_id or "").strip()
+    if not raw:
+        return None
+    try:
+        conversation_id = _uuid.UUID(raw)
+    except ValueError:
+        return None
+
+    with tenant_scope(context.tenant_id):
+        async with async_session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(Message)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.created_at.desc())
+                    .limit(20)
+                )
+            ).all()
+
+    for row in rows:
+        draft = (row.metadata_json or {}).get("workflow_draft")
+        if isinstance(draft, dict) and isinstance(draft.get("definition"), dict):
+            return draft
+    return None
+
+
+async def _graph_from_arguments(
+    context: ToolExecutionContext,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str], str | None]:
+    """把 `definition` / `patch` 解析成「最终要存的那张图」。
+
+    四个入口共用这一份：起草、保存、确认卡正文、卡之前的预检。分成两份写的
+    后果不是「多写几行」，而是**卡上画的那张图与实际存下去的那张不是同一张**——
+    改一处只体现在其中一边时，人是在对着一张他没批准过的图点确认。
+
+    返回 `(图, 改动说明, 错误文案)`。图是 None 且错误也是 None 表示「没给图」
+    （只改显示名或启停那种情形）。
+    """
+    definition = arguments.get("definition")
+    patch = arguments.get("patch")
+
+    if patch is None:
+        if definition is not None and not isinstance(definition, dict):
+            return None, [], 'definition 必须是一个对象：{"entry": "起点id", "nodes": [...]}。'
+        return definition, [], None
+
+    if definition is not None:
+        return (
+            None,
+            [],
+            "definition 与 patch 只能给一个：patch 是在库里那张图上改，"
+            "definition 是整张换掉。要改一处就用 patch，不用重发整张图。",
+        )
+    if not isinstance(patch, dict):
+        return (
+            None,
+            [],
+            'patch 必须是对象：{"set_nodes": [{...}], "remove_nodes": ["id"], "entry": "id"}。',
+        )
+
+    name = str(arguments.get("name") or "").strip()
+
+    from app.orchestration.definition import PatchError, apply_patch
+    from app.services import workflow_service
+
+    existing = await workflow_service.get_workflow(context.tenant_id, name) if name else None
+    if existing is not None:
+        try:
+            merged, notes = apply_patch(existing.definition or {}, patch)
+        except PatchError as exc:
+            where = f"节点「{exc.node}」" if exc.node else "这张图"
+            return None, [], f"{where}改不动（{exc.code}）：{exc.message}"
+        return merged, notes, None
+
+    # 库里没有这张图——可能它根本还没建，也可能上一轮刚起草过、用户还在改。
+    # 找本会话最近一份草稿来叠：起草与保存之间隔着好几轮对话，没有这一步，
+    # 「把第二步换成 ops」只能退回成重画整张。
+    draft = await _latest_workflow_draft(context)
+    if draft is not None:
+        try:
+            merged, notes = apply_patch(draft["definition"], patch)
+        except PatchError as exc:
+            where = f"节点「{exc.node}」" if exc.node else "这张图"
+            return None, [], f"{where}改不动（{exc.code}）：{exc.message}"
+        return merged, notes + ["叠在本会话上一版草稿上"], None
+
+    if not name:
+        return (
+            None,
+            [],
+            "用 patch 时必须带 name（改的是库里哪一张图），"
+            "或者先在本会话里起草过一张——那样可以不带 name，直接改那张草稿。",
+        )
+    return (
+        None,
+        [],
+        f"没有标识为「{name}」的流程，本会话也没有起草过可改的草稿。"
+        "新建请用 definition 给整张图；要改的图叫什么，可以先 studio_describe resource=workflow 看一眼。",
+    )
+
+
 async def _summarize_workflow_call(
     context: ToolExecutionContext,
     arguments: dict[str, Any],
@@ -2171,8 +2289,10 @@ async def _summarize_workflow_call(
     因为确认卡上的顺序与实际执行的顺序不一致，比不写顺序更糟——同样地，
     编译不过就不给图：一张靠猜画出来的图会被当成「存进去的就是这样」。
     """
-    definition = arguments.get("definition")
-    if not isinstance(definition, dict):
+    definition, patch_notes, error = await _graph_from_arguments(context, arguments)
+    if error is not None:
+        return ToolBrief(text=f"流程「{str(arguments.get('name') or '').strip()}」：{error}")
+    if definition is None:
         # 只改显示名/说明/启停：没有图要说，卡片上那一行参数就够。
         return ToolBrief()
 
@@ -2196,7 +2316,10 @@ async def _summarize_workflow_call(
         # 等于让人在两处读同一件事，而文字那行表达不了分叉。
         text=_summarize_workflow(
             plan, mode, name, display_name, with_steps=graph is None, labels=labels
-        ),
+        )
+        # 只给最终那张图，审批的人看不到「这次到底动了哪一处」。改一处与重画一张
+        # 在卡上长得一模一样，而前者正是不该被当成后者批的东西。
+        + (f"\n本次改动：{'；'.join(patch_notes)}" if patch_notes else ""),
         graph=graph,
     )
 
@@ -2211,8 +2334,12 @@ async def _preflight_workflow(
     这边只回答「该不该让用户看到这张卡」。让人对着一张注定被拒的卡点确认，
     训练出来的是闭眼确认——与凭据预检同一条理由。
     """
-    definition = arguments.get("definition")
-    if not isinstance(definition, dict):
+    definition, _, error = await _graph_from_arguments(context, arguments)
+    if error is not None:
+        # patch 拼不上（节点不存在、删完变成断头边）同样不该弹卡：那是「这次的
+        # 改法不成立」，与人批不批准是两件事。
+        return error
+    if definition is None:
         return None
 
     from app.orchestration.definition import DefinitionError, compile_definition
@@ -2332,9 +2459,13 @@ async def studio_workflow_draft(
     校验仍然是 `compile_definition` 加保存时那两项库校验，不另写一套：
     起草说「能存」而保存被拒，比不校验更让人不信任这个工具。
     """
-    definition = arguments.get("definition")
-    if not isinstance(definition, dict):
-        return _fail('definition 必须是一个对象：{"entry": "起点id", "nodes": [...]}。')
+    definition, patch_notes, patch_error = await _graph_from_arguments(context, arguments)
+    if patch_error is not None:
+        return _fail(patch_error)
+    if definition is None:
+        return _fail(
+            '要校验得先有图：给 definition（整张图），或在已有一张图上给 patch（{"set_nodes": […]}）。'
+        )
 
     from app.orchestration.definition import DefinitionError, compile_definition
 
@@ -2352,7 +2483,8 @@ async def studio_workflow_draft(
                 ],
             },
             message=(
-                f"这张图现在存不进去：{where}没过校验（{exc.code}）——{exc.message}\n"
+                f"{'按这次改动改出来的图' if patch_notes else '这张图'}现在存不进去："
+                f"{where}没过校验（{exc.code}）——{exc.message}\n"
                 "只改这一处再交回来，不用重发整张图。一次改一处、多交几版，"
                 "比一次写完整张再指望它通过更省时间。"
             ),
@@ -2373,7 +2505,12 @@ async def studio_workflow_draft(
 
         existing = await workflow_service.get_workflow(context.tenant_id, name)
 
-    lines = ["这张图能存。", *_workflow_steps_text(plan, labels=labels)]
+    lines = ["这张图能存。"]
+    if patch_notes:
+        # 改动清单只在这一处出现：patch 里「删了谁」若不回显，模型下一轮就会
+        # 以为那个节点还在，然后再删一次、被告知「图里没有这个节点」。
+        lines.append("本次改动：" + "；".join(patch_notes) + "。")
+    lines.extend(_workflow_steps_text(plan, labels=labels))
     if renames:
         # 说清「换成了谁」：图里从此显示 `assistant`，而用户说的是「通用助手」。
         # 不说明的话，卡上那个人在他眼里就是凭空出现的。
@@ -2408,6 +2545,10 @@ async def studio_workflow_draft(
             "不想存就说改哪一步。"
         )
         lines.append("要调顺序或换人，改对应的那个节点再交回来，不必重写整张图。")
+        lines.append(
+            "这张图留在本会话里了：下一轮说「把第二步换成谁」，直接改它就行，"
+            "不用重发整张图——改了哪几处会一起列出来。"
+        )
     if existing is not None:
         lines.append(
             f"注意：这个标识下已经有一张流程（第 {int(existing.revision or 0)} 版），"
@@ -2425,6 +2566,10 @@ async def studio_workflow_draft(
             "errors": problems,
             **({"graph": graph} if graph.get("nodes") else {}),
             **({"writable_nodes": writable} if writable else {}),
+            # 这张图随这一轮消息存下来（`nodes._result_workflow_draft` → 消息
+            # 元数据）。下一轮「把第二步换成 ops」时，patch 才有底图可叠——
+            # 否则改一处仍然要模型凭记忆重画整张。
+            "workflow_draft": {"name": name or None, "definition": definition},
         },
         message="\n".join(lines),
     )
@@ -2600,7 +2745,9 @@ async def studio_workflow_save(
             "要换标识则新建一张（mode=create）。"
         )
 
-    definition = arguments.get("definition")
+    definition, patch_notes, patch_error = await _graph_from_arguments(context, arguments)
+    if patch_error is not None:
+        return _fail(patch_error)
     if definition is None:
         if existing is None:
             return _fail(
@@ -2609,8 +2756,6 @@ async def studio_workflow_save(
             )
         # 不传图 = 只改名字、说明或启停。传空对象才是「把图清空」，那由编译拒绝。
         definition = existing.definition or {}
-    elif not isinstance(definition, dict):
-        return _fail('definition 必须是一个对象：{"entry": "起点id", "nodes": [...]}。')
 
     display_name = str(
         arguments.get("display_name") or (existing.display_name if existing else name)
@@ -2661,6 +2806,8 @@ async def studio_workflow_save(
         f"已{action}流程「{row.display_name}」（{row.name}）：{node_count} 个节点 / "
         f"{depth_hops} 跳 · {'启用' if row.enabled else '停用'} · v{row.revision}。"
     ]
+    if patch_notes:
+        lines.append("本次改动：" + "；".join(patch_notes) + "。")
     if steps:
         lines.append(f"步骤：{' → '.join(steps)}")
     # 角色单独一行，而不是只把 id 串成一串：用户可能点名过某个角色（「让 ops
@@ -4104,6 +4251,12 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                 "比来回问几句快得多——问清楚再动手，只该用在保存那一步。"
                 "改一版交一版：它把第一处问题连节点一起指出来，改好那一处再交回来，"
                 "不要因为一处错误就重写整张图（重写最容易漏节点，漏掉等于删掉）。"
+                "**只改已有的那张图就用 patch，不要重发整张 definition**："
+                'patch={"set_nodes": [{…}], "remove_nodes": ["id"], "entry": "id"}，'
+                "按 id 叠在库里那张图上（用 patch 必须带 name）。"
+                "set_nodes 里那个节点写什么就是什么，不写的字段不会沿用旧值；"
+                "删掉的节点会从别人的 next 里一并摘掉；删完让某一步没有后继时报错，"
+                "那时给那一步补一条新的 next。"
                 "**它说能存就直接调 studio_workflow_save**，不要再问一句「确认就回『存』」："
                 "保存会弹确认卡，那是唯一一次确认；口头那句拦不住任何东西，只是多一轮往返。"
                 "它回答：图能不能存（errors 带节点与错误码）、步骤是否就是用户描述的那个过程、"
@@ -4126,8 +4279,9 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                         "pattern": "^[a-z][a-z0-9_-]{0,63}$",
                     },
                     "definition": {"type": "object"},
+                    "patch": {"type": "object"},
                 },
-                "required": ["definition"],
+                "required": [],
                 "additionalProperties": False,
             },
             handler=studio_workflow_draft,
@@ -4138,8 +4292,14 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
             description=(
                 "新建或修改一张编排流程（workflow）。**先 studio_workflow_draft 确认这张图能存**，"
                 "再调这个——保存会弹确认卡，图不成立时那张卡是白点一次。"
-                "mode=create 新建（必须给 definition），"
+                "mode=create 新建（给 definition；本会话刚起草过的话，patch 也能落在那张草稿上）,"
                 "mode=update 只改传入的字段（不给 definition 就只改说明与启停）。"
+                "**改一个已有的节点就用 patch，不用把整张图重发一遍**："
+                'patch={"set_nodes": [{…}], "remove_nodes": ["id"], "entry": "id"}，'
+                "按节点 id 叠在库里那张图上；set_nodes 是整节点替换（这个节点的 next、"
+                "emit 都要写全，不写的字段不会沿用旧值）；删掉的节点会从别人的 next 里"
+                "一并摘掉；删完让某一步没有后继时会被拒，那就给那一步补一条 next。"
+                "definition 与 patch 只能给一个。"
                 "name 建好之后不能改（它出现在「/workflow」后面与审计里），换名字只能新建一张；"
                 "只换显示名改 display_name。"
                 "**建图前先 studio_describe resource=agent 看有哪些智能体**："
@@ -4190,6 +4350,7 @@ def build_studio_admin_tools() -> list[ToolDefinition]:
                     "display_name": {"type": "string", "maxLength": 128},
                     "description": {"type": "string", "maxLength": 512},
                     "definition": {"type": "object"},
+                    "patch": {"type": "object"},
                     "enabled": {"type": "boolean"},
                 },
                 "required": ["mode", "name"],

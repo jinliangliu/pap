@@ -13,18 +13,24 @@
 3. **存不下必须说出来**。`skipped` 带回原因，网关把它写进日志与审计；
    静默跳过等于告诉后来的人「这里没有备份，所以大概不重要」。
 
+保留期（`_prune`）与第 2 条不矛盾：它删的是**同一份资源上早已没有回滚价值**的
+旧快照（第 6 份以前、或 90 天以前），不是「为了腾地方挤掉最新的那份」。没有
+保留期时，总量上限会让备份在某天全体静默停止——`store_full` 每日刷日志，而
+真正需要恢复的那一件恰好落在停止之后。
+
 备份失败**不吞**：调用方（网关）根据异常决定是否继续。默认语义是
 「备不下来就别写」——写前备份的意义就在于它是写的前置条件。
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.db.session import async_session_factory
 from app.models.write_backup import WriteBackup
@@ -35,6 +41,16 @@ from app.tools.types import BackupSpec
 logger = logging.getLogger(__name__)
 
 _MB = 1024 * 1024
+
+# 保留期。两个数各自回答一个问题，缺一个都会让「留多久」变得不可预期：
+#
+# - `KEEP_PER_RESOURCE`：同一个资源（一张流程、一个连接器）留最近几份。
+#   回滚读的是最新那份，往前第 6 份已经没有人会去翻；而按份数留比按天数留
+#   更贴近使用方式——改得勤的那几天不该因为「都在今天」而只剩一份。
+# - `MAX_AGE_DAYS`：不管多少份，90 天前的都不再留。它挡的是「一年前那张图
+#   还是最新一份」的情形：那时按份数看是合法的，按价值看早就不该在库里。
+KEEP_PER_RESOURCE = 5
+MAX_AGE_DAYS = 90
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +96,84 @@ def measure(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
     """
     text = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
     return json.loads(text), len(text.encode("utf-8"))
+
+
+async def _trim_resource(
+    session: Any,
+    tenant_id: str,
+    resource_type: str,
+    resource_id: str,
+) -> int:
+    """把「这一个资源」压回保留份数。插完新行之后调用。
+
+    裁剪分两次跑是有意的：插入**之前**那次是为了腾出空间（总量判据要用清理后的
+    用量），插入**之后**这次是为了兑现「每个资源留最近几份」——只在插入前裁，
+    稳态会是 N+1 份，而文档写的是 N。
+
+    这次的条件比窗口函数窄：直接按资源取第 N 名之后的行。写操作（尤其要过审批的）
+    频次很低，多这一条按资源的删除，比在每次写时重扫全租户便宜。
+    """
+    older = (
+        select(WriteBackup.id)
+        .where(
+            WriteBackup.tenant_id == tenant_id,
+            WriteBackup.resource_type == resource_type,
+            WriteBackup.resource_id == resource_id,
+        )
+        .order_by(WriteBackup.created_at.desc(), WriteBackup.id.desc())
+        .offset(KEEP_PER_RESOURCE)
+        .subquery()
+    )
+    result = await session.execute(delete(WriteBackup).where(WriteBackup.id.in_(select(older.c.id))))
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+async def _prune(session: Any, tenant_id: str) -> int:
+    """按保留期删掉没有回滚价值的旧快照，返回删掉的条数。
+
+    在**插入之前**跑：总量判据要用的是「清理之后还剩多少」，否则一个早就该
+    清理的租户会一直卡在 `store_full`，而它的备份全是三个月前的。反过来，
+    保留期也不能替第 2 条兜底——它永远留着每个资源最新的几份。
+
+    两步删除共用一次事务：中间失败会整批回滚，不会留下「删了一半」的库。
+    """
+    ranked = (
+        select(
+            WriteBackup.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=(WriteBackup.resource_type, WriteBackup.resource_id),
+                order_by=(WriteBackup.created_at.desc(), WriteBackup.id.desc()),
+            )
+            .label("rn"),
+        )
+        .where(WriteBackup.tenant_id == tenant_id)
+        .subquery()
+    )
+
+    stale = await session.execute(
+        delete(WriteBackup).where(WriteBackup.id.in_(select(ranked.c.id).where(ranked.c.rn > KEEP_PER_RESOURCE)))
+    )
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=MAX_AGE_DAYS)
+    aged = await session.execute(
+        delete(WriteBackup).where(
+            WriteBackup.tenant_id == tenant_id,
+            WriteBackup.created_at < cutoff,
+        )
+    )
+
+    removed = int(getattr(stale, "rowcount", 0) or 0) + int(getattr(aged, "rowcount", 0) or 0)
+    if removed:
+        logger.info(
+            "按保留期清理了旧备份。",
+            extra={
+                "event": "write_backup_pruned",
+                "removed": removed,
+                "keep_per_resource": KEEP_PER_RESOURCE,
+                "max_age_days": MAX_AGE_DAYS,
+            },
+        )
+    return removed
 
 
 async def capture(
@@ -139,6 +233,10 @@ async def capture(
     with tenant_scope(tenant_id):
         async with async_session_factory() as session:
             async with session.begin():
+                # 先按保留期裁剪，再判总量：否则一个三个月没清理的租户会永远卡在
+                # `store_full`，而它占空间的恰恰全是早该删掉的快照。
+                await _prune(session, tenant_id)
+
                 used = await session.scalar(
                     select(func.coalesce(func.sum(WriteBackup.size_bytes), 0)).where(
                         WriteBackup.tenant_id == tenant_id
@@ -184,6 +282,10 @@ async def capture(
                 session.add(row)
                 await session.flush()
                 backup_id = str(row.id)
+                # 插入前那次裁剪留下的是「去掉新行之后的 N 份」，所以这一步才把
+                # 这个资源压回 N。两处缺一：只有前者会稳定多留一份，只有后者
+                # 则腾不出空间（总量判据用的是插之前的用量）。
+                await _trim_resource(session, tenant_id, spec.resource_type, spec.resource_id)
 
     return BackupOutcome(
         enabled=True,

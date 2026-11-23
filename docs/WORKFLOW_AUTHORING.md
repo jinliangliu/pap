@@ -95,46 +95,55 @@ studio_workflow_draft(name?, definition) -> {
 
 **不新增写工具。** `STUDIO_ASSISTANT.md` §4.2.1 已经论证过「一个写工具 + 一个删工具」，
 再加一个 `studio_workflow_patch` 会让审批、摘要、verifier、备份各长出第二套。
-改成同一个工具的可选参数，与 `definition` 二选一：
+改成同一个工具的可选参数，与 `definition` 二选一。**`studio_workflow_draft` 同样接受它**，
+否则「改一处」在起草那一步仍然要重发整张图：
 
 ```json
 {
   "name": "pressure-triage",
-  "patch": [
-    {"op": "upsert_node", "node": {"id": "check", "agent": "field-ops",
-      "task": "查规程里对这类泄漏的处置要求",
-      "emit": {"field": "level", "values": ["泄漏", "正常"]},
-      "next": [{"when": {"key": "level", "op": "eq", "value": "泄漏"}, "to": "advise"},
-               {"to": "report"}]}},
-    {"op": "remove_node", "node": "diagnose"},
-    {"op": "set_entry", "entry": "check"},
-    {"op": "set_max_nodes", "max_nodes": 6}
-  ]
+  "patch": {
+    "set_nodes": [{"id": "b", "agent": "ops", "task": "按超压处置：{{nodes.a.level}}",
+                   "next": [{"when": null, "to": "c"}]}],
+    "remove_nodes": ["diagnose"],
+    "entry": "check"
+  }
 }
 ```
 
-语义只有三条，每条都可测：
+三个键，语义只有三条：
 
 | 规则 | 为什么 |
 |---|---|
-| 没给的字段**保留**；传 `{}` / `[]` 是显式清空 | 「漏传 = 清空」会让一次改名删掉整张图（这是 `definition` 那条路径已经避开的坑） |
-| `next` 给就**整组替换** | 边是集合，逐条增删会留下半条边；整组替换的语义与 `save` 一致 |
-| `remove_node` 连带删掉所有指向它的边，**不改接** | 指向不存在的节点（`WORKFLOW_DANGLING_EDGE`）比缺兜底边（`WORKFLOW_NO_FALLBACK`）更难修；但自动把 `A→X→B` 折成 `A→B` 是猜，会静默改变行为 |
+| `set_nodes` 按 id **整节点替换**，没有的 id 就**新增** | 合并语义会让「我没写 next」同时表示「沿用旧 next」和「它没有后继」，而这两件事跑起来完全不同。整节点替换只有一个含义：你写的就是它 |
+| `remove_nodes` 摘掉所有指向它的边，**并说出来**；若某节点因此没有后继，**报错不改接** | 指向不存在的节点编译不过；但自动把 `A→X→B` 折成 `A→B` 是猜，而「三步走完」变成「停在第二步」不会抛任何异常 |
+| `entry` 可改；删掉入口却没给新 `entry` → 报错 | 入口是流程的起点，静默换成别的节点等于换了一张图 |
 
-落点：`workflow_service.save_workflow(..., patch=None)`。**注意执行顺序变了**——
-现在先 `compile_definition` 再进事务，而 patch 要读库里的当前图，所以编译必须挪进事务内。
-`_ensure_agents_available` 本来就在事务里，这一点不变。
+**底图从哪来**：先按 `name` 取库里的那张；库里没有（还没建、或上一轮刚起草过）就取
+**本会话最近一份草稿**（`_latest_workflow_draft`，读消息元数据）。返回里会多一行
+「叠在本会话上一版草稿上」——不说的话，读者以为改的是库里那张。
 
-`patch` 只在流程**已存在**时可用；新建必须给 `definition`（没有底图可施）。
-两者同时给 → `WorkflowError`，不猜谁优先。带 `patch` 时 `mode` 可省（有底图即 `update`）。
+**改动清单要回显**：「本次改动：替换节点「b」；删掉节点「diagnose」」出现在起草正文、
+保存正文、确认卡三处。不回显的话，模型下一轮会以为那个节点还在，再删一次、
+然后被告知「图里没有这个节点」。
 
-`_preflight_workflow` 与 `summarize` 都要跟着改：
-- preflight 对 patch 先查一次当前图，施加后编译——否则「注定被拒的确认卡」又回来了；
-- 确认卡正文对 patch 只说**改了哪几处**（从参数就能算），不重述整张图：
-  「修改流程「pressure-triage」：更新 check、删除 diagnose、入口改为 check」。
-  图仍然由 `graph` 给——同一个工具、同一个渲染路径。
+### 与最初设计的差异（2026-11-23 实现时改的）
 
-## 6. 改动三：回滚（P1，借 `write_backups`）
+设计稿原本是 `patch` 为一串 ops（`upsert_node` / `remove_node` / `set_entry` / `set_max_nodes`）、
+「没给的字段保留」、施加在 `workflow_service.save_workflow` 里。三处都改了，各有理由：
+
+1. **ops 数组 → 三个键**：数组要模型逐条保证顺序与合法性，而实际改动通常是一处。
+   键名固定之后，写错键会在 `apply_patch` 里被拒并列出可用的键，不必等到编译。
+2. **字段保留 → 整节点替换**：见上表。代价是改一个字段要重发整个节点——比整张图便宜
+   一个数量级，而且不会出现「我以为它保留了 next」。
+3. **不进服务层**：把 `compile_definition` 挪进事务是这套设计里唯一有风险的动作
+   （编译是纯函数，挪进去之后事务变长、错误点变多）。改为在工具层施加后照常编译，
+   `save_workflow` 一行不动。代价是控制台的 `POST /workflows` 用不上 patch——
+   那边本来就是整张图编辑，不需要它。
+
+`_preflight_workflow` 与 `summarize` 共用同一份解析（`_graph_from_arguments`）：卡上画的
+必须就是存下去的那张。preflight 对拼不上的 patch 直接返回错误、不弹卡。
+
+## 6. 改动三：回滚（P2，借 `write_backups`）
 
 `revision` 只有号，没有快照，所以「回到第 3 版」现在做不到。**不新建版本表**：
 `studio_workflow_save` 的 `_backup_workflow` 钩子已经在每次保存前把整份 `definition`
@@ -145,9 +154,14 @@ studio_workflow_draft(name?, definition) -> {
 - **回滚是一次新的保存**，`revision` 继续涨，审计里是 `workflow_updated`。
   「版本号退回去」等于声称那段时间没发生过，而运行记录上记的是它——这条与
   `studio_agent_restore` 的口径一致（恢复类不能拿版本号当证据）；
-- 备份是「保存**前**」的，所以「回到上一次的样子」是按 `created_at` 倒序取第一条，不是当前行；
-- 前置条件：`write_backups` 要有保留期清理，否则这个入口会翻出三个月前的图。
-  清理与「控制台展示备份设置」是同一条待办。
+- 备份是「保存**前**」的，所以「回到上一次的样子」是按 `created_at` 倒序取第一条，不是当前行。
+
+**保留期已经落在 `write_backup_service`**（回滚的前置条件）：每个资源留最近
+`KEEP_PER_RESOURCE=5` 份、且只留 `MAX_AGE_DAYS=90` 天内的。裁剪跑两次——
+插入前一次（腾出空间，总量判据要用清理后的用量）、插入后按资源压回 5 份
+（只在插入前裁，稳态会是 6 份，与「留几份」这个承诺不符）。
+没有它，总量上限会让备份在某个时刻全体静默停止（`store_full` 每天刷日志），
+而真正需要恢复的那一件恰好落在停止之后。
 
 ## 7. 试运行：不造假跑
 
@@ -201,8 +215,8 @@ A 的代价是可见的、C 的代价是长期的，B 的代价是治理上的�
 4. 模型把图 + 3 步 + 「第 2 步会停在审批」说给用户；用户说「就这样」
 5. `studio_workflow_save`（`definition=那张图`）→ 确认卡：图 + 角色 + 分流
 6. 批准 → `verify_workflow_saved` 回读（节点集合一致、`revision`、`enabled`）→ 给触发方式
-7. 后续「把第 2 步换成 assistant」→ `studio_describe` 读原图 → `patch`（一个 `upsert_node`）
-   → 确认卡只说「更新 advise」，其余节点一个字不动
+7. 后续「把第 2 步换成 assistant」→ `patch` 里 `set_nodes` 一个节点（并带上它的 `next`）
+   → 正文说「本次改动：替换节点「advise」」，其余节点一个字不动；确认卡上的图与它一致
 
 第 3 步是这套改动真正省下来的东西：**一次改动 = 一个节点**，而不是一整份 JSON。
 
@@ -212,7 +226,7 @@ A 的代价是可见的、C 的代价是长期的，B 的代价是治理上的�
 |---|---|
 | 写工具只在构建助手 | 默认助手最容易被动过嘴，给它 `studio_workflow_save` 等于开一条不经审批的配置写入。**这条现在是硬隔离**：`ToolGateway.internal_denial` 按身份把 `studio_*` 挡在所有别的智能体之外（目录与执行两处同一份判断）。之前只写在提示词里，而默认智能体 `allowed_tools=None`、平台管理员跳过 scope，工具其实一直在它的目录里 |
 | 起草不落库、不要审批 | 起草失败是常态；对失败也弹确认，人会对确认卡闭眼 |
-| `patch` 仍然是「保存一张完整的图」 | 服务端施加 ops 后整图编译，`revision` 语义、冻结、审计都不变 |
+| `patch` 仍然是「保存一张完整的图」 | 施加 patch 后照常 `compile_definition`，`revision` 语义、冻结、审计都不变；它只是省掉「重打一遍」 |
 | 校验只有一份 | `compile_definition` 是唯一权威；draft 与 preflight 都只是它的包装 |
 | 角色替换必须说出来 | 用户点名 `ops`、图里用了 `field-ops` 时，**调用前**要用一句话说明换成了谁（卡上列得出用了谁，列不出他原本说了什么） |
 
@@ -222,9 +236,10 @@ A 的代价是可见的、C 的代价是长期的，B 的代价是治理上的�
 |---|---|---|---|
 | P0 | `studio_workflow_draft` + 提示词收口 | 模型在一轮里至少调用 2 次 draft，且第 2 次只改出错的那个节点 | **已完成**（2026-11-23） |
 | P0 | `/build`（前端截住 + 后端 409 兜底） | 对话页输入 `/build ...` 能到面板；直接打 API 得到 409 而不是一段编出来的话 | **已完成** |
-| P1 | `save` 的 `patch` | 「把第 2 步换成 X」不改动其余节点（节点集合与边逐条对比） | 未开始 |
-| P1 | 草稿跨轮（`response_metadata.workflow_draft`） | 刷新后第二轮仍能引用上一轮的图，且 `messages` 行里真有这个字段 | 未开始 |
-| P2 | 备份取回（回滚） | 从 `write_backups` 取回第 N 份，`revision` 继续涨而不是回退 | 未开始 |
+| P1 | `save` / `draft` 的 `patch` | 「把第 2 步换成 X」不改动其余节点（节点集合与边逐条对比） | **已完成**（2026-11-23） |
+| P1 | 草稿跨轮（`response_metadata.workflow_draft`） | 第二轮的 patch 落在上一轮的图上，且 `messages.metadata_json.workflow_draft` 真有这个字段 | **已完成**（2026-11-23） |
+| P2 | 备份保留期清理 | 同一资源留 5 份、只留 90 天内的；总量满了先清再判 | **已完成**（2026-11-23） |
+| P2 | 备份取回（回滚） | 从 `write_backups` 取回第 N 份，`revision` 继续涨而不是回退 | 未开始（前置的保留期已就绪） |
 | P2 | 对话里回显 run 的节点流水 | 跑完在会话里看得到每步耗时与输出前 N 字 | 未开始 |
 
 ## 12. 验收用例
@@ -235,17 +250,22 @@ A 的代价是可见的、C 的代价是长期的，B 的代价是治理上的�
    且**库里没有新增行**、`revision` 没变。
 2. `draft` 里写了清单上没有的角色 → `preflight.agents_missing` 非空；
    `save` 同一张图 → 被拒，理由点名那个角色。
-3. `patch` 只给 `{"op":"upsert_node","node":{"id":"check",...}}` → 其余节点的
-   `task` / `emit` / `next` 与改动前逐字相同。**（反向：把 patch 实现成整图替换，这条绿）**
-4. `patch` 传 `"emit": {}` → 该节点的 `emit` 被清空，不是「保留原值」。
-5. `remove_node` → 指向它的边消失；没有自动改接；若某节点因此缺兜底边，
-   `save` 报 `WORKFLOW_NO_FALLBACK` 并指出该节点。
-6. `patch` 与 `definition` 同时给 → 被拒（`WorkflowError`），`revision` 不变。
-7. `patch` 打在不存在的流程上 → 拒绝，提示「新建要给 definition」。
+3. `patch.set_nodes` 只给一个节点 → 其余节点的 `task` / `emit` / `next` 与改动前
+   逐字相同。**（反向：把 patch 实现成整图替换，这条绿）**
+4. `set_nodes` 里那个节点没写 `next` → 它就没有后继，**不是沿用旧值**；由此让别的节点
+   走不到时，`save` 报 `WORKFLOW_UNREACHABLE_NODE` 并指出节点，`revision` 不变。
+5. `remove_nodes` → 指向它的边被摘掉并在正文里说出来；若某节点因此没有后继，
+   报 `WORKFLOW_PATCH_ORPHAN_EDGE` 并指出是哪一步，**不自动改接**。
+6. `patch` 与 `definition` 同时给 → 被拒，文案说「只能给一个」，`revision` 不变。
+7. `patch` 带 `name` 但库里没有、本会话也没起草过 → 拒绝，并说明「新建要给 definition」。
+8. 不带 `name`、但本会话上一轮起草过 → 落在草稿上，正文写「叠在本会话上一版草稿上」；
+   随后 `save(mode=create)` 能把改完的图建出来（`revision=1`）。
 8. 直接 `POST /api/v1/chat` 发 `/build ...` → 409，`messages` 表没有新增行。
-9. 回滚：`write_backups` 里取第 N 份 → 保存后 `revision` = 原值 + 1，审计是
-   `workflow_updated`，且 `definition` 与第 N 份逐字段相等。
-10. `test_studio_tool_verifiers` 仍绿：`studio_workflow_save` 有 `verifier` 与 `summarize`，
+9. 保留期：同一资源连存 8 次 → 库里正好 5 行（不是 6）；八张不同的图各存一次 → 8 行都在
+   （按资源计份，不是全局）；总量已满但旧快照过期时，先清理再判，写入不被 `store_full` 误伤。
+10. 回滚（未实现）：`write_backups` 里取第 N 份 → 保存后 `revision` = 原值 + 1，审计是
+    `workflow_updated`，且 `definition` 与第 N 份逐字段相等。
+11. `test_studio_tool_verifiers` 仍绿：`studio_workflow_save` 有 `verifier` 与 `summarize`，
     `studio_workflow_draft` **不**需要 `verifier`（它不写）。
 
 ## 13. 相关文件

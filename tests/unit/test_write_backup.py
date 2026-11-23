@@ -174,3 +174,129 @@ async def test_payload_is_stored_as_strict_json():
 
     assert outcome.captured is True
     assert outcome.size_bytes > 0
+
+
+# ---------------------------------------------------------------- 保留期
+
+
+async def _capture(blob: str, resource_id: str = "wf-1") -> None:
+    await write_backup_service.capture(
+        tenant_id=TEST_TENANT,
+        tool_name="studio_workflow_save",
+        decision="approved",
+        policy_revision=1,
+        spec=BackupSpec(
+            resource_type="workflow", resource_id=resource_id, payload={"definition": blob}
+        ),
+    )
+
+
+async def _payloads() -> list[str]:
+    async with async_session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(WriteBackup).order_by(WriteBackup.created_at.asc(), WriteBackup.id.asc())
+            )
+        ).all()
+    return [row.payload["definition"] for row in rows]
+
+
+async def _insert_old_backup(
+    *,
+    days: int = 0,
+    minutes_ago: int = 0,
+    size_bytes: int,
+    resource_id: str = "wf-old",
+    payload: str = "old",
+) -> None:
+    """直接插一行历史备份：`created_at` 要能指定，否则测不出「留最近几份」。"""
+    async with async_session_factory() as session:
+        async with session.begin():
+            session.add(
+                WriteBackup(
+                    tenant_id=TEST_TENANT,
+                    tool_name="studio_workflow_save",
+                    resource_type="workflow",
+                    resource_id=resource_id,
+                    decision="approved",
+                    policy_revision=1,
+                    payload={"definition": payload},
+                    size_bytes=size_bytes,
+                    created_at=datetime.datetime.now(datetime.UTC)
+                    - datetime.timedelta(days=days, minutes=minutes_ago),
+                )
+            )
+
+
+async def test_keeps_only_the_newest_snapshots_of_one_resource():
+    """同一张流程改八次，只留最近五份。
+
+    否则回滚永远读得到，但库会一直被同一张图的历代版本占着——而这正是
+    「总量满了、新备份悄悄停掉」的成因。
+
+    历史行直接插、时间戳显式错开：`created_at` 是库端 `now()`，在测试库里
+    同一个事务内是同一个值，八行会并列——那时「哪五份算最近的」就不是这条
+    规则能回答的问题（顺序退化成 uuid 排序）。
+    """
+    for index in range(7):
+        await _insert_old_backup(
+            days=0, size_bytes=1024, resource_id="wf-1", payload=f"v{index}",
+            minutes_ago=(7 - index) * 10,
+        )
+    await _capture("v7")
+
+    assert await _payloads() == [f"v{i}" for i in range(3, 8)]
+
+
+async def test_retention_counts_per_resource_not_globally():
+    """按资源计份：八张不同的流程各备一份，一份都不该被删。"""
+    for index in range(8):
+        await _capture(f"v{index}", resource_id=f"wf-{index}")
+
+    assert await _row_count() == 8
+
+
+async def test_drops_snapshots_older_than_the_age_limit():
+    await _insert_old_backup(days=write_backup_service.MAX_AGE_DAYS + 10, size_bytes=1024)
+
+    await _capture("fresh")
+
+    payloads = await _payloads()
+    assert payloads == ["fresh"]
+
+
+async def test_pruning_frees_space_so_capture_does_not_stop_early():
+    """总量满了时，先按保留期清掉过期的，再判能不能备。
+
+    不清就判的话，一个三个月没动过的租户会一直 `store_full`——它的空间全被
+    早该删掉的旧快照占着，而真正需要恢复的那一次落在「停止」之后。
+    """
+    await runtime_settings.set_backup_max_size_mb(1, actor="tester")
+    await _insert_old_backup(
+        days=write_backup_service.MAX_AGE_DAYS + 10, size_bytes=900 * 1024
+    )
+
+    outcome = await write_backup_service.capture(
+        tenant_id=TEST_TENANT,
+        tool_name="studio_workflow_save",
+        decision="approved",
+        policy_revision=1,
+        spec=BackupSpec(
+            resource_type="workflow", resource_id="wf-1", payload={"definition": "x" * 200_000}
+        ),
+    )
+
+    assert outcome.captured is True
+    assert outcome.skipped is None
+
+
+async def test_repeated_captures_hold_at_the_retention_count():
+    """连改八次之后库里正好留五份——不是六份。
+
+    只裁「插之前」会稳定多留一份：8 行时裁到 5，插入变 6，下次再裁到 5 再插。
+    稳态多出来的那一份与文档写的份数不符，而「留几份」是这条规则唯一的承诺。
+    """
+    for index in range(8):
+        await _capture(f"v{index}")
+
+    assert await _row_count() == write_backup_service.KEEP_PER_RESOURCE

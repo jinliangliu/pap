@@ -467,3 +467,74 @@ def test_stages_never_leak_into_the_answer_text() -> None:
     assert "已导入知识库" in text
     assert "stages" not in text
     assert "23,727 字" not in text
+
+
+def test_workflow_draft_never_leaks_into_the_answer_text() -> None:
+    """草稿图是下一轮的底图，不是这一轮的结论。
+
+    铺进正文会变成整段 definition JSON，把「这张图能存 / 差在哪」那句埋掉，
+    而用户要读的正是那句。
+    """
+    result = _result(
+        result={
+            "workflow_draft": {
+                "name": "triage",
+                "definition": {"entry": "check", "nodes": [{"id": "check", "next": []}]},
+            }
+        },
+        message="这张图能存。图还没落库。",
+    )
+
+    text = _summarize_result(result)
+    assert "这张图能存" in text
+    assert "workflow_draft" not in text
+    assert "check" not in text
+
+
+def test_result_workflow_draft_keeps_only_name_and_definition() -> None:
+    """起草出来的图随消息存下来，但只留两个键。
+
+    多留字段的代价是历史消息越来越胖，而下一轮改图只需要底图本身：
+    `writable_nodes`、`errors` 那些是这一轮的结论，不是下一轮的输入。
+    """
+    from app.agents.nodes import _result_workflow_draft
+
+    result = ToolExecutionResult(
+        success=True,
+        result={
+            "ok": True,
+            "writable_nodes": ["b"],
+            "workflow_draft": {
+                "name": "triage",
+                "definition": {"entry": "a", "nodes": [{"id": "a", "next": []}]},
+            },
+        },
+    )
+
+    draft = _result_workflow_draft(result)["workflow_draft"]
+    assert draft["name"] == "triage"
+    assert list(draft) == ["name", "definition"]
+    assert draft["definition"]["nodes"][0]["id"] == "a"
+
+
+def test_result_workflow_draft_is_dropped_when_the_graph_is_unusable() -> None:
+    """没有节点列表的「草稿」不能进消息元数据：下一轮 patch 会拿它当底图。"""
+    from app.agents.nodes import _result_workflow_draft
+
+    assert _result_workflow_draft(None) == {}
+    assert _result_workflow_draft(ToolExecutionResult(success=True, result={})) == {}
+    assert (
+        _result_workflow_draft(
+            ToolExecutionResult(success=True, result={"workflow_draft": {"definition": {}}})
+        )
+        == {}
+    )
+    assert (
+        _result_workflow_draft(
+            ToolExecutionResult(
+                success=False,
+                result={"workflow_draft": {"definition": {"nodes": [{"id": "a"}]}}},
+            )
+        )
+        == {}
+    )
