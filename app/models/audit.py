@@ -86,6 +86,14 @@ class AuditEventType(str, enum.Enum):
     API_TOKEN_ISSUED = "api_token_issued"
     API_TOKEN_REVOKED = "api_token_revoked"
 
+    # 编排：图本身就是治理对象——「谁在第几步、用什么边界做什么」写在这张图里。
+    # 控制台与构建助手是两个入口，两边都必须留痕；否则从控制台删掉一张图，
+    # 事后既查不出谁删的、也给不了 `verify_workflow_deleted` 要的那份正向证据。
+    WORKFLOW_CREATED = "workflow_created"
+    WORKFLOW_UPDATED = "workflow_updated"
+    WORKFLOW_STATUS_CHANGED = "workflow_status_changed"
+    WORKFLOW_DELETED = "workflow_deleted"
+
     ADMIN_ACTION = "admin_action"
     SECURITY_EVENT = "security_event"
 

@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.dependencies import get_current_identity
 from app.auth.dependencies import Identity
+from app.db.session import async_session_factory
 from app.models.workflow import Workflow, WorkflowRun
 from app.schemas.workflow import (
     WorkflowDetail,
@@ -30,6 +32,8 @@ from app.schemas.workflow import (
     WorkflowToggleRequest,
 )
 from app.services import workflow_service
+from app.services.audit_service import write_audit_event
+from app.tenancy.context import tenant_scope
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,66 @@ def _require_manage(identity: Identity) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="缺少 agent:write 权限，无法管理编排。",
         )
+
+
+async def _audit_workflow(
+    identity: Identity,
+    *,
+    event_type: str,
+    resource_id: str,
+    message: str,
+    metadata: dict[str, Any],
+) -> None:
+    """给一次编排写操作留痕。
+
+    **必须自己带 `tenant_scope`**：`audit_logs` 是 FORCE RLS，插入要求事务里先设好
+    `app.tenant_id`。少了这一层，SQLite 单测一切正常，PostgreSQL 上直接
+    `new row violates row-level security policy`——表现成「审计页空空如也，代码却
+    以为记了」。同一处坑在 `studio_admin_tools._audit_admin` 里已经踩过一次。
+
+    **审计不参与写操作本身的事务**：`workflow_service` 自己开会话、自己提交，
+    两边合不到一起。所以失败时不能把请求判成失败——那时流程已经改完了，
+    报错只会让人再点一次删除、拿到 404。打 ERROR 并带上 `resource_id`，
+    事后按它补记。
+    """
+    try:
+        with tenant_scope(identity.tenant_id):
+            async with async_session_factory() as session:
+                async with session.begin():
+                    await write_audit_event(
+                        session,
+                        event_type=event_type,
+                        tenant_id=identity.tenant_id,
+                        actor_id=identity.user_id,
+                        resource_type="workflow",
+                        resource_id=resource_id,
+                        message=message,
+                        metadata=metadata,
+                    )
+    except Exception:  # noqa: BLE001 - 审计失败不改变已经生效的结论
+        logger.error(
+            "编排审计写入失败，改动已生效。",
+            extra={
+                "event": "workflow_audit_failed",
+                "workflow_resource_id": resource_id,
+                "audit_event_type": event_type,
+            },
+            exc_info=True,
+        )
+
+
+def _graph_shape(row: Workflow) -> dict[str, Any]:
+    """审计里记图的形状，不记图的正文。
+
+    `definition` 里是全部分工与提示词，进审计等于把配置复制一份到长期表；
+    而事后要回答的是「这次改动动了多大」——节点数与深度够了。
+    """
+    plan = workflow_service.plan_of(row)
+    return {
+        "node_count": plan.size if plan else 0,
+        "depth_hops": plan.depth_hops if plan else 0,
+        "max_nodes": plan.max_nodes if plan else 0,
+    }
 
 
 def _run_item(row: WorkflowRun) -> WorkflowRunItem:
@@ -141,6 +205,11 @@ async def save_workflow(
     """
     _require_manage(identity)
 
+    # 先读一次找出「新建还是更新」：`save_workflow` 内部那次查询不对外，
+    # 而审计要回答的第一件事就是这两个动作中的哪一个。写操作是人点出来的，
+    # 多一次按名字的 SELECT 不值得为省它去改服务层签名。
+    existing = await workflow_service.get_workflow(identity.tenant_id, payload.name)
+
     try:
         row = await workflow_service.save_workflow(
             tenant_id=identity.tenant_id,
@@ -158,6 +227,30 @@ async def save_workflow(
             # 只显示这句 message，不会因此多一个分支。
             detail={"code": exc.code, "message": exc.message, "node": exc.node},
         ) from exc
+
+    created = existing is None
+    previous_definition = (existing.definition or {}) if existing is not None else None
+    await _audit_workflow(
+        identity,
+        event_type="workflow_created" if created else "workflow_updated",
+        resource_id=str(row.id),
+        message=(
+            f"控制台{'新建' if created else '更新'}流程「{row.display_name}」"
+            f"（{row.name}）v{row.revision}"
+        ),
+        metadata={
+            "operation": "workflow_created" if created else "workflow_updated",
+            "name": row.name,
+            "display_name": row.display_name,
+            "revision": row.revision,
+            "enabled": row.enabled,
+            # 只改显示名 / 说明 / 启停时图没变、修订号也不涨：审计要能区分
+            # 「换了个名字」和「换了整张图」，否则版本号一样的两条记录看着像重复。
+            "graph_changed": created or previous_definition != (row.definition or {}),
+            "source": "console",
+            **_graph_shape(row),
+        },
+    )
 
     summary = _summary(row, None)
     return WorkflowDetail(**summary.model_dump(), definition=row.definition or {})
@@ -189,6 +282,28 @@ async def toggle_workflow(
         definition=row.definition,
         enabled=payload.enabled,
     )
+
+    # 启停是治理动作：停掉一张图等于让某条处置链路消失。改之前的状态要记下来，
+    # 否则「什么时候被停的」只能靠 `updated_at` 猜，而它同时被改名、改说明触发。
+    if bool(row.enabled) != bool(updated.enabled):
+        await _audit_workflow(
+            identity,
+            event_type="workflow_status_changed",
+            resource_id=str(updated.id),
+            message=(
+                f"控制台{'启用' if updated.enabled else '停用'}流程"
+                f"「{updated.display_name}」（{updated.name}）"
+            ),
+            metadata={
+                "operation": "workflow_status_changed",
+                "name": updated.name,
+                "from": bool(row.enabled),
+                "to": bool(updated.enabled),
+                "revision": updated.revision,
+                "source": "console",
+            },
+        )
+
     return _summary(updated, None)
 
 
@@ -199,11 +314,38 @@ async def delete_workflow(
 ) -> None:
     _require_manage(identity)
 
+    # 删完就查不到这一行了，id 与形状必须**删之前**取。`delete_workflow` 只回一个
+    # 布尔，拿不到它删的是哪一条——而审计的价值全在 `resource_id` 上：
+    # `verify_workflow_deleted` 就是按这个 id 去找「已删除」那条记录的。
+    row = await workflow_service.get_workflow(identity.tenant_id, name)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"没有名为「{name}」的流程。")
+
+    audit_meta = {
+        "operation": "workflow_deleted",
+        "name": str(row.name),
+        "display_name": str(row.display_name),
+        "revision": int(row.revision or 0),
+        "source": "console",
+        **_graph_shape(row),
+    }
+
     deleted = await workflow_service.delete_workflow(
         tenant_id=identity.tenant_id, name=name
     )
     if not deleted:
         raise HTTPException(status_code=404, detail=f"没有名为「{name}」的流程。")
+
+    await _audit_workflow(
+        identity,
+        event_type="workflow_deleted",
+        resource_id=str(row.id),
+        message=(
+            f"控制台删除流程「{row.display_name}」（{row.name}）"
+            f"v{int(row.revision or 0)}"
+        ),
+        metadata=audit_meta,
+    )
 
 
 @router.get("/{name}/runs", response_model=WorkflowRunListResponse)
