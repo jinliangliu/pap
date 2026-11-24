@@ -4654,7 +4654,11 @@
     // 卡片内展开的面板：{ name, kind: "credential" | "edit" }
     // 「发现工具」不在这里——它在弹窗里，卡片只有 300px 宽，装不下工具名 + 整段说明。
     panel: null,
-    busy: false
+    busy: false,
+    // 挂在常驻 `#view` 上的两个委托监听器。存下来是为了下一次挂载前摘掉，
+    // 否则每进一次这一页就多一份（见 `mountConnectors` 里的注释）。
+    onClick: null,
+    onChange: null
   };
 
   function connKindLabel(kind) {
@@ -5309,15 +5313,24 @@
       });
     }
 
-    root.addEventListener("click", function (event) {
+    // 事件委托挂在 `root`（常驻的 `#view`）上：卡片整批重绘时不用逐张重绑。
+    // 代价是每进一次这一页就会再挂一份——`render()` 只清 `innerHTML`，元素本身
+    // 不会换，旧监听器跟着活下来。挂了两份，点一下「发现工具」就开两层遮罩，
+    // 关掉上面那层下面还在，表现成「这个窗口要点好几次才关得掉」；更早的形态是
+    // 点一次「删除」发两次请求，第二次 404 弹一条红字。所以先摘掉上一份再挂。
+    if (connUI.onClick) root.removeEventListener("click", connUI.onClick);
+    if (connUI.onChange) root.removeEventListener("change", connUI.onChange);
+
+    connUI.onClick = function (event) {
       var target = event.target.closest("[data-act]");
       if (!target) return;
       connAction(target.getAttribute("data-act"), target.getAttribute("data-name"), root);
-    });
+    };
+    root.addEventListener("click", connUI.onClick);
 
     // 认证方式一改，头名输入框跟着开/关。留着一个「能填但没人读」的框，
     // 就是让人把令牌贴进去——后果见 connector_service.validate_auth 里的注释。
-    root.addEventListener("change", function (event) {
+    connUI.onChange = function (event) {
       var target = event.target;
       if (!target || !target.id) return;
       var pair = { "new-auth": "new-header", "conn-auth": "conn-header" }[target.id];
@@ -5327,7 +5340,8 @@
       var usesHeader = target.value === "header";
       field.disabled = !usesHeader;
       if (!usesHeader) field.value = "";
-    });
+    };
+    root.addEventListener("change", connUI.onChange);
 
     await loadConnectors(root);
   }

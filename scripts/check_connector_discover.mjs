@@ -419,6 +419,32 @@ check(
 window.document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape" }));
 await wait();
 
+// 一次点击只该开一层、点一次就该关干净。
+//
+// `mountConnectors` 把事件委托挂在常驻的 `#view` 上，而 `render()` 只清
+// `innerHTML`、元素本身不换——于是每进一次连接器页就多挂一份监听器。
+// 挂了几份，点一下「发现工具」就叠几层遮罩；关窗时点掉最上面那层，下面
+// 那层还在，用户看到的就是「这个窗口要点好几次才关得掉」。
+// 这里模拟两次进出，再点一次。
+window.location.hash = "#/tools";
+await wait(120);
+window.location.hash = "#/connectors";
+await wait(150);
+
+$('[data-act="discover"]').click();
+await wait(90);
+const stacked = $$(".modal-mask").length;
+check("一次点击只开一层弹窗", stacked === 1, `叠了 ${stacked} 层遮罩`);
+
+const anyClose = $(".modal-mask .modal-close");
+if (anyClose) anyClose.click();
+await wait();
+check(
+  "点一次关闭就关干净",
+  $$(".modal-mask").length === 0,
+  `还剩 ${$$(".modal-mask").length} 层没关`
+);
+
 if (failures) {
   console.error(`\n${failures} 条断言失败。`);
   process.exit(1);
