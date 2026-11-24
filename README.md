@@ -9,6 +9,7 @@
 设计口径与暂不做的部分见 [`docs/AGENTS.md`](docs/AGENTS.md)。
 
 本仓库对应《Personal Agent Platform：第 1～11 批实施方案》的落地实现。
+项目定位、六条不变量、已经能做什么与**明确不做什么**：[`ABOUT.md`](ABOUT.md)。
 
 ## 快速开始
 
