@@ -376,29 +376,60 @@ async def _load_turns(
 
     turns: list[Turn] = []
     current_user: Message | None = None
-    assistant_text = ""
+    # 本轮每条助手消息：(审批号, 正文, 是否已由结论收口)。
+    parts: list[tuple[str, str, bool]] = []
     assistant_count = 0
     last: Message | None = None
 
+    def _fold_text() -> tuple[str, int]:
+        """把本轮助手消息折成一段话，返回（正文，留下的条数）。
+
+        坑在审批上：发起审批时落一条「待确认……该操作尚未执行」的卡体，
+        点完确认后又落一条结论（「已导入 58 片」），两条都是助手消息，
+        原样拼进同一轮会得到自相矛盾的历史。模型看到「待确认」与「已完成」
+        并存，随后就会照这个样式声称执行过。
+
+        判据用 metadata，不用正文：同一条 `approval_id` 且有
+        `approval_action` 的那条才是结论，它之前的卡体一律丢掉。
+        只剩卡体（还没点，或取消了）时保留——那确实就是当前状态。
+        """
+        last_index = {
+            approval_id: index
+            for index, (approval_id, _text, _settled) in enumerate(parts)
+            if approval_id
+        }
+        kept = [
+            text
+            for index, (approval_id, text, settled) in enumerate(parts)
+            if not (approval_id and not settled and index < last_index[approval_id])
+        ]
+        return ("\n".join(item for item in kept if item.strip()).strip(), len(kept))
+
     def flush() -> None:
-        nonlocal current_user, assistant_text, assistant_count
-        if current_user is None or last is None or not assistant_text.strip():
+        nonlocal current_user, parts, assistant_count
+        if current_user is None or last is None:
             current_user = None
-            assistant_text = ""
+            parts = []
+            assistant_count = 0
+            return
+        assistant_text, kept_assistant = _fold_text()
+        if not assistant_text:
+            current_user = None
+            parts = []
             assistant_count = 0
             return
         turns.append(
             Turn(
                 user_text=str(current_user.content or "").strip(),
-                assistant_text=assistant_text.strip(),
+                assistant_text=assistant_text,
                 user_at=current_user.created_at,
                 last_message_id=last.id,
                 last_message_at=last.created_at,
-                messages=1 + assistant_count,
+                messages=1 + kept_assistant,
             )
         )
         current_user = None
-        assistant_text = ""
+        parts = []
         assistant_count = 0
 
     for row in rows:
@@ -407,12 +438,17 @@ async def _load_turns(
         if row.role == MessageRole.USER:
             flush()
             current_user = row
-            assistant_text = ""
+            parts = []
             assistant_count = 0
             last = row
         elif row.role == MessageRole.ASSISTANT and current_user is not None:
-            assistant_text = (
-                f"{assistant_text}\n{row.content}" if assistant_text else str(row.content)
+            meta = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+            parts.append(
+                (
+                    str(meta.get("approval_id") or ""),
+                    str(row.content or ""),
+                    bool(meta.get("approval_action")),
+                )
             )
             assistant_count += 1
             last = row
