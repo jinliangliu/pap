@@ -71,6 +71,19 @@ from app.models.rbac import (
     UserRole,
 )
 from app.models.skill import Skill, SkillHit
+from app.models.task import (
+    TERMINAL_TASK_STATUSES,
+    ExecutionState,
+    ExecutionStatus,
+    ExecutionTrace,
+    Schedule,
+    Task,
+    TaskExecution,
+    TaskKind,
+    TaskStatus,
+    Workspace,
+    WorkspaceStatus,
+)
 from app.models.tenant import (
     Tenant,
     TenantQuota,
@@ -152,4 +165,15 @@ __all__ = [
     "WorkflowRunStatus",
     "OPEN_RUN_STATUSES",
     "WriteBackup",
+    "Workspace",
+    "WorkspaceStatus",
+    "Task",
+    "TaskKind",
+    "TaskStatus",
+    "TERMINAL_TASK_STATUSES",
+    "Schedule",
+    "TaskExecution",
+    "ExecutionStatus",
+    "ExecutionTrace",
+    "ExecutionState",
 ]

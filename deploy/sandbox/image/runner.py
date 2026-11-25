@@ -47,6 +47,26 @@ def _limits(cpu_seconds: int, pids: int, nofile: int) -> None:  # pragma: no cov
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
+def _child_cpu_ms() -> int | None:
+    """已退出的直接子进程累计 CPU 时间（毫秒）；不可用时返回 None。"""
+    try:
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return int((usage.ru_utime + usage.ru_stime) * 1000)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _cpu_ms_since(before: int | None) -> int | None:
+    """ CPU 时间差。before 或当前值拿不到就返回 None，不用 0 冒充。"""
+    if before is None:
+        return None
+    now = _child_cpu_ms()
+    if now is None or now < before:
+        # 跨进程复用 / 计数器回退：宁可报「没测到」也不报一个负数或假值。
+        return None
+    return now - before
+
+
 def _run(payload: dict) -> dict:
     language = str(payload.get("language") or "")
     command = LANGUAGES.get(language)
@@ -58,6 +78,7 @@ def _run(payload: dict) -> dict:
             "stdout": "",
             "stderr": f"不支持的语言：{language}",
             "duration_ms": 0,
+            "cpu_ms": None,
         }
 
     timeout_seconds = int(payload.get("timeout_seconds") or 30)
@@ -71,6 +92,12 @@ def _run(payload: dict) -> dict:
         handle.write(code)
 
     started = time.monotonic()
+    # CPU 时间取「代码子进程」的 user+sys 差值，不读 cgroup 路径：
+    # cgroup v1/v2、systemd driver、云宿主的路径都不同，硬编码必错；
+    # 而 getrusage(RUSAGE_CHILDREN) 在容器内稳定可得，语义也更准——
+    # 只算这段代码真正消耗的 CPU，不含 runner 自身与容器启动开销。
+    # 拿不到（平台实现差异）时留 None，绝不填 0：0 表示「测到了且没消耗」。
+    cpu_before = _child_cpu_ms()
 
     try:
         completed = subprocess.run(  # noqa: S603
@@ -97,6 +124,7 @@ def _run(payload: dict) -> dict:
             "stdout": "",
             "stderr": f"执行超过 {timeout_seconds} 秒，已被终止。",
             "duration_ms": int((time.monotonic() - started) * 1000),
+            "cpu_ms": _cpu_ms_since(cpu_before),
         }
 
     return {
@@ -105,6 +133,7 @@ def _run(payload: dict) -> dict:
         "stdout": (completed.stdout or "")[:MAX_OUTPUT_CHARS],
         "stderr": (completed.stderr or "")[:MAX_OUTPUT_CHARS],
         "duration_ms": int((time.monotonic() - started) * 1000),
+        "cpu_ms": _cpu_ms_since(cpu_before),
     }
 
 

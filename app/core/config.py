@@ -190,6 +190,31 @@ class Settings(BaseSettings):
     artifact_storage_dir: str = "./data/artifacts"
     artifact_max_bytes: int = 10 * 1024 * 1024
 
+    # ---------------- 事务工作区（单机版） ----------------
+    # 一人一块持久目录：workspaces/<tenant>/<user>/<workspace_id>/。
+    # 与对象存储分开：工作区会被执行代码读写，对象存储只放不可变产物。
+    workspace_storage_dir: str = "./data/workspaces"
+    # 未单独配置时的默认硬上限；0 表示不限制（不推荐，快照会放大占用）。
+    workspace_default_max_bytes: int = 512 * 1024 * 1024
+    # 快照保留：最近 N 次 + 每个半小时桶内最早一次；桶上限 48（24 小时）。
+    snapshot_keep_recent: int = 3
+    snapshot_bucket_minutes: int = 30
+    snapshot_max_buckets: int = 48
+    # 在途任务超过此时长没有心跳即标记 unknown，不自动重发。
+    task_stale_after_seconds: int = 3600
+    # 任务产物走 stdout 回传：base64 后可达 artifact_max_bytes 的 4/3，
+    # 与对话输出上限（8000）分开配。沙箱服务端也要同步调大输出上限。
+    task_artifact_max_chars: int = 14 * 1024 * 1024
+    task_document_max_chars: int = 200_000
+    # 比这更短的「docx」只可能是截断或伪造的 PK 头。
+    task_artifact_min_bytes: int = 512
+    task_execution_timeout_seconds: int = 120
+    # 编程事务：内容随请求走（不挂宿主目录）。单文件/总输入的字符上限，
+    # 以及沙箱内测试命令的独立超时（含在 task_execution_timeout_seconds 内）。
+    task_code_file_max_chars: int = 100_000
+    task_code_files_max: int = 64
+    task_code_test_timeout_seconds: int = 30
+
     # ---------------- 知识库 ----------------
     # 目录扫描源：运维放进去的文件，``sync`` 会把它当作「该租户的全集」，
     # 目录里没有的 file 类文档视为已删除。
@@ -588,6 +613,28 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "SANDBOX_ALLOWED_LANGUAGES 不能为空；留空会让平台无法拒绝任何语言。"
                 )
+
+        if self.snapshot_keep_recent < 1:
+            raise ValueError("SNAPSHOT_KEEP_RECENT 至少为 1；否则任务前快照会被立刻删掉。")
+        if self.snapshot_bucket_minutes < 1:
+            raise ValueError("SNAPSHOT_BUCKET_MINUTES 必须大于 0。")
+        if self.snapshot_max_buckets < 1:
+            raise ValueError("SNAPSHOT_MAX_BUCKETS 至少为 1。")
+        if self.task_stale_after_seconds < 1:
+            raise ValueError("TASK_STALE_AFTER_SECONDS 必须大于 0。")
+        # 产物上限必须能装下最大附件的 base64（4/3），否则「配置合法」但
+        # 每次大产物都因截断失败——这种错要在启动时说，不在运行时猜。
+        if self.task_artifact_max_chars < self.artifact_max_bytes * 4 // 3:
+            raise ValueError(
+                "TASK_ARTIFACT_MAX_CHARS 必须至少为 ARTIFACT_MAX_BYTES 的 4/3，"
+                "否则产物回传会被截断。"
+            )
+        if self.task_execution_timeout_seconds < 1:
+            raise ValueError("TASK_EXECUTION_TIMEOUT_SECONDS 必须大于 0。")
+        if self.task_code_file_max_chars < 1 or self.task_code_files_max < 1:
+            raise ValueError("编程事务的单文件字符数与文件数上限都必须大于 0。")
+        if self.task_code_test_timeout_seconds < 1:
+            raise ValueError("TASK_CODE_TEST_TIMEOUT_SECONDS 必须大于 0。")
 
         return self
 

@@ -58,6 +58,11 @@ CONVERSATION_HEADER = "X-Sandbox-Conversation"
 # 回头再问平台一次——那会让一次执行的中途依赖两次读取，而两次之间
 # 管理员可能已经按了开关。
 POLICY_REVISION_HEADER = "X-Policy-Revision"
+# 任务归属：事务执行器把 task_id / snapshot_id 交给沙箱写进执行记录，
+# 让「哪次执行属于哪个任务、用的是哪份快照」只有一个写入方（沙箱）。
+# 一次性代码执行不带这两个头，落库时对应列为 NULL。
+TASK_HEADER = "X-Sandbox-Task"
+SNAPSHOT_HEADER = "X-Sandbox-Snapshot"
 
 # 错误文本上限：服务端可能返回整页 HTML，不能原样塞进日志或用户回答。
 MAX_ERROR_CHARS = 240
@@ -87,6 +92,9 @@ class SandboxResult:
     stdout: str
     stderr: str
     duration_ms: int | None = None
+    # 代码子进程消耗的 CPU 毫秒。None = 沙箱没回报（老版本或采集失败），
+    # 0 = 测到了且确实没消耗——两者计量语义不同，不能合并。
+    cpu_ms: int | None = None
     truncated: bool = False
     # runsc / process：让审计与排障能看出这次执行用的是哪种隔离后端。
     backend: str = "unknown"
@@ -152,6 +160,8 @@ class SandboxClient:
         user_id: str | None = None,
         conversation_id: str | None = None,
         policy_revision: int | None = None,
+        task_id: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict[str, str]:
         headers = {"Accept": "application/json"}
 
@@ -177,6 +187,12 @@ class SandboxClient:
         if policy_revision is not None:
             headers[POLICY_REVISION_HEADER] = str(policy_revision)
 
+        if task_id:
+            headers[TASK_HEADER] = task_id
+
+        if snapshot_id:
+            headers[SNAPSHOT_HEADER] = snapshot_id
+
         return headers
 
     async def execute(
@@ -192,6 +208,8 @@ class SandboxClient:
         conversation_id: str | None = None,
         policy_revision: int | None = None,
         policy: dict[str, Any] | None = None,
+        task_id: str | None = None,
+        snapshot_id: str | None = None,
     ) -> SandboxResult:
         deadline = time.monotonic() + self._timeout
 
@@ -218,6 +236,8 @@ class SandboxClient:
             user_id,
             conversation_id,
             policy_revision,
+            task_id,
+            snapshot_id,
         )
 
         if data.get("status") not in TERMINAL_STATUSES:
@@ -244,6 +264,8 @@ class SandboxClient:
         user_id: str | None = None,
         conversation_id: str | None = None,
         policy_revision: int | None = None,
+        task_id: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict[str, Any]:
         try:
             response = await self._client.post(
@@ -255,6 +277,8 @@ class SandboxClient:
                     user_id,
                     conversation_id,
                     policy_revision,
+                    task_id,
+                    snapshot_id,
                 ),
             )
         except httpx.TimeoutException as exc:
@@ -352,6 +376,7 @@ class SandboxClient:
             stdout=stdout,
             stderr=stderr,
             duration_ms=_as_int(data.get("duration_ms")),
+            cpu_ms=_as_int(data.get("cpu_ms")),
             truncated=stdout_cut or stderr_cut,
             backend=str(data.get("backend") or "unknown"),
             policy_revision=_as_int(data.get("policy_revision")),

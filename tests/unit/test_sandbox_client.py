@@ -203,3 +203,32 @@ async def test_get_execution_missing_record_is_rejected():
 
     with pytest.raises(SandboxRejected, match="记录已过期"):
         await _build(handler).get_execution("exec-gone")
+
+
+@pytest.mark.parametrize(
+    ("reported", "expected"),
+    [
+        (38, 38),   # 测到了，消耗 38ms
+        (0, 0),     # 测到了，确实没消耗 CPU——与 None 不能混
+        (None, None),
+        ("not-a-number", None),  # 字段类型不对时按「没测到」处理
+    ],
+)
+async def test_cpu_ms_preserves_missing_vs_zero(reported, expected):
+    """cpu_ms 的 null 与 0 是两种计量事实，解析时不能合并。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = {
+            "execution_id": "exec-cpu",
+            "status": "succeeded",
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 5,
+        }
+        if reported is not None or request.method == "POST":
+            payload["cpu_ms"] = reported
+        return httpx.Response(200, json=payload)
+
+    result = await _build(handler).execute(code="pass", language="python")
+
+    assert result.cpu_ms == expected

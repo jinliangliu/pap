@@ -26,6 +26,11 @@ Firecracker Worker Pool）不在当前实现范围内。
 |---|---|
 | 读取平台密钥 / 业务代码 | 容器**不挂载任何宿主路径**；代码经 stdin 传入；根文件系统 `--read-only` |
 | 跨租户读取残留数据 | 每个执行一个容器，`--rm` 销毁；工作区是 tmpfs，不落盘 |
+
+> **编程事务不例外**：DOCUMENT 与 CODE 两类事务任务同样零宿主挂载。CODE 的代码
+> 基线/改动走 stdin，在 tmpfs 里出 diff；平台侧那个持久工作区只留档输入与打快照，
+> 从不挂进容器。未来若引入 `docs/TRANSACTION.md` §7 的本地依赖目录（wheel /
+> bare mirror），那是单独一次安全边界改动，须重新评审并单列测试，不在此默认放行。
 | 跨租户读取执行记录 | 记录按 `X-Sandbox-Tenant` 归属，跨租户回读一律 **404**（不是 403，避免泄露 ID 是否存在） |
 | 数据外带 / 下载二阶段载荷 | `--network none`，容器内没有网络接口 |
 | 提权 | gVisor 用户态内核 + `--cap-drop ALL` + `no-new-privileges` + 非 root（65534） |
@@ -57,6 +62,9 @@ Firecracker Worker Pool）不在当前实现范围内。
 POST /v1/execute
 Authorization: Bearer <SANDBOX_API_KEY>
 X-Sandbox-Tenant: <tenant_id>
+X-Sandbox-User: <user_id>            # 可选，执行记录按人归属
+X-Sandbox-Task: <task_uuid>          # 可选，仅事务执行器带
+X-Sandbox-Snapshot: <snapshot_id>    # 可选，任务前快照
 X-Policy-Revision: 7
 Idempotency-Key: approval:<thread_id>:<run_id>
 Content-Type: application/json
@@ -77,11 +85,24 @@ Content-Type: application/json
 
 ```json
 {"execution_id": "e-1", "status": "succeeded", "exit_code": 0,
- "stdout": "5050\n", "stderr": "", "duration_ms": 412,
+ "stdout": "5050\n", "stderr": "", "duration_ms": 412, "cpu_ms": 38,
  "truncated": false, "backend": "runsc", "policy_revision": 7}
 ```
 
 `status`：`succeeded` / `failed` / `timeout` / `cancelled`。
+
+`cpu_ms` 是代码子进程消耗的 CPU 毫秒（runner 用 `getrusage(RUSAGE_CHILDREN)`
+取差值，不依赖 cgroup v1/v2 的路径差异）。**`null` 表示没测到，`0` 表示测到了
+且没消耗**——计量上不能混。老服务端不返回这个字段时按 `null` 处理。
+
+**事务产物走 stdout**：`PAP_ARTIFACT:<base64>` 一行，由平台侧生成固定代码
+（python-docx）产出，用户 Markdown 只走 `stdin`（JSON），不进代码。
+服务端 `PAP_SANDBOX_MAX_OUTPUT_CHARS` 默认 14MB 以容纳 base64；对话侧仍由
+平台 `SandboxClient` 截到 8000 字符，不受影响。截断时任务失败，不落半份产物。
+
+`X-Sandbox-Task` / `X-Sandbox-Snapshot` 只在事务执行器发起时带，写进
+`task_executions` 供回读；一次性代码执行不带，这两列为 NULL（迁移
+`d4a7c9e13b62` 放开了 `task_id` 的 NOT NULL 约束）。
 
 **`policy` 是自包含的一份。** 沙箱不该在执行中途回头问平台「现在是什么
 策略」——那次读取与这次提交之间，管理员可能刚按了开关，而代码已经按旧
@@ -137,16 +158,23 @@ Content-Type: application/json
 # 1) 安装 gVisor 并注册 docker 运行时（需重建 docker daemon 配置）
 sudo GVISOR_VERSION=release-20261026.0 bash deploy/sandbox/install-runsc.sh
 
-# 2) 构建运行时镜像（只含解释器、执行入口与删除护栏）
-#    从旧 tag 升上来时加 PAP_BUILD_PULL=0，避免基底 python:3.12-slim 顺带换代
-PAP_BUILD_PULL=0 bash deploy/sandbox/build-image.sh pap-sandbox-runtime:4
+# 2) 构建运行时镜像（解释器、执行入口、删除护栏、python-docx）
+#    从旧 tag 升上来时加 PAP_BUILD_PULL=0，避免基底 python:3.12-slim 顺带换代。
+#    加了 python-docx 后必须打新 tag（如 :5）并同步改下面第 4 步的 IMAGE；
+#    沿用旧 tag 会让事务任务的 docx 生成因缺包失败。
+# 国内机器若卡在 files.pythonhosted.org 读超时，用可达的 PyPI 镜像：
+# PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple/ \
+#   PAP_BUILD_PULL=0 bash deploy/sandbox/build-image.sh pap-sandbox-runtime:5
+PAP_BUILD_PULL=0 bash deploy/sandbox/build-image.sh pap-sandbox-runtime:5
 
 # 3) 独立用户 + 独立虚拟环境 + docker 组
 useradd --system --home /opt/pap-sandbox --shell /usr/sbin/nologin sandbox || true
 usermod -aG docker sandbox
 mkdir -p /opt/pap-sandbox
 python3 -m venv /opt/pap-sandbox/.venv
-/opt/pap-sandbox/.venv/bin/pip install -q fastapi uvicorn
+# psycopg / psycopg_pool 只在启用执行记录直写 PG 时必需；
+# 不装也能跑（回落内存记录），但进程重启后回读会 404。
+/opt/pap-sandbox/.venv/bin/pip install -q fastapi uvicorn 'psycopg[binary]' psycopg_pool
 chown -R sandbox:sandbox /opt/pap-sandbox
 
 # 4) 运行时配置（不要写进 systemd 单元，避免密钥进 git）
@@ -154,11 +182,25 @@ install -m 0600 -o root -g sandbox /dev/null /etc/pap-sandbox.env
 cat >/etc/pap-sandbox.env <<'EOF'
 PAP_SANDBOX_BACKEND=runsc
 # 与 build-image.sh 打出的 tag 保持一致；换镜像就是改这一行 + 重启服务
-PAP_SANDBOX_IMAGE=pap-sandbox-runtime:4
+PAP_SANDBOX_IMAGE=pap-sandbox-runtime:5
 PAP_SANDBOX_API_KEY=<至少 32 位随机串>
 PAP_SANDBOX_MAX_CONCURRENT=4
 PAP_SANDBOX_MAX_PER_TENANT=2
+# 执行记录直写 PG（强烈建议配置）。留空时记录只在内存，进程重启后
+# 审批回读会 404 → 永久停在 EXECUTED。用**普通业务角色**，不要用
+# 超级用户或带 BYPASSRLS 的角色——沙箱写入也要受 RLS 约束。
+# 库表由主仓迁移 b9d4f2a71c60 创建；只需该角色对五张新表有
+# SELECT/INSERT/UPDATE 权限。systemd 已允许访问 localhost，无需额外放开网络。
+PAP_SANDBOX_DATABASE_URL=postgresql://pap_sandbox:<专用角色口令>@127.0.0.1:5432/personal_agent
 EOF
+
+**直写 PG 的安全代价（选择它就要接受）：** 沙箱启动器持有一份业务库凭据，
+一旦启动器被攻破，该凭据能读它能连到的所有租户表。缓解手段有三条，缺一不可：
+① 专用角色、**不是**超级用户、**没有** BYPASSRLS（否则 RLS 这道防线直接失效）；
+② 只授予五张新表的 SELECT/INSERT/UPDATE，不碰 knowledge / conversations / connectors；
+③ 凭据只放 `/etc/pap-sandbox.env`（0600 root:sandbox），不进 systemd 单元、不进 git。
+如果这套代价不能接受，回退路径是清空 DSN——记录退回内存，但仍满足「代码不落宿主」。
+
 
 # 5) 装单元 + 铺源码（deploy/install.sh 的沙箱块，可重复执行）
 PAP_INSTALL_SANDBOX=1 bash deploy/install.sh

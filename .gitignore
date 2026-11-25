@@ -46,3 +46,6 @@ deploy/connector/
 # OCR 转出来的源料（PaddleOCR 产物）：可由 PDF 重新生成，不进版本库。
 # 要不要入库是知识库那边的事，与仓库无关。
 docs/*_by_PaddleOCR-VL-*.md
+
+# 脱敏映射表含真实地址与账号，只在本机
+scripts/_identifiers.local.py

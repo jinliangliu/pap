@@ -13,6 +13,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     DateTime,
     Enum,
     ForeignKey,
@@ -99,6 +100,27 @@ class TenantQuota(TenantScoped, Base):
     )
     knowledge_max_documents: Mapped[int] = mapped_column(
         Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+
+    # 事务层配额。0 = 沿用平台默认；按人核算，共享池只在沙箱侧兜底。
+    # 并发任务数防止一个人占满单机；CPU 秒与磁盘决定成本口径。
+    max_concurrent_tasks: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    daily_cpu_seconds: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    workspace_max_bytes: Mapped[int] = mapped_column(
+        BigInteger,
         nullable=False,
         default=0,
         server_default="0",

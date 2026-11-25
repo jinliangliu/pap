@@ -200,6 +200,7 @@ def _to_payload(language: str, result: SandboxResult) -> dict[str, Any]:
         "stdout": result.stdout,
         "stderr": result.stderr,
         "duration_ms": result.duration_ms,
+        "cpu_ms": result.cpu_ms,
         "truncated": result.truncated,
         "backend": result.backend,
     }

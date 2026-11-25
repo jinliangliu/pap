@@ -67,7 +67,7 @@ from app.schemas.model_provider import (
     ProviderResponse,
     ProviderUpdate,
 )
-from app.services import connector_service, runtime_settings
+from app.services import runtime_settings
 from app.services.audit_service import write_admin_action
 from app.services.mcp_tool_service import (
     McpToolNameError,
@@ -424,6 +424,25 @@ async def remove_member(
                 )
 
 
+@router.get("/tenants/{tenant_id}/quota", response_model=QuotaResponse)
+async def get_quota(
+    tenant_id: str,
+    identity: Identity = Depends(require_platform_admin),
+) -> QuotaResponse:
+    """读取某租户配额供管理页回显。
+
+    `require_platform_admin` 是硬闸：普通租户既拿不到路由，也看不到别人租户的
+    配额；`platform_admin_tenant_scope` 再限定本次读的目标租户，避免带着平台
+    租户的上下文去查 RLS 表得到空集。
+    """
+    with platform_admin_tenant_scope(tenant_id):
+        async with async_session_factory() as session:
+            quota = await get_tenant_service().get_quota(
+                session, tenant_id=tenant_id
+            )
+    return QuotaResponse(**quota)
+
+
 @router.put("/tenants/{tenant_id}/quota", response_model=QuotaResponse)
 async def set_quota(
     tenant_id: str,
@@ -439,6 +458,9 @@ async def set_quota(
                     daily_chat_requests=payload.daily_chat_requests,
                     tool_calls_per_minute=payload.tool_calls_per_minute,
                     knowledge_max_documents=payload.knowledge_max_documents,
+                    max_concurrent_tasks=payload.max_concurrent_tasks,
+                    daily_cpu_seconds=payload.daily_cpu_seconds,
+                    workspace_max_bytes=payload.workspace_max_bytes,
                 )
 
                 await _audit(
@@ -451,6 +473,10 @@ async def set_quota(
                     metadata={
                         "daily_chat_requests": payload.daily_chat_requests,
                         "tool_calls_per_minute": payload.tool_calls_per_minute,
+                        "knowledge_max_documents": payload.knowledge_max_documents,
+                        "max_concurrent_tasks": payload.max_concurrent_tasks,
+                        "daily_cpu_seconds": payload.daily_cpu_seconds,
+                        "workspace_max_bytes": payload.workspace_max_bytes,
                     },
                 )
 
@@ -459,6 +485,9 @@ async def set_quota(
         daily_chat_requests=quota.daily_chat_requests,
         tool_calls_per_minute=quota.tool_calls_per_minute,
         knowledge_max_documents=quota.knowledge_max_documents,
+        max_concurrent_tasks=quota.max_concurrent_tasks,
+        daily_cpu_seconds=quota.daily_cpu_seconds,
+        workspace_max_bytes=quota.workspace_max_bytes,
     )
 
 

@@ -29,6 +29,9 @@ from app.services.execution_recovery_service import (
 from app.services.expiry_service import expire_pending_approvals
 from app.services.obs_sweep import sweep_orphaned_runs
 from app.services.run_service import reconcile_waiting_runs
+from app.services.schedule_service import fire_due_schedules
+from app.services.task_runner_service import dispatch_queued_tasks
+from app.services.task_service import mark_stale_tasks_unknown
 from app.tenancy.context import system_tenant_scope, tenant_scope
 
 logger = logging.getLogger(__name__)
@@ -57,6 +60,9 @@ async def _run_sweeps() -> None:
     purged = 0
     swept = 0
     reconciled = 0
+    tasks_unknown = 0
+    tasks_run = 0
+    schedules_fired = 0
 
     try:
         with system_tenant_scope():
@@ -70,6 +76,17 @@ async def _run_sweeps() -> None:
                 swept += await sweep_orphaned_runs()
                 # 排在过期之后：本轮的过期单先落终态，对账这一遍就能顺带收口。
                 reconciled += await reconcile_waiting_runs()
+                # 事务任务：在途超时的标 unknown，不自动重发。
+                tasks_unknown += await mark_stale_tasks_unknown()
+                # 执行 queued 任务。排在 unknown 之后：上一轮的超时单已收口，
+                # 本轮只认领真正待跑的，避免把 unknown 当 queued 重发。
+                tasks_run += await dispatch_queued_tasks(tenant_id=tenant_id)
+
+        # 定时触发：传入本轮已算出的活跃租户列表（避免重复查询）。服务内部
+        # 逐租户读 due 行（RLS 要求），再逐条构造独立租户 Context 入队。
+        # 必须在逐租户循环之外——此时上下文已回到 None，而 system scope
+        # 不允许从具体租户进入（会抛 TenantIsolationError）。
+        schedules_fired = await fire_due_schedules(tenant_ids=tenants)
     except Exception:
         logger.exception(
             "维护任务执行失败。",
@@ -77,7 +94,16 @@ async def _run_sweeps() -> None:
         )
         return
 
-    if expired or recovered or purged or swept or reconciled:
+    if (
+        expired
+        or recovered
+        or purged
+        or swept
+        or reconciled
+        or tasks_unknown
+        or tasks_run
+        or schedules_fired
+    ):
         logger.info(
             "维护任务完成。",
             extra={
@@ -87,6 +113,9 @@ async def _run_sweeps() -> None:
                 "credentials_purged": purged,
                 "obs_orphans": swept,
                 "runs_reconciled": reconciled,
+                "tasks_unknown": tasks_unknown,
+                "tasks_run": tasks_run,
+                "schedules_fired": schedules_fired,
             },
         )
 

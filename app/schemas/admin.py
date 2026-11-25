@@ -53,12 +53,22 @@ class QuotaRequest(APIModel):
     tool_calls_per_minute: int = Field(ge=0, le=1_000_000)
     knowledge_max_documents: int = Field(default=0, ge=0, le=1_000_000)
 
+    # 沙箱事务配额。只走 /api/v1/admin/*，接口层已由 require_platform_admin
+    # 拦住普通租户；0 = 沿用平台默认。三项都是「每人」口径，不是租户总量。
+    max_concurrent_tasks: int = Field(default=0, ge=0, le=1000)
+    daily_cpu_seconds: int = Field(default=0, ge=0, le=10_000_000)
+    # 用字节对齐库里的列，避免「页面填 MB、库里存 MB」的两套单位。
+    workspace_max_bytes: int = Field(default=0, ge=0, le=1024**4)
+
 
 class QuotaResponse(APIModel):
     tenant_id: str
     daily_chat_requests: int
     tool_calls_per_minute: int
     knowledge_max_documents: int
+    max_concurrent_tasks: int
+    daily_cpu_seconds: int
+    workspace_max_bytes: int
 
 
 class ToolPolicyRequest(APIModel):

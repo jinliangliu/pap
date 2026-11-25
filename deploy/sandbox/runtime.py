@@ -73,6 +73,8 @@ class Outcome:
     stderr: str
     duration_ms: int
     backend: str
+    # 代码子进程消耗的 CPU 毫秒；None = 沙箱没测到，不是 0。
+    cpu_ms: int | None = None
 
 
 def validate_tenant(raw: str | None) -> str:
@@ -325,6 +327,8 @@ async def run_container(
             stderr=f"执行超过 {timeout_seconds} 秒，容器已被销毁。",
             duration_ms=int((time.monotonic() - started) * 1000),
             backend="runsc",
+            # 容器已被销毁，拿不到 runner 的 CPU 读数；留空不猜。
+            cpu_ms=None,
         )
 
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -347,6 +351,7 @@ async def run_container(
         stderr=str(parsed.get("stderr") or ""),
         duration_ms=_as_int(parsed.get("duration_ms")) or duration_ms,
         backend="runsc",
+        cpu_ms=_as_int(parsed.get("cpu_ms")),
     )
 
 

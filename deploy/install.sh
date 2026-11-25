@@ -86,7 +86,8 @@ if [ "${PAP_INSTALL_SANDBOX:-1}" = "1" ]; then
 
     # 工作区文件可能因 core.autocrlf 带着 CRLF；Python 虽能容忍，但会让
     # 版本比对（md5）与实际内容对不上，这里统一去掉行尾 CR。
-    for f in server.py runtime.py; do
+    # records.py：执行记录直写 PG 的独立 SQL 层；缺它时配了 DSN 会启动失败。
+    for f in server.py runtime.py records.py; do
       sed 's/\r$//' "$APP_DIR/deploy/sandbox/$f" > "$SBX_DIR/$f.tmp"
       install -o sandbox -g sandbox -m 0644 "$SBX_DIR/$f.tmp" "$SBX_DIR/$f"
       rm -f "$SBX_DIR/$f.tmp"

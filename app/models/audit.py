@@ -94,6 +94,19 @@ class AuditEventType(str, enum.Enum):
     WORKFLOW_STATUS_CHANGED = "workflow_status_changed"
     WORKFLOW_DELETED = "workflow_deleted"
 
+    # 事务层：工作区与快照是持久状态，创建/归档/删除必须能事后追溯；
+    # 任务状态迁移由 execution_traces 记录，这里只记治理级动作（谁发起、谁取消）。
+    WORKSPACE_CREATED = "workspace_created"
+    WORKSPACE_ARCHIVED = "workspace_archived"
+    WORKSPACE_DELETED = "workspace_deleted"
+    SNAPSHOT_CREATED = "snapshot_created"
+    SNAPSHOT_DELETED = "snapshot_deleted"
+    TASK_CREATED = "task_created"
+    TASK_SUCCEEDED = "task_succeeded"
+    TASK_FAILED = "task_failed"
+    TASK_CANCELLED = "task_cancelled"
+    TASK_UNKNOWN = "task_unknown"
+
     ADMIN_ACTION = "admin_action"
     SECURITY_EVENT = "security_event"
 

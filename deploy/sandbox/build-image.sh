@@ -23,6 +23,15 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 PULL="--pull"
 [ "${PAP_BUILD_PULL:-1}" = "0" ] && PULL=""
 
+# 国内机器上默认 PyPI 源会读超时。传 PIP_INDEX_URL 改用可达镜像，例如：
+#   PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple/ bash deploy/sandbox/build-image.sh pap-sandbox-runtime:5
+# 不传时维持 pip 默认行为，开发机不受影响。空串不能传进构建：pip 会把
+# 「显式的空 index URL」当成配置错误，而不是「没配置」。
+BUILD_ARGS=()
+if [ -n "${PIP_INDEX_URL:-}" ]; then
+  BUILD_ARGS+=(--build-arg "PIP_INDEX_URL=$PIP_INDEX_URL")
+fi
+
 CONTEXT="$(mktemp -d)"
 trap 'rm -rf "$CONTEXT"' EXIT
 
@@ -30,7 +39,7 @@ cp "$HERE/image/Dockerfile" "$HERE/image/runner.py" \
    "$HERE/image/sitecustomize.py" "$CONTEXT/"
 cp "$ROOT/app/sandbox_guard/safe_delete.py" "$CONTEXT/"
 
-docker build $PULL -t "$TAG" "$CONTEXT"
+docker build $PULL "${BUILD_ARGS[@]}" -t "$TAG" "$CONTEXT"
 
 echo
 echo "已构建：$TAG"

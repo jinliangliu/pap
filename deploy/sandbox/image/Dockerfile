@@ -17,6 +17,17 @@ RUN node --version && python3 --version
 COPY runner.py /opt/pap/runner.py
 RUN chmod 0555 /opt/pap/runner.py
 
+# 事务任务的文档排版：只装 python-docx，不引 LibreOffice（字体与本身体积
+# 会把镜像推到 GB 级）。wheel 在构建期联网装，运行时沙箱仍然 --network none。
+#
+# PIP_INDEX_URL 由 build-image.sh 以 --build-arg 传入（ARG 在 RUN 期间就是
+# 环境变量，pip 原生认它）。国内机器上 files.pythonhosted.org 会读超时，
+# 不给定源时构建会在这一步挂住；超时与重试次数同时放宽，避免偶发抖动
+# 又要重跑整条镜像链。
+ARG PIP_INDEX_URL
+RUN pip install --no-cache-dir --only-binary=:all: --retries 5 --timeout 60 \
+      "python-docx>=1.1,<2"
+
 # 删除护栏：`sitecustomize` 由解释器在启动时自动导入，比用户代码早，
 # 于是模型写的 `os.remove(...)` 拿到的是已经换成「进回收站」的版本，
 # 它不需要知道这层存在。实现来自 app/sandbox_guard/safe_delete.py，

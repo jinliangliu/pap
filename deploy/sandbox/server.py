@@ -47,6 +47,16 @@ except ImportError:  # uvicorn server:app 在 /opt/pap-sandbox 下直接运行
         Outcome,
     )
 
+# 执行记录直写 PG 是可选后端：沙箱独立 venv 可能还没装 psycopg。
+# 导入失败只在「明确配了 DSN」时才是错误（见 _build_store），没配就回落内存。
+try:
+    try:
+        from . import records as records_module
+    except ImportError:
+        import records as records_module  # type: ignore[no-redef]
+except ImportError:  # pragma: no cover - 取决于部署机的 venv
+    records_module = None  # type: ignore[assignment]
+
 logger = logging.getLogger("pap.sandbox")
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
@@ -93,9 +103,14 @@ class SandboxSettings:
     execution_ttl_seconds: int = _env_int("PAP_SANDBOX_EXECUTION_TTL_SECONDS", 600)
     idempotency_ttl_seconds: int = _env_int("PAP_SANDBOX_IDEMPOTENCY_TTL_SECONDS", 600)
     container_ttl_seconds: int = _env_int("PAP_SANDBOX_CONTAINER_TTL_SECONDS", 900)
-    max_output_chars: int = _env_int("PAP_SANDBOX_MAX_OUTPUT_CHARS", 200_000)
+    # 任务产物（docx base64）走 stdout 回传，需要远大于对话输出的额度。
+    # 对话侧仍由平台 SandboxClient 截到 8000 字符，这里放宽不影响对话；
+    # 直接打沙箱 API 的调用方受 API key 与 max_code_bytes 约束。
+    max_output_chars: int = _env_int("PAP_SANDBOX_MAX_OUTPUT_CHARS", 14 * 1024 * 1024)
     max_code_bytes: int = _env_int("PAP_SANDBOX_MAX_CODE_BYTES", 64_000)
     sweep_interval_seconds: float = _env_float("PAP_SANDBOX_SWEEP_INTERVAL_SECONDS", 60.0)
+    # 配了就用 PG 直写；留空回落内存记录（回滚路径）。
+    database_url: str = (os.environ.get("PAP_SANDBOX_DATABASE_URL") or "").strip()
     profile: IsolationProfile = field(default_factory=_build_profile)
 
 
@@ -196,6 +211,28 @@ _idempotent: dict[str, tuple[float, dict[str, Any]]] = {}
 _inflight: set[str] = set()
 _probe_cache: tuple[float, dict[str, Any]] | None = None
 
+# None = 内存记录（默认，回滚路径）；非 None = PG 直写。
+_record_store: Any | None = None
+
+
+def _build_store() -> Any | None:
+    """按配置选后端。配了 DSN 但依赖/连接不可用时**启动失败**，不静默降级。"""
+    if not settings.database_url:
+        logger.warning(
+            "未配置 PAP_SANDBOX_DATABASE_URL：执行记录仅存内存，进程重启后回读将 404。"
+        )
+        return None
+
+    if records_module is None:
+        raise RuntimeError(
+            "已配置 PAP_SANDBOX_DATABASE_URL，但沙箱 venv 缺少 psycopg / psycopg_pool，"
+            "无法直写 PG。请先在 /opt/pap-sandbox/.venv 安装依赖。"
+        )
+
+    store = records_module.RecordStore(settings.database_url)
+    # 连接失败让 lifespan 抛出去，systemd 会重启；不能带着「配了其实没写」的状态服务。
+    return store
+
 
 # ---------------------------------------------------------------- 鉴权与租户
 
@@ -237,6 +274,25 @@ def resolve_tenant(request: Request) -> str:
 
 
 _OWNER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.-]{0,127}$")
+# 任务标识：UUID 或快照 id（含冒号分隔的时间戳）。格式非法直接 400，
+# 避免把任意字符串写进执行记录并被后续回读当成归属依据。
+_TASK_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$")
+
+
+def resolve_task_owner(request: Request) -> tuple[str | None, str | None]:
+    """事务执行器附加的归属头；一次性代码执行不带，返回 (None, None)。"""
+    values: list[str | None] = []
+
+    for header in ("X-Sandbox-Task", "X-Sandbox-Snapshot"):
+        raw = (request.headers.get(header) or "").strip()
+        if not raw:
+            values.append(None)
+            continue
+        if not _TASK_PATTERN.match(raw):
+            raise HTTPException(status_code=400, detail=f"{header} 格式无效。")
+        values.append(raw)
+
+    return values[0], values[1]
 
 
 def resolve_owner(request: Request) -> tuple[str, str]:
@@ -356,6 +412,14 @@ async def _sweep_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    global _record_store
+
+    _record_store = _build_store()
+
+    if _record_store is not None:
+        await _record_store.open()
+        logger.info("执行记录已切到 PG 直写（事务级租户上下文 + 终态同步落库）。")
+
     if settings.backend == "runsc":
         try:
             removed = await asyncio.wait_for(
@@ -378,6 +442,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     finally:
         if sweeper is not None:
             sweeper.cancel()
+        if _record_store is not None:
+            await _record_store.close()
+            _record_store = None
 
 
 app = FastAPI(title="pap-sandbox", version="0.2.0", lifespan=lifespan)
@@ -432,6 +499,7 @@ async def execute(
     authorize(request, authorization)
     tenant_id = resolve_tenant(request)
     user_id, conversation_id = resolve_owner(request)
+    task_id, snapshot_id = resolve_task_owner(request)
 
     if payload.language not in backend.LANGUAGES:
         raise HTTPException(status_code=400, detail=f"不支持的语言：{payload.language}")
@@ -501,6 +569,8 @@ async def execute(
         "duration_ms": outcome.duration_ms,
         "truncated": stdout_cut or stderr_cut,
         "backend": outcome.backend,
+        # None = 沙箱没测到 CPU 时间；老客户端忽略这个字段，不破坏协议。
+        "cpu_ms": outcome.cpu_ms,
     }
 
     _remember(
@@ -510,6 +580,28 @@ async def execute(
         user_id=user_id,
         conversation_id=conversation_id,
     )
+
+    if _record_store is not None:
+        # 代码已经跑了，落库失败不能报成功：那会让审批停在 EXECUTED，
+        # 而回读又是 404。503 让平台侧显式转 SANDBOX_UNAVAILABLE、不自动重发。
+        try:
+            await _record_store.save(
+                tenant_id=tenant_id,
+                record={
+                    **result,
+                    "user_id": user_id,
+                    # 任务层执行时由平台注入；一次性代码执行落 NULL。
+                    "task_id": task_id,
+                    "snapshot_id": snapshot_id,
+                    "policy_revision": None,  # 沙箱不解释平台的策略版本。
+                },
+            )
+        except Exception as exc:  # pragma: no cover - 依赖 PG 故障注入
+            logger.error("执行 %s 终态落库失败：%s", execution_id, exc)
+            raise HTTPException(
+                status_code=503,
+                detail="代码已执行，但执行记录落库失败；结果未知，请勿直接重试。",
+            ) from exc
 
     if cache_key:
         if len(_idempotent) > 512:
@@ -534,6 +626,38 @@ async def get_execution(
     authorize(request, authorization)
     tenant_id = resolve_tenant(request)
     user_id, _ = resolve_owner(request)
+
+    if _record_store is not None:
+        stored = await _record_store.get(tenant_id=tenant_id, execution_id=execution_id)
+
+        if stored is None or stored.get("state") is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"未找到执行记录 {execution_id}。",
+            )
+
+        execution = stored["execution"]
+
+        # 回读是一份独立证据：终态、轨迹、当前态必须自洽，
+        # 不一致说明写入中途出了问题，不能拿它去推进审批。
+        state = stored["state"]
+        if execution["status"] != state["status"]:
+            raise HTTPException(
+                status_code=503,
+                detail="执行记录的状态与当前态不一致，无法核验。",
+            )
+
+        payload = dict(execution)
+        payload["traces"] = stored["traces"]
+        payload["state"] = state
+
+        # 同租户内按用户隔离：猜到别人的 execution_id 同样拿不到内容。
+        # 归属从 execution 行直接取，不从 trace detail 推断——后者可能为空。
+        owner_id = execution.get("user_id") or ""
+        if user_id and owner_id and owner_id != user_id:
+            raise HTTPException(status_code=404, detail=f"未找到执行记录 {execution_id}。")
+
+        return payload
 
     record = _records.get(execution_id)
 

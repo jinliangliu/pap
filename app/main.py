@@ -32,6 +32,7 @@ from app.services.rate_limit_service import (
     init_rate_limiter,
 )
 from app.services.run_service import interrupt_stale_runs
+from app.services.task_runner_service import close_task_client
 from app.tools.dependencies import get_tool_gateway
 from app.tools.mcp_tools import register_mcp_tools
 from app.workers.maintenance import (
@@ -146,6 +147,7 @@ async def lifespan(app: FastAPI):
         await close_checkpointer()
         await close_platform_client()
         await close_sandbox_client()
+        await close_task_client()
         await dispose_engine()
 
 

@@ -319,9 +319,11 @@
     NAV.forEach(function (group) {
       html += '<div class="nav-group-label">' + esc(group.group) + "</div>";
       group.items.forEach(function (item) {
-        var disabled = item.admin && !state.admin;
-        html += '<a class="nav-item' + (disabled ? " disabled" : "") +
-          '" data-route="' + esc(item.id) + '" data-label="' + esc(item.label) +
+        // 管理入口对普通身份彻底不渲染，不是置灰：灰条目仍然泄露「有这个能力」，
+        // 点进去又落在 adminGate，不如不给看。深链由各页自己的 adminGate 兜底。
+        if (item.admin && !state.admin) return;
+        html += '<a class="nav-item" ' +
+          'data-route="' + esc(item.id) + '" data-label="' + esc(item.label) +
           '" href="#/' + esc(item.id) + '">' +
           ico(item.icon) + "<span>" + esc(item.label) + "</span>" +
           (item.flag ? '<span class="nav-flag">' + esc(item.flag) + "</span>" : "") +
@@ -8386,6 +8388,7 @@
           '<td class="muted nowrap">' + esc(fmtTime(t.created_at)) + "</td>" +
           '<td class="right nowrap">' +
           '<button class="btn sm" data-members="' + esc(t.tenant_id) + '">成员</button> ' +
+          '<button class="btn sm" data-quota="' + esc(t.tenant_id) + '">配额</button> ' +
           '<button class="btn sm" data-toggle="' + esc(t.tenant_id) + '" data-status="' +
           (active ? "disabled" : "active") + '">' + (active ? "停用" : "启用") + "</button>" +
           "</td></tr>";
@@ -8396,9 +8399,117 @@
         loadMembers(btn.getAttribute("data-members"));
       });
     });
+    $$("[data-quota]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        openQuotaModal(btn.getAttribute("data-quota"), root);
+      });
+    });
     $$("[data-toggle]").forEach(function (btn) {
       btn.addEventListener("click", function () {
         toggleTenant(btn.getAttribute("data-toggle"), btn.getAttribute("data-status"), root);
+      });
+    });
+  }
+
+  /* ---------------- 租户配额弹窗（平台管理员专属） ---------------- */
+  //
+  // 沙箱事务配额放在同一张表单的后半段，但不是「又一个普通配额」：
+  // 接口在 /admin/* 下由 require_platform_admin 拦住，这里再按 state.admin
+  // 收一层入口。两层都要有——只靠前端隐藏是假权限，只靠后端会让人看见点不动的字段。
+  var quotaUI = { mask: null };
+
+  function closeQuotaModal() {
+    if (quotaUI.mask) { quotaUI.mask.remove(); quotaUI.mask = null; }
+  }
+
+  function openQuotaModal(tenantId, root) {
+    if (!state.admin || quotaUI.mask) return;
+    closeQuotaModal();
+
+    var mask = document.createElement("div");
+    mask.className = "modal-mask";
+    mask.innerHTML =
+      '<div class="modal modal-wide" role="dialog" aria-modal="true">' +
+      '<div class="modal-head"><div>' +
+      '<div class="modal-eyebrow">TENANT QUOTA</div>' +
+      '<div class="modal-title">租户配额 · ' + esc(tenantId) + "</div>" +
+      "</div><button class=\"modal-close\" type=\"button\" id=\"q-close\" aria-label=\"关闭\">×</button></div>" +
+      '<div class="modal-body">' +
+      '<p class="card-sub">0 = 沿用平台默认。常规配额对所有租户生效，沙箱事务配额只由平台管理员维护。</p>' +
+      '<div class="detail-h4">常规配额</div>' +
+      '<div class="form-grid">' +
+      '<div class="field"><label>每日对话</label><input type="number" id="q-daily" min="0" max="10000000"></div>' +
+      '<div class="field"><label>每分钟工具调用</label><input type="number" id="q-tpm" min="0" max="1000000"></div>' +
+      '<div class="field"><label>知识库文档数</label><input type="number" id="q-docs" min="0" max="1000000"></div>' +
+      "</div>" +
+      '<div class="detail-h4">沙箱事务配额 <span class="chip">仅平台管理员</span></div>' +
+      '<p class="hint">按人核算，不是租户总量。并发任务数防止单人占满单机；CPU 秒与工作区上限决定成本口径。' +
+      "这些值只在服务端生效，普通租户看不到、也改不了。</p>" +
+      '<div class="form-grid">' +
+      '<div class="field"><label>并发任务数</label><input type="number" id="q-concurrent" min="0" max="1000"></div>' +
+      '<div class="field"><label>每日 CPU 秒</label><input type="number" id="q-cpu" min="0" max="10000000"></div>' +
+      '<div class="field"><label>工作区上限（MB）</label><input type="number" id="q-workspace" min="0" max="1048576"></div>' +
+      "</div></div>" +
+      '<div class="modal-foot">' +
+      '<button class="btn" type="button" id="q-cancel">取消</button>' +
+      '<button class="btn primary" type="button" id="q-save">保存配额</button>' +
+      "</div></div>";
+
+    document.body.appendChild(mask);
+    quotaUI.mask = mask;
+
+    $("#q-close", mask).addEventListener("click", closeQuotaModal);
+    $("#q-cancel", mask).addEventListener("click", closeQuotaModal);
+    mask.addEventListener("click", function (event) { if (event.target === mask) closeQuotaModal(); });
+    document.addEventListener("keydown", function onEsc(event) {
+      if (event.key === "Escape" && quotaUI.mask === mask) {
+        closeQuotaModal();
+        document.removeEventListener("keydown", onEsc);
+      }
+    });
+
+    var save = $("#q-save", mask);
+    save.disabled = true;
+    api("/api/v1/admin/tenants/" + encodeURIComponent(tenantId) + "/quota")
+      .then(function (data) {
+        $("#q-daily", mask).value = data.daily_chat_requests;
+        $("#q-tpm", mask).value = data.tool_calls_per_minute;
+        $("#q-docs", mask).value = data.knowledge_max_documents;
+        $("#q-concurrent", mask).value = data.max_concurrent_tasks;
+        $("#q-cpu", mask).value = data.daily_cpu_seconds;
+        $("#q-workspace", mask).value = Math.round(
+          (data.workspace_max_bytes || 0) / (1024 * 1024)
+        );
+        save.disabled = false;
+      })
+      .catch(function (e) {
+        toast("读取配额失败：" + errText(e), "err");
+        closeQuotaModal();
+      });
+
+    save.addEventListener("click", function () {
+      if (save.disabled) return;
+      var number = function (id) {
+        return parseInt($("#" + id, mask).value, 10) || 0;
+      };
+      save.disabled = true;
+      api("/api/v1/admin/tenants/" + encodeURIComponent(tenantId) + "/quota", {
+        method: "PUT",
+        body: {
+          daily_chat_requests: number("q-daily"),
+          tool_calls_per_minute: number("q-tpm"),
+          knowledge_max_documents: number("q-docs"),
+          max_concurrent_tasks: number("q-concurrent"),
+          daily_cpu_seconds: number("q-cpu"),
+          workspace_max_bytes: Math.round(number("q-workspace") * 1024 * 1024)
+        }
+      }).then(function () {
+        toast("租户 " + tenantId + " 的配额已保存", "ok");
+        closeQuotaModal();
+        mountOrg(root);
+      }).catch(function (e) {
+        toast("保存失败：" + errText(e), "err");
+        save.disabled = false;
       });
     });
   }

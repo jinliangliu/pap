@@ -45,6 +45,31 @@ logger = logging.getLogger(__name__)
 _CREDENTIAL_REF_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 
 
+def _quota_values(quota: TenantQuota) -> dict:
+    """配额行 → 管理页可回显的纯字典。 session 关闭后仍可读。"""
+    return {
+        "tenant_id": quota.tenant_id,
+        "daily_chat_requests": quota.daily_chat_requests,
+        "tool_calls_per_minute": quota.tool_calls_per_minute,
+        "knowledge_max_documents": quota.knowledge_max_documents,
+        "max_concurrent_tasks": quota.max_concurrent_tasks,
+        "daily_cpu_seconds": quota.daily_cpu_seconds,
+        "workspace_max_bytes": quota.workspace_max_bytes,
+    }
+
+
+def _empty_quota(tenant_id: str) -> dict:
+    return {
+        "tenant_id": tenant_id,
+        "daily_chat_requests": 0,
+        "tool_calls_per_minute": 0,
+        "knowledge_max_documents": 0,
+        "max_concurrent_tasks": 0,
+        "daily_cpu_seconds": 0,
+        "workspace_max_bytes": 0,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class QuotaLimits:
     daily_chat_requests: int = 0
@@ -346,6 +371,19 @@ class TenantService:
         await session.flush()
         return tenant
 
+    async def get_quota(self, session: AsyncSession, *, tenant_id: str) -> dict:
+        """读取配额供管理页回显；没有配额行时返回全 0，不为此建行。
+
+        管理页打开一次不应该写库：租户刚建好还没配过配额是正常状态。
+        调用方仍需在外层用 `platform_admin_tenant_scope(tenant_id)` 指定目标租户。
+        """
+        target = normalize_tenant_id(tenant_id)
+        with tenant_scope(target):
+            quota = await session.get(TenantQuota, target)
+        if quota is None:
+            return _empty_quota(target)
+        return _quota_values(quota)
+
     async def set_quota(
         self,
         session: AsyncSession,
@@ -354,6 +392,9 @@ class TenantService:
         daily_chat_requests: int,
         tool_calls_per_minute: int,
         knowledge_max_documents: int = 0,
+        max_concurrent_tasks: int = 0,
+        daily_cpu_seconds: int = 0,
+        workspace_max_bytes: int = 0,
     ) -> TenantQuota:
         target = normalize_tenant_id(tenant_id)
 
@@ -367,6 +408,9 @@ class TenantService:
             quota.daily_chat_requests = max(0, daily_chat_requests)
             quota.tool_calls_per_minute = max(0, tool_calls_per_minute)
             quota.knowledge_max_documents = max(0, knowledge_max_documents)
+            quota.max_concurrent_tasks = max(0, max_concurrent_tasks)
+            quota.daily_cpu_seconds = max(0, daily_cpu_seconds)
+            quota.workspace_max_bytes = max(0, workspace_max_bytes)
             await session.flush()
 
         self.invalidate(target)
